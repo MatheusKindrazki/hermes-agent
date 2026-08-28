@@ -82,6 +82,7 @@ import { armWakeWord, stopClientCapture } from '@/store/wake-word'
 import { isAuxiliaryWindow, isBrowserWindow, isHudWindow } from '@/store/windows'
 import { useSkinCommand } from '@/themes/use-skin-command'
 
+import { shouldPreserveRouteAcrossGatewaySwitch } from '../chat/active-context'
 import { closeWorkspaceTab } from '../chat/close-tab'
 import { requestComposerInsert } from '../chat/composer/focus'
 import { useComposerActions } from '../chat/hooks/use-composer-actions'
@@ -779,7 +780,14 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
   useGatewayBoot({
     beforeConnectionSwitch: () => {
-      startFreshSessionDraft({ preserveRoute: true, workspaceTarget: null })
+      // Keep a route OVERLAY (Settings, Gateway); drop a route that names a
+      // SESSION on the backend being left. One owner for that policy, with
+      // its reasoning: shouldPreserveRouteAcrossGatewaySwitch. Read through
+      // the ref so this closure always sees the current route.
+      startFreshSessionDraft({
+        preserveRoute: shouldPreserveRouteAcrossGatewaySwitch(routedSessionIdRef.current),
+        workspaceTarget: null
+      })
       resetOverlayReturnRoute()
       resetProjectTreeState()
       closeAllTerminals()

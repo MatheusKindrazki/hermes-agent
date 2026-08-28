@@ -27,11 +27,19 @@ import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
 import { migrateSessionDraft } from '@/store/composer'
 import { migrateQueuedPrompts, parkQueuedPrompts } from '@/store/composer-queue'
+import { $connectionsRegistry } from '@/store/connection-registry-state'
+import { $activeConnectionId } from '@/store/connections'
 import { $introSplash } from '@/store/intro-splash'
 import { $pinnedSessionIds } from '@/store/layout'
 import { $petActive } from '@/store/pet'
 import { $petOverlayActive } from '@/store/pet-overlay'
-import { $activeGatewayProfile, $gatewaySwapTarget, $hydrationSyncProfile, $profiles } from '@/store/profile'
+import {
+  $activeGatewayProfile,
+  $gatewaySwapTarget,
+  $hydrationSyncProfile,
+  $profiles,
+  resolveNewChatOwnerRoute
+} from '@/store/profile'
 import {
   $connection,
   $contextSuggestions,
@@ -42,6 +50,7 @@ import {
   $resumeExhaustedSessionId,
   $sessions,
   getSessionOwnerHint,
+  knownSessionOwner,
   resolveComposerSessionKey,
   sessionMatchesStoredId,
   sessionPinId,
@@ -55,6 +64,8 @@ import type { ModelOptionsResponse } from '@/types/hermes'
 import { primaryRouteSelectedSessionId, routeSessionId } from '../routes'
 import { titlebarHeaderBaseClass, titlebarHeaderShadowClass, titlebarHeaderTitleClass } from '../shell/titlebar'
 
+import { resolveActiveContext } from './active-context'
+import { ActiveContextChip } from './active-context-chip'
 import { ChatDropOverlay } from './chat-drop-overlay'
 import { ChatSwapOverlay, ChatSyncBadge } from './chat-swap-overlay'
 import { ChatBar, ChatBarFallback } from './composer'
@@ -113,6 +124,9 @@ interface ChatHeaderProps {
   isRoutedSessionView: boolean
   onDeleteSelectedSession: () => void
   onToggleSelectedPin: () => void
+  /** The session the next message TARGETS — route first, exactly as
+   *  resolve-target-session does. On a tile this is the tile's own id. */
+  routedSessionId: null | string
   selectedSessionId: null | string
 }
 
@@ -121,21 +135,52 @@ function ChatHeader({
   isRoutedSessionView,
   onDeleteSelectedSession,
   onToggleSelectedPin,
+  routedSessionId,
   selectedSessionId
 }: ChatHeaderProps) {
   const sessions = useStore($sessions)
   const pinnedSessionIds = useStore($pinnedSessionIds)
   const profiles = useStore($profiles)
+  const connectionsRegistry = useStore($connectionsRegistry)
+  // resolveNewChatOwnerRoute() reads atoms with .get(), which does not
+  // subscribe. Subscribe to the two that move it so a draft's chip cannot go
+  // on naming the previous destination after a profile pick or a connection
+  // apply — the exact staleness this chip exists to expose.
+  const activeGatewayProfile = useStore($activeGatewayProfile)
+  const activeConnectionId = useStore($activeConnectionId)
 
   const activeStoredSession =
     (selectedSessionId && sessions.find(session => sessionMatchesStoredId(session, selectedSessionId))) || null
 
   const title = activeStoredSession ? sessionTitle(activeStoredSession) : NEW_SESSION_TITLE
 
-  // Which agent/persona owns this chat — glanceable in the header once a
-  // second profile exists, so the open session's ownership is never ambiguous
-  // (#66003). Single-profile users see the unchanged header.
+  // Where the next message actually lands — profile AND connection AND
+  // session, derived from the same resolvers the submit path uses so the
+  // chrome cannot drift from routing.
+  //
+  // The old predicate suppressed identity whenever no session row was loaded,
+  // which is precisely the state a connection/mode apply leaves behind: the
+  // header read "New session" with no owner at all while the route still
+  // named a conversation on the backend just left. Identity is now stated
+  // whenever more than one destination EXISTS — including on a draft, which
+  // is exactly when the user most needs to know where Enter goes.
+  // Bound to the SEND TARGET, route first — the same precedence
+  // resolve-target-session applies. Reading the selected id instead is exactly
+  // how the visible identity and the real destination came apart.
+  const targetStoredSessionId = routedSessionId ?? selectedSessionId
+  const activeContext = useMemo(
+    () =>
+      resolveActiveContext({
+        newChatRoute: resolveNewChatOwnerRoute(),
+        owner: knownSessionOwner(sessions, targetStoredSessionId),
+        targetStoredSessionId
+      }),
+    // activeGatewayProfile/activeConnectionId are inputs to
+    // resolveNewChatOwnerRoute(), not unused: they are what make this recompute.
+    [activeConnectionId, activeGatewayProfile, sessions, targetStoredSessionId]
+  )
   const showProfileTag = profiles.length > 1 && Boolean(activeStoredSession)
+  const showContext = profiles.length > 1 || (connectionsRegistry?.connections.length ?? 0) > 1
 
   // Pins live on the durable lineage-root id, but selectedSessionId is the live
   // (tip) id — resolve through the loaded row so the menu reflects the pin
@@ -156,13 +201,14 @@ function ChatHeader({
   return (
     <header className={cn(titlebarHeaderBaseClass, isRoutedSessionView && titlebarHeaderShadowClass)}>
       <div
-        className={cn(titlebarHeaderTitleClass, showProfileTag && 'flex items-center')}
+        className={cn(titlebarHeaderTitleClass, (showProfileTag || showContext) && 'flex items-center')}
         style={{
           maxWidth:
             'calc(100vw - var(--titlebar-content-inset,0px) - var(--titlebar-tools-right) - var(--titlebar-tools-width) - 1.5rem)'
         }}
       >
         {showProfileTag && <ProfileTag className="pointer-events-auto mr-1.5" profile={activeStoredSession?.profile} />}
+        {showContext && <ActiveContextChip className="pointer-events-auto mr-1.5 inline-flex items-center" context={activeContext} />}
         <SessionActionsMenu
           align="start"
           onDelete={selectedSessionId ? onDeleteSelectedSession : undefined}
@@ -619,6 +665,7 @@ const ChatViewContent = memo(function ChatViewContent({
           isRoutedSessionView={isRoutedSessionView}
           onDeleteSelectedSession={onDeleteSelectedSession}
           onToggleSelectedPin={onToggleSelectedPin}
+          routedSessionId={routedSessionId}
           selectedSessionId={selectedSessionId}
         />
       )}
