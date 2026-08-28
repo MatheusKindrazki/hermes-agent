@@ -28,6 +28,7 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import faulthandler
+import hashlib
 import inspect
 import json
 import logging
@@ -112,6 +113,17 @@ _USER_BOUNDARY_END_REASONS = (
 # transport cannot block the session-stall watcher pass (notify-only path;
 # on timeout the latch stays clear and the next tick retries).
 _STALL_NOTIFY_SEND_TIMEOUT_SECONDS = 15.0
+# How long one internal conclusion stays "already said" on a route
+# (_internal_event_equivalence_key). Long enough to span the gap between a
+# wrapped process and its wrapper exiting, plus the cascade turn each of them
+# would otherwise start — the 0.1s completion fan-in window and the 2.0s
+# delegation drain tick are both far too short for that. Short enough that a
+# genuinely repeated run minutes later still surfaces: this supersedes a
+# restatement, it does not mute a signal.
+_INTERNAL_EQUIVALENCE_TTL_SECONDS = 120.0
+# Bounded like every other per-lifetime gateway cache. Keys are small tuples
+# and only routes with recent internal traffic ever appear.
+_INTERNAL_EQUIVALENCE_MAX_ENTRIES = 256
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
@@ -7060,6 +7072,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._completion_notification_batch_flush_tasks: set[asyncio.Task] = set()
         self._completion_notification_batch_window = 0.1
         self._completion_notification_batches_stopping = False
+        # Producer identity is not work identity. A wrapper script and the
+        # process it wraps are two producers reporting ONE conclusion, and they
+        # exit far enough apart to miss the 0.1s fan-in window above — so both
+        # became their own synthetic turn. Remember the conclusions recently
+        # injected on each route so an equivalent restatement is superseded
+        # instead of asking the agent the same question again. The key is
+        # reserved for the duration of an injection (_internal_equivalence_
+        # inflight), so two concurrent copies cannot both pass the check while
+        # the first is still awaiting the adapter.
+        self._internal_equivalence_seen: "OrderedDict[tuple[str, ...], tuple[float, Optional[int]]]" = OrderedDict()
+        self._internal_equivalence_inflight: "Dict[tuple[str, ...], asyncio.Future]" = {}
 
         # Cache AIAgent instances per session to preserve prompt caching.
         # Without this, a new AIAgent is created per message, rebuilding the
@@ -25582,7 +25605,243 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as exc:
                 logger.error("Watch notification injection error: %s", exc)
 
+    @staticmethod
+    def _internal_event_equivalence_key(evt: dict) -> "Optional[tuple[str, ...]]":
+        """Return a work+route+conclusion key shared by equivalent internal events.
+
+        ``None`` means "no equivalence claim" — the event is always injected.
+
+        Three things must agree before two internal events count as
+        restatements of one conclusion:
+
+        * the **unit of work** — ``task_id``, the grouping key every registry
+          producer already stamps (``_check_watch_patterns`` and
+          ``_move_to_finished`` in ``tools/process_registry.py``). An event
+          without one is legacy or unstamped and fails OPEN: it is delivered,
+          never suppressed. That is the same stance
+          :meth:`_completion_delivery_identity` takes for process events with
+          no ``started_at`` — risk a duplicate turn, never a lost result.
+        * the **route** — the full gateway routing tuple, so two chats that
+          happen to watch the same log stay two conversations.
+        * the **conclusion** — the payload itself.
+
+        Producer fields are deliberately absent. ``session_id``, ``command``
+        and ``started_at`` are what make a wrapper and the process it wraps
+        look like two events; ``type`` and ``pattern`` are what make a
+        ``watch_match`` and the ``completion`` that follows it look like two
+        events. Neither pair is a different conclusion.
+
+        ``async_delegation`` is excluded outright. A delegation IS its own unit
+        of work — two delegation ids are two pieces of work even when their
+        summaries read alike — and its delivery is arbitrated by the durable
+        claim/ack ledger in ``tools.async_delegation``. Suppressing one here
+        would either strand its row pending forever or ack work the user never
+        saw; neither is an honest ack.
+
+        Accepted trade: two genuinely different commands inside ONE task whose
+        payloads are byte-identical collapse into one turn. Distinguishing them
+        would need ``command`` in the key, which is exactly the field a wrapper
+        and its child disagree on.
+        """
+        if str(evt.get("type") or "completion") == "async_delegation":
+            return None
+        task_id = str(evt.get("task_id") or "").strip()
+        if not task_id:
+            return None
+        payload = str(evt.get("output") or evt.get("message") or "").strip()
+        if not payload:
+            # No conclusion is no evidence of sameness — two silent jobs
+            # finishing on one route are two results, not one restated.
+            return None
+        digest = hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()
+        return (task_id, digest, *GatewayRunner._equivalence_route(evt))
+
+    @staticmethod
+    def _equivalence_route(evt: dict) -> "tuple[str, ...]":
+        """The conversation an internal event lands in.
+
+        ``session_key`` alone when present: it already encodes platform, chat
+        type, chat and thread. The full
+        :meth:`_completion_notification_batch_key` tuple cannot be used here
+        because producers disagree about which routing fields they stamp — a
+        registry ``watch_match`` carries no ``chat_type`` while the
+        gateway-built ``completion`` for the very same process does, so keying
+        on the wide tuple would put one conclusion's two shapes on two routes
+        and never collapse them. Events with no session key fall back to the
+        wide tuple.
+        """
+        session_key = str(evt.get("session_key") or "").strip()
+        if session_key:
+            return (session_key,)
+        return GatewayRunner._completion_notification_batch_key(evt)
+
+    @staticmethod
+    def _internal_event_exit_code(evt: dict) -> Optional[int]:
+        """The event's exit status, or ``None`` when it does not report one."""
+        code = evt.get("exit_code")
+        return code if isinstance(code, int) else None
+
+    def _equivalence_store(self) -> "OrderedDict[tuple[str, ...], tuple[float, Optional[int]]]":
+        """Conclusions recently injected, keyed as above. Value: (when, exit).
+
+        Created lazily: focused lifecycle tests build a runner with
+        ``object.__new__`` and no ``__init__`` (the AGENTS.md pitfall), so this
+        seam must not depend on the constructor having run.
+        """
+        store = getattr(self, "_internal_equivalence_seen", None)
+        if store is None:
+            store = OrderedDict()
+            self._internal_equivalence_seen = store
+        return store
+
+    def _equivalence_inflight(self) -> "Dict[tuple[str, ...], asyncio.Future]":
+        """One in-flight injection per key, so check-then-record cannot race."""
+        inflight = getattr(self, "_internal_equivalence_inflight", None)
+        if inflight is None:
+            inflight = {}
+            self._internal_equivalence_inflight = inflight
+        return inflight
+
+    @staticmethod
+    def _outcomes_are_equivalent(
+        seen_code: Optional[int], incoming_code: Optional[int],
+    ) -> bool:
+        """Whether two reports of one payload describe the same outcome.
+
+        ``None`` means the event reports no exit status at all — a
+        ``watch_match`` scans output, it does not wait for an exit. Unknown is
+        compatible with **success only**. Letting unknown absorb a non-zero
+        exit would mean a marker line observed first could hide that the
+        process then failed, which is the one conclusion that must never be
+        swallowed. Two known outcomes are equivalent only when equal, so a
+        wrapper that masks its child's failure still gets its own turn.
+        """
+        if seen_code is None and incoming_code is None:
+            return True
+        if seen_code is None:
+            return incoming_code == 0
+        if incoming_code is None:
+            return seen_code == 0
+        return seen_code == incoming_code
+
+    def _internal_event_superseded_locked(
+        self, key: "tuple[str, ...]", evt: dict,
+    ) -> bool:
+        """Whether this conclusion already reached this route. Lock held."""
+        entry = self._equivalence_store().get(key)
+        if entry is None:
+            return False
+        _recorded_at, seen_code = entry
+        return self._outcomes_are_equivalent(
+            seen_code, self._internal_event_exit_code(evt),
+        )
+
+    def _record_internal_event_equivalence(self, evt: dict) -> None:
+        """Remember a conclusion that the adapter accepted."""
+        key = self._internal_event_equivalence_key(evt)
+        if key is None:
+            return
+        with self._completion_delivery_lock:
+            self._record_internal_equivalence_locked(key, evt)
+
+    def _record_internal_equivalence_locked(
+        self, key: "tuple[str, ...]", evt: dict,
+    ) -> None:
+        """Store one accepted conclusion. Caller holds the delivery lock."""
+        now = time.monotonic()
+        store = self._equivalence_store()
+        store.pop(key, None)
+        store[key] = (now, self._internal_event_exit_code(evt))
+        self._prune_internal_equivalence(now)
+
+    def _prune_internal_equivalence(self, now: float) -> None:
+        """Drop expired/overflowing entries. Caller holds the delivery lock."""
+        seen = self._equivalence_store()
+        while seen:
+            oldest_key = next(iter(seen))
+            recorded_at, _code = seen[oldest_key]
+            if now - recorded_at < _INTERNAL_EQUIVALENCE_TTL_SECONDS and (
+                len(seen) <= _INTERNAL_EQUIVALENCE_MAX_ENTRIES
+            ):
+                break
+            seen.pop(oldest_key, None)
+
     async def _inject_watch_notification(
+        self, synth_text: str, evt: dict,
+    ) -> Optional[bool]:
+        """Inject an internal notification unless it restates a fresh conclusion.
+
+        Wraps :meth:`_inject_watch_notification_now` with the work-scoped
+        supersession described in :meth:`_internal_event_equivalence_key`.
+
+        The key is **reserved** for the duration of the injection, not merely
+        checked before it. A bare check-await-record would let two concurrent
+        injections of one conclusion both pass the check while the first was
+        still awaiting the adapter, which is precisely the fan-out this exists
+        to collapse. A second caller instead waits on the first attempt and
+        only stands down if that attempt actually reached the adapter; if it
+        did not, the second caller retries rather than being dropped, so a
+        failed delivery never swallows the event behind it.
+
+        Returning ``None`` for a superseded event matches the existing "another
+        caller already owns this delivery" contract, so callers treat it as
+        handled rather than replaying it forever. Suppression only ever removes
+        a synthetic turn — it never splices text into a running one, so strict
+        user/assistant alternation is untouched.
+        """
+        key = self._internal_event_equivalence_key(evt)
+        if key is None:
+            return await self._inject_watch_notification_now(synth_text, evt)
+
+        while True:
+            owner: Optional[asyncio.Future] = None
+            waiter: Optional[asyncio.Future] = None
+            with self._completion_delivery_lock:
+                self._prune_internal_equivalence(time.monotonic())
+                if self._internal_event_superseded_locked(key, evt):
+                    logger.debug(
+                        "Superseding internal %s event for %s: an equivalent "
+                        "conclusion already reached this route within %.0fs",
+                        evt.get("type", "completion"),
+                        evt.get("session_id") or "<unknown>",
+                        _INTERNAL_EQUIVALENCE_TTL_SECONDS,
+                    )
+                    return None
+                inflight = self._equivalence_inflight()
+                waiter = inflight.get(key)
+                if waiter is None:
+                    owner = asyncio.get_running_loop().create_future()
+                    inflight[key] = owner
+
+            if owner is None:
+                # Another injection of this same conclusion is in flight.
+                delivered_by_other = False
+                try:
+                    delivered_by_other = bool(await waiter)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    delivered_by_other = False
+                if delivered_by_other:
+                    return None
+                # It did not reach the adapter. This event must not be lost
+                # behind it — loop and take the attempt ourselves.
+                continue
+
+            result: Optional[bool] = None
+            try:
+                result = await self._inject_watch_notification_now(synth_text, evt)
+                return result
+            finally:
+                with self._completion_delivery_lock:
+                    if self._equivalence_inflight().get(key) is owner:
+                        self._equivalence_inflight().pop(key, None)
+                    if result is True:
+                        self._record_internal_equivalence_locked(key, evt)
+                if not owner.done():
+                    owner.set_result(result is True)
+
+    async def _inject_watch_notification_now(
         self, synth_text: str, evt: dict,
     ) -> Optional[bool]:
         """Inject a watch/completion notification as a synthetic message event.
@@ -26026,6 +26285,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _record_coalesced_completion_siblings(self, events: list[dict]) -> None:
         """Extend a successful primary delivery claim to its batched siblings."""
+        # A sibling's conclusion rode along inside the consolidated text, so it
+        # HAS reached the user — claim its equivalence key too, or a later
+        # restatement of that same conclusion would start its own turn.
+        for evt in events:
+            self._record_internal_event_equivalence(evt)
         with self._completion_delivery_lock:
             for evt in events:
                 identity = self._completion_delivery_identity(evt)
@@ -26468,6 +26732,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "type": "completion",
                         "session_id": session_id,
                         "session_key": session_key,
+                        # The registry stamps task_id on every notification it
+                        # emits (_move_to_finished, _check_watch_patterns); the
+                        # watcher dict never carried it, so this gateway-built
+                        # copy used to be the one completion event with no
+                        # unit-of-work grouping key at all. Read it off the live
+                        # session so a wrapper and the process it wraps can be
+                        # recognised as one piece of work.
+                        "task_id": getattr(session, "task_id", "") or "",
                         "platform": platform_name,
                         "chat_type": watcher.get("chat_type", ""),
                         "chat_id": chat_id,
