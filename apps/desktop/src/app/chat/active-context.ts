@@ -122,3 +122,42 @@ export function sameActiveContext(a: ActiveContext, b: ActiveContext): boolean {
 export function shouldPreserveRouteAcrossGatewaySwitch(routedSessionId: null | string | undefined): boolean {
   return !trimmed(routedSessionId)
 }
+
+export interface ActiveContextLabels {
+  /** The full sentence, for the tooltip and the accessible name. */
+  detail: string
+  /** Always-visible compact text, e.g. `research · Homelab`. Never empty. */
+  text: string
+}
+
+const UNKNOWN_PROFILE = 'unknown profile'
+const UNKNOWN_DEVICE = 'unknown device'
+
+/**
+ * Compose what the chip SHOWS and what it says in full.
+ *
+ * `text` is deliberately not optional and never empty: identity that lives
+ * only in a tooltip or an aria-label is identity the user has to go looking
+ * for, and the whole complaint is that they cannot tell at a glance which
+ * profile and which machine the next message reaches. A hover is not a glance.
+ *
+ * Unknowns are spelled out rather than omitted. Dropping the half we cannot
+ * derive would read as "there is nothing to say here", which is the opposite
+ * of the truth.
+ *
+ * `connectionLabel` is the registry's human name for the connection; callers
+ * pass null when the registry cannot name it (then the id, if any, is used —
+ * a raw id still tells two machines apart, which is the job).
+ */
+export function activeContextLabels(
+  context: ActiveContext,
+  connectionLabel: null | string
+): ActiveContextLabels {
+  const profile = context.profile ?? UNKNOWN_PROFILE
+  const device = connectionLabel?.trim() || context.connectionId?.trim() || UNKNOWN_DEVICE
+  const what =
+    context.source === 'draft' ? 'New chat' : context.source === 'unknown' ? 'Chat' : 'This chat'
+  const owner = context.source === 'unknown' ? `owner unknown — ${profile} on ${device}` : `${profile} on ${device}`
+
+  return { detail: `${what}: ${owner}`, text: `${profile} · ${device}` }
+}

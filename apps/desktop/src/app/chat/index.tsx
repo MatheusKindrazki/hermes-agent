@@ -193,8 +193,19 @@ function ChatHeader({
 
   // Secondary windows (new-session scratch, subagent watch, cmd-click pop-out)
   // are compact side panels — they drop the session-actions header + border
-  // entirely. A brand-new draft has nothing to pin/delete/rename either.
-  if (isAuxiliaryWindow() || (!selectedSessionId && !activeSessionId && !isRoutedSessionView)) {
+  // entirely.
+  //
+  // A brand-new draft has nothing to pin/delete/rename, which is why it used
+  // to drop the header too. But that reasoning is about the ACTIONS, and the
+  // header is now also where the destination is stated. Dropping it whenever
+  // more than one destination exists is the ambiguity itself: after a
+  // connection apply the window sits on exactly this state, and a header that
+  // is simply absent tells the user even less than one reading "New session".
+  // The actions below already degrade on their own (`selectedSessionId ? ... :
+  // undefined`), so keeping the header costs nothing.
+  const isBareDraft = !selectedSessionId && !activeSessionId && !isRoutedSessionView
+
+  if (isAuxiliaryWindow() || (isBareDraft && !showContext)) {
     return null
   }
 

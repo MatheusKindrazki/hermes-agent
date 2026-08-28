@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest'
 
+import { NEW_CHAT_ROUTE, routeSessionId, SETTINGS_ROUTE } from '../routes'
+
 import {
+  activeContextLabels,
   resolveActiveContext,
   sameActiveContext,
   shouldPreserveRouteAcrossGatewaySwitch
@@ -144,5 +147,71 @@ describe('shouldPreserveRouteAcrossGatewaySwitch', () => {
 
   it('treats a blank id as no session rather than a session named ""', () => {
     expect(shouldPreserveRouteAcrossGatewaySwitch('   ')).toBe(true)
+  })
+})
+
+describe('activeContextLabels', () => {
+  it('paints profile AND machine — identity must not be tooltip-only', () => {
+    const labels = activeContextLabels(
+      { connectionId: 'homelab', profile: 'research', source: 'session', storedSessionId: 'chat-a' },
+      'Homelab'
+    )
+
+    expect(labels.text).toBe('research · Homelab')
+    expect(labels.detail).toContain('research')
+    expect(labels.detail).toContain('Homelab')
+  })
+
+  it('spells unknowns out instead of dropping the half it cannot derive', () => {
+    const labels = activeContextLabels(
+      { connectionId: null, profile: null, source: 'unknown', storedSessionId: 'chat-a' },
+      null
+    )
+
+    expect(labels.text).toBe('unknown profile · unknown device')
+    expect(labels.detail).toContain('owner unknown')
+  })
+
+  it('states where a draft would land', () => {
+    const labels = activeContextLabels(
+      { connectionId: 'work', profile: 'default', source: 'draft', storedSessionId: null },
+      'Work laptop'
+    )
+
+    expect(labels.text).toBe('default · Work laptop')
+    expect(labels.detail.startsWith('New chat:')).toBe(true)
+  })
+
+  it('falls back to the connection id when the registry cannot name it', () => {
+    // A raw id still tells two machines apart, which is the job.
+    const labels = activeContextLabels(
+      { connectionId: 'conn-7', profile: 'p', source: 'session', storedSessionId: 's' },
+      null
+    )
+
+    expect(labels.text).toBe('p · conn-7')
+  })
+
+  it('never produces empty visible text', () => {
+    for (const source of ['draft', 'session', 'unknown'] as const) {
+      const labels = activeContextLabels(
+        { connectionId: null, profile: null, source, storedSessionId: null },
+        null
+      )
+
+      expect(labels.text.trim().length).toBeGreaterThan(0)
+    }
+  })
+})
+
+describe('a session route does not survive a connection switch', () => {
+  it('drops the id of the backend being left, keeps an overlay', () => {
+    // `beforeConnectionSwitch` feeds routeSessionId(pathname) through this
+    // policy: `/settings` and `/` parse to null (preserved), a session route
+    // does not (dropped), so the wipe cannot leave the URL naming a session on
+    // a backend that is gone while $sessions is empty.
+    expect(shouldPreserveRouteAcrossGatewaySwitch(routeSessionId(SETTINGS_ROUTE))).toBe(true)
+    expect(shouldPreserveRouteAcrossGatewaySwitch(routeSessionId(NEW_CHAT_ROUTE))).toBe(true)
+    expect(shouldPreserveRouteAcrossGatewaySwitch(routeSessionId('/chat-a'))).toBe(false)
   })
 })
