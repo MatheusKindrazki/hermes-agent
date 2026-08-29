@@ -544,12 +544,26 @@ export interface SessionInfo {
    *  connection-scoped gateway (`ensureGatewayAgent`) when present. */
   connection_id?: string
   /** Optional active-context/v1 correlation fields from newer gateways. */
+  active_context?: ActiveContextReceipt
   tenant?: null | string
   machine?: null | string
   gateway_generation?: null | string
   runtime_session_id?: null | string
   xirp_session_id?: null | string
   work_id?: null | string
+}
+
+export interface ActiveContextReceipt {
+  schema: 'kindra.active-context/v1'
+  connection_id: string
+  profile: string
+  tenant: string
+  machine: string
+  gateway_generation: string
+  runtime_session_id: string
+  stored_session_id: string
+  xirp_session_id: null | string
+  work_id: null | string
 }
 
 export type TimelineDisplayMetadata =

@@ -64,7 +64,12 @@ import type { ModelOptionsResponse } from '@/types/hermes'
 import { primaryRouteSelectedSessionId, routeSessionId } from '../routes'
 import { titlebarHeaderBaseClass, titlebarHeaderShadowClass, titlebarHeaderTitleClass } from '../shell/titlebar'
 
-import { type ActiveContext, activeContextCanSubmit, resolveActiveContext } from './active-context'
+import {
+  type ActiveContext,
+  activeContextCanSubmit,
+  activeContextCorrelationFromReceipt,
+  resolveActiveContext
+} from './active-context'
 import { ActiveContextChip } from './active-context-chip'
 import { ChatDropOverlay } from './chat-drop-overlay'
 import { ChatSwapOverlay, ChatSyncBadge } from './chat-swap-overlay'
@@ -466,7 +471,7 @@ const ChatViewContent = memo(function ChatViewContent({
   onRetryResume,
   onTranscribeAudio,
   onDismissError,
-  identityV2Enabled = false
+  identityV2Enabled: identityV2Override
 }: ChatViewProps) {
   const location = useLocation()
   const { t } = useI18n()
@@ -492,7 +497,6 @@ const ChatViewContent = memo(function ChatViewContent({
   const busy = useStore(view.$busy)
   const activeGatewayProfile = useStore($activeGatewayProfile)
   const activeConnectionId = useStore($activeConnectionId)
-  const connectionsRegistry = useStore($connectionsRegistry)
   const contextSuggestions = useStore($contextSuggestions)
   // Per-session (SessionView) reads — a tile IS its session, so these come
   // from the view slice, not the global atoms (which track the primary only).
@@ -594,7 +598,11 @@ const ChatViewContent = memo(function ChatViewContent({
         ? owner
         : targetSession?.profile || draftRoute?.profile || activeGatewayProfile
 
-  const registryConnection = connectionsRegistry?.connections.find(connection => connection.id === ownerConnectionId)
+  // A v1 receipt is itself the backend capability signal: it is emitted only
+  // when that profile's config canary is enabled and every required authority
+  // field is explicit. Tests may force the gate through the internal prop.
+  const identityV2Enabled =
+    identityV2Override ?? targetSession?.active_context?.schema === 'kindra.active-context/v1'
 
   const activeContext = useMemo(() => {
     // The legacy local door intentionally returns no explicit draft route:
@@ -610,17 +618,7 @@ const ChatViewContent = memo(function ChatViewContent({
 
     return resolveActiveContext({
       activeRuntimeSessionId: activeSessionId,
-      correlation: {
-        connectionId: ownerConnectionId || null,
-        gatewayGeneration: targetSession?.gateway_generation ?? null,
-        machine: targetSession?.machine || registryConnection?.installId || registryConnection?.label || null,
-        profile: ownerProfile || null,
-        runtimeSessionId: targetSession?.runtime_session_id || activeSessionId || null,
-        storedSessionId: targetStoredSessionId,
-        tenant: targetSession?.tenant ?? null,
-        workId: targetSession?.work_id ?? null,
-        xirpSessionId: targetSession?.xirp_session_id ?? null
-      },
+      correlation: activeContextCorrelationFromReceipt(targetSession?.active_context),
       identityV2: identityV2Enabled,
       newChatRoute: displayedDraftRoute,
       owner,
@@ -633,7 +631,6 @@ const ChatViewContent = memo(function ChatViewContent({
     owner,
     ownerConnectionId,
     ownerProfile,
-    registryConnection,
     targetSession,
     targetStoredSessionId
   ])

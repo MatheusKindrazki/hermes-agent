@@ -5,6 +5,7 @@ import { MemoryRouter } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { assistantTextPart, type ChatMessage } from '@/lib/chat-messages'
+import { $connectionsRegistry } from '@/store/connection-registry-state'
 import {
   $activeSessionId,
   $awaitingResponse,
@@ -48,7 +49,19 @@ vi.mock('@/lib/model-options', () => ({
 }))
 vi.mock('./chat-drop-overlay', () => ({ ChatDropOverlay: () => null }))
 vi.mock('./chat-swap-overlay', () => ({ ChatSwapOverlay: () => null, ChatSyncBadge: () => null }))
-vi.mock('./composer', () => ({ ChatBar: () => null, ChatBarFallback: () => null }))
+vi.mock('./composer', async () => {
+  const React = await import('react')
+
+  return {
+    ChatBar: ({ onSubmit }: { onSubmit: (text: string) => void }) =>
+      React.createElement(
+        'button',
+        { onClick: () => onSubmit('identity probe'), type: 'button' },
+        'submit identity probe'
+      ),
+    ChatBarFallback: () => null
+  }
+})
 vi.mock('./hooks/use-file-drop-zone', () => ({
   useFileDropZone: () => ({ dragKind: null, dropHandlers: {} })
 }))
@@ -86,6 +99,12 @@ describe('ChatView render isolation', () => {
     $messages.set([assistantMessage('assistant-1', 'Stable historical answer')])
     $selectedStoredSessionId.set('stored-1')
     $sessions.set([{ id: 'stored-1', message_count: 1, title: 'Stable chat' } as never])
+    $connectionsRegistry.set({
+      connections: [{ id: 'homelab', kind: 'ssh', label: 'Homelab', tokenSet: false }],
+      primary: 'homelab',
+      secureTokenStorage: true,
+      version: 1
+    } as never)
   })
 
   afterEach(() => {
@@ -103,6 +122,7 @@ describe('ChatView render isolation', () => {
     $messages.set([])
     $selectedStoredSessionId.set(null)
     $sessions.set([])
+    $connectionsRegistry.set(null)
   })
 
   it('does not re-render chat history when an unrelated parent idle tick updates', () => {
@@ -160,5 +180,73 @@ describe('ChatView render isolation', () => {
     // memo(ChatView) with stable props must absorb the parent's idle tick —
     // the transcript (Thread) must not re-render. This is PR #38470's contract.
     expect(threadRenderCount.current).toBe(1)
+  })
+
+  it('blocks the production submit entrypoint when the backend receipt diverges', () => {
+    const onSubmit = vi.fn()
+    $sessions.set([
+      {
+        active_context: {
+          schema: 'kindra.active-context/v1',
+          connection_id: 'homelab',
+          gateway_generation: 'gateway-sha',
+          machine: 'personal-mac-mini',
+          profile: 'research',
+          runtime_session_id: 'runtime-1',
+          stored_session_id: 'different-session',
+          tenant: 'research-team',
+          work_id: null,
+          xirp_session_id: null
+        },
+        connection_id: 'homelab',
+        gateway_generation: 'gateway-sha',
+        id: 'stored-1',
+        machine: 'personal-mac-mini',
+        message_count: 1,
+        profile: 'research',
+        runtime_session_id: 'runtime-1',
+        tenant: 'research-team',
+        title: 'Stable chat'
+      } as never
+    ])
+
+    const props = {
+      gateway: null,
+      identityV2Enabled: true,
+      onAddContextRef: vi.fn(),
+      onAddUrl: vi.fn(),
+      onAttachDroppedItems: vi.fn(),
+      onAttachImageBlob: vi.fn(),
+      onCancel: vi.fn(),
+      onDeleteSelectedSession: vi.fn(),
+      onEdit: vi.fn(),
+      onPasteClipboardImage: vi.fn(),
+      onPickFiles: vi.fn(),
+      onPickFolders: vi.fn(),
+      onPickImages: vi.fn(),
+      onReload: vi.fn(),
+      onRemoveAttachment: vi.fn(),
+      onRetryResume: vi.fn(),
+      onSteer: vi.fn(),
+      onSubmit,
+      onThreadMessagesChange: vi.fn(),
+      onToggleSelectedPin: vi.fn()
+    }
+
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } }
+    })
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={['/stored-1']}>
+          <ChatView {...props} />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'submit identity probe' }))
+
+    expect(onSubmit).not.toHaveBeenCalled()
   })
 })

@@ -1,4 +1,5 @@
 import type { SessionOwnerScope } from '@/store/session-request-router'
+import type { ActiveContextReceipt } from '@/types/hermes'
 
 /**
  * Who owns the destination of the next message: profile, connection, session.
@@ -48,6 +49,27 @@ export interface ActiveContextCorrelation {
   storedSessionId: null | string
   xirpSessionId: null | string
   workId: null | string
+}
+
+/** Translate the backend receipt without filling any identity field locally. */
+export function activeContextCorrelationFromReceipt(
+  receipt: ActiveContextReceipt | null | undefined
+): ActiveContextCorrelation | null {
+  if (receipt?.schema !== 'kindra.active-context/v1') {
+    return null
+  }
+
+  return {
+    connectionId: trimmed(receipt.connection_id),
+    profile: trimmed(receipt.profile),
+    tenant: trimmed(receipt.tenant),
+    machine: trimmed(receipt.machine),
+    gatewayGeneration: trimmed(receipt.gateway_generation),
+    runtimeSessionId: trimmed(receipt.runtime_session_id),
+    storedSessionId: trimmed(receipt.stored_session_id),
+    xirpSessionId: trimmed(receipt.xirp_session_id),
+    workId: trimmed(receipt.work_id)
+  }
 }
 
 export interface ActiveContextDeps {
