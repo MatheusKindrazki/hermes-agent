@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import json
 import sqlite3
 import threading
 import time
@@ -20,6 +21,8 @@ CREATE TABLE IF NOT EXISTS run_request_idempotency(
   request_sha256 TEXT NOT NULL,
   payload_sha256 TEXT NOT NULL,
   run_id TEXT NOT NULL UNIQUE,
+  state TEXT NOT NULL DEFAULT 'claimed',
+  receipt_json TEXT NOT NULL DEFAULT '{}',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -34,6 +37,13 @@ class RunIdempotencyConflict(RuntimeError):
 class RunIdempotencyClaim:
     run_id: str
     inserted: bool
+
+
+@dataclass(frozen=True)
+class RunIdempotencyRecord:
+    run_id: str
+    state: str
+    receipt: dict
 
 
 class RunIdempotencyLedger:
@@ -54,6 +64,22 @@ class RunIdempotencyLedger:
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA synchronous=FULL")
         connection.executescript(_SCHEMA)
+        columns = {
+            str(row[1])
+            for row in connection.execute(
+                "PRAGMA table_info(run_request_idempotency)"
+            ).fetchall()
+        }
+        if "state" not in columns:
+            connection.execute(
+                "ALTER TABLE run_request_idempotency "
+                "ADD COLUMN state TEXT NOT NULL DEFAULT 'claimed'"
+            )
+        if "receipt_json" not in columns:
+            connection.execute(
+                "ALTER TABLE run_request_idempotency "
+                "ADD COLUMN receipt_json TEXT NOT NULL DEFAULT '{}'"
+            )
         os.chmod(self.db_path, 0o600)
         return connection
 
@@ -90,6 +116,64 @@ class RunIdempotencyLedger:
                 request_sha256=request_sha256,
                 payload_sha256=payload_sha256,
             )
+
+    @staticmethod
+    def _record(row: tuple[str, str, str]) -> RunIdempotencyRecord:
+        try:
+            receipt = json.loads(row[2])
+        except (TypeError, ValueError):
+            receipt = {}
+        return RunIdempotencyRecord(
+            run_id=str(row[0]),
+            state=str(row[1] or "claimed"),
+            receipt=receipt if isinstance(receipt, dict) else {},
+        )
+
+    def lookup_record(
+        self,
+        *,
+        idempotency_key: str,
+        request_sha256: str,
+        payload_sha256: str,
+    ) -> Optional[RunIdempotencyRecord]:
+        with self._lock, closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT request_sha256,payload_sha256,run_id,state,receipt_json "
+                "FROM run_request_idempotency WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if row is None:
+                return None
+            self._validate_existing(
+                (row[0], row[1], row[2]),
+                request_sha256=request_sha256,
+                payload_sha256=payload_sha256,
+            )
+            return self._record((row[2], row[3], row[4]))
+
+    def lookup_run(self, run_id: str) -> Optional[RunIdempotencyRecord]:
+        with self._lock, closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT run_id,state,receipt_json "
+                "FROM run_request_idempotency WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            return self._record(row) if row is not None else None
+
+    def update_state(self, run_id: str, state: str, receipt: dict) -> None:
+        now = time.time_ns() // 1_000_000
+        encoded = json.dumps(
+            receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        with self._lock, closing(self._connect()) as connection, connection:
+            connection.execute(
+                "UPDATE run_request_idempotency "
+                "SET state = ?,receipt_json = ?,updated_at = ? WHERE run_id = ?",
+                (state, encoded, now, run_id),
+            )
+
+    def attach(self, run_id: str, receipt: dict) -> None:
+        self.update_state(run_id, "attached", receipt)
 
     def claim(
         self,

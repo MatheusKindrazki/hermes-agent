@@ -1569,6 +1569,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
         self._run_idempotency = RunIdempotencyLedger()
+        self._run_idempotent_ids: set[str] = set()
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
         self._session_dbs: Dict[str, Any] = {}
         self._session_db_cache_lock = threading.Lock()
@@ -7495,7 +7496,37 @@ class APIServerAdapter(BasePlatformAdapter):
         current.setdefault("created_at", fields.pop("created_at", now))
         current.update(fields)
         self._run_statuses[run_id] = current
+        if run_id in self._run_idempotent_ids:
+            try:
+                self._run_idempotency.update_state(run_id, status, current)
+            except Exception:
+                logger.exception(
+                    "[api_server] failed to persist idempotent run receipt %s",
+                    run_id,
+                )
         return current
+
+    def _recovery_required_run_receipt(self, run_id: str) -> Dict[str, Any]:
+        receipt = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "recovery_required",
+            "deduplicated": True,
+            "reattach": {
+                "required": True,
+                "method": "POST",
+                "reason": "durable_receipt_has_no_live_worker",
+            },
+        }
+        try:
+            self._run_idempotency.update_state(
+                run_id, "recovery_required", receipt
+            )
+        except Exception:
+            logger.exception(
+                "[api_server] failed to persist recovery receipt %s", run_id
+            )
+        return receipt
 
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
@@ -7678,6 +7709,8 @@ class APIServerAdapter(BasePlatformAdapter):
         ).strip()
         request_sha256 = ""
         payload_sha256 = ""
+        reattached = False
+        recoverable_run_id: Optional[str] = None
 
         def _deduplicated_response(existing_run_id: str) -> "web.Response":
             response_headers = (
@@ -7737,7 +7770,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ).encode("utf-8")
             ).hexdigest()
             try:
-                existing_run_id = self._run_idempotency.lookup(
+                existing_record = self._run_idempotency.lookup_record(
                     idempotency_key=idempotency_key,
                     request_sha256=request_sha256,
                     payload_sha256=payload_sha256,
@@ -7750,8 +7783,31 @@ class APIServerAdapter(BasePlatformAdapter):
                     ),
                     status=409,
                 )
-            if existing_run_id is not None:
-                return _deduplicated_response(existing_run_id)
+            if existing_record is not None:
+                existing_run_id = existing_record.run_id
+                if (
+                    existing_run_id in self._run_statuses
+                    or existing_run_id in self._active_run_tasks
+                ):
+                    return _deduplicated_response(existing_run_id)
+                if existing_record.state == "claimed":
+                    # The durable claim exists but no worker was ever attached.
+                    # The exact retry body is present on this request, so reuse
+                    # the original run id and start the missing worker.
+                    recoverable_run_id = existing_run_id
+                    reattached = True
+                elif existing_record.state in {"completed", "failed", "cancelled"}:
+                    durable = dict(existing_record.receipt)
+                    durable.setdefault("object", "hermes.run")
+                    durable.setdefault("run_id", existing_run_id)
+                    durable.setdefault("status", existing_record.state)
+                    durable["deduplicated"] = True
+                    return web.json_response(durable, status=202)
+                else:
+                    return web.json_response(
+                        self._recovery_required_run_receipt(existing_run_id),
+                        status=409,
+                    )
 
         # Let durable retries return the original receipt before applying the
         # shared concurrency limit. A retry must not become 429 merely because
@@ -7760,8 +7816,8 @@ class APIServerAdapter(BasePlatformAdapter):
         if limited is not None:
             return limited
 
-        run_id = f"run_{uuid.uuid4().hex}"
-        if idempotency_key:
+        run_id = recoverable_run_id or f"run_{uuid.uuid4().hex}"
+        if idempotency_key and recoverable_run_id is None:
             try:
                 claim = self._run_idempotency.claim(
                     idempotency_key=idempotency_key,
@@ -8106,6 +8162,12 @@ class APIServerAdapter(BasePlatformAdapter):
         self._activate_admitted_request()
         task = asyncio.create_task(_run_and_close())
         self._active_run_tasks[run_id] = task
+        if idempotency_key:
+            self._run_idempotent_ids.add(run_id)
+            self._run_idempotency.attach(
+                run_id,
+                dict(self._run_statuses.get(run_id, {"run_id": run_id, "status": "queued"})),
+            )
         try:
             self._background_tasks.add(task)
         except TypeError:
@@ -8116,8 +8178,11 @@ class APIServerAdapter(BasePlatformAdapter):
         response_headers = (
             {"X-Hermes-Session-Key": gateway_session_key} if gateway_session_key else {}
         )
+        response_body = {"run_id": run_id, "status": "started"}
+        if reattached:
+            response_body["reattached"] = True
         return web.json_response(
-            {"run_id": run_id, "status": "started"},
+            response_body,
             status=202,
             headers=response_headers,
         )
@@ -8131,10 +8196,21 @@ class APIServerAdapter(BasePlatformAdapter):
         run_id = request.match_info["run_id"]
         status = self._run_statuses.get(run_id)
         if status is None:
-            return web.json_response(
-                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
-                status=404,
-            )
+            durable = self._run_idempotency.lookup_run(run_id)
+            if durable is None:
+                return web.json_response(
+                    _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                    status=404,
+                )
+            if durable.state in {"completed", "failed", "cancelled"}:
+                status = dict(durable.receipt)
+                status.setdefault("object", "hermes.run")
+                status.setdefault("run_id", run_id)
+                status.setdefault("status", durable.state)
+            elif durable.state == "recovery_required":
+                status = dict(durable.receipt)
+            else:
+                status = self._recovery_required_run_receipt(run_id)
         return web.json_response(status)
 
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":

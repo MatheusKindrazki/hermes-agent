@@ -10,6 +10,8 @@ Covers:
 """
 
 import asyncio
+import hashlib
+import json
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -25,6 +27,7 @@ from gateway.platforms.api_server import (
     cors_middleware,
     security_headers_middleware,
 )
+from gateway.run_idempotency import RunIdempotencyLedger
 from tools import approval as approval_mod
 
 
@@ -128,6 +131,116 @@ def auth_adapter():
 
 
 class TestStartRun:
+    @pytest.mark.asyncio
+    async def test_retry_reattaches_a_claim_that_never_started_a_worker(
+        self, tmp_path
+    ):
+        body = {
+            "session_id": "webui-session",
+            "message": "resume the claimed work",
+            "metadata": {"request_sha256": "c" * 64},
+        }
+        key = "turn:webui-session:crash"
+        payload_sha256 = hashlib.sha256(
+            json.dumps(
+                body,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        ledger = RunIdempotencyLedger(tmp_path / "runs.sqlite3")
+        crashed_run_id = "run_claimed_before_crash"
+        ledger.claim(
+            idempotency_key=key,
+            request_sha256="c" * 64,
+            payload_sha256=payload_sha256,
+            proposed_run_id=crashed_run_id,
+        )
+
+        replacement = _make_adapter()
+        replacement._run_idempotency = RunIdempotencyLedger(
+            tmp_path / "runs.sqlite3"
+        )
+        app = _create_runs_app(replacement)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(replacement, "_create_agent") as mock_create:
+                agent = MagicMock()
+                agent.run_conversation.return_value = {"final_response": "done"}
+                agent.session_prompt_tokens = 0
+                agent.session_completion_tokens = 0
+                agent.session_total_tokens = 0
+                mock_create.return_value = agent
+
+                response = await cli.post(
+                    "/v1/runs",
+                    json=body,
+                    headers={"Idempotency-Key": key},
+                )
+                data = await response.json()
+                for _ in range(40):
+                    if mock_create.call_count:
+                        break
+                    await asyncio.sleep(0.01)
+                status_response = await cli.get(f"/v1/runs/{crashed_run_id}")
+
+        assert response.status == 202
+        assert data["run_id"] == crashed_run_id
+        assert data["reattached"] is True
+        assert mock_create.call_count == 1
+        assert status_response.status == 200
+
+    @pytest.mark.asyncio
+    async def test_retry_requires_recovery_when_durable_claim_had_attached_worker(
+        self, tmp_path
+    ):
+        body = {
+            "message": "do not duplicate the attached worker",
+            "metadata": {"request_sha256": "d" * 64},
+        }
+        key = "turn:webui-session:attached"
+        payload_sha256 = hashlib.sha256(
+            json.dumps(
+                body,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        ledger = RunIdempotencyLedger(tmp_path / "runs.sqlite3")
+        run_id = "run_attached_before_crash"
+        ledger.claim(
+            idempotency_key=key,
+            request_sha256="d" * 64,
+            payload_sha256=payload_sha256,
+            proposed_run_id=run_id,
+        )
+        ledger.attach(run_id, {"run_id": run_id, "status": "queued"})
+
+        replacement = _make_adapter()
+        replacement._run_idempotency = RunIdempotencyLedger(
+            tmp_path / "runs.sqlite3"
+        )
+        app = _create_runs_app(replacement)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(replacement, "_create_agent") as mock_create:
+                response = await cli.post(
+                    "/v1/runs",
+                    json=body,
+                    headers={"Idempotency-Key": key},
+                )
+                data = await response.json()
+                status_response = await cli.get(f"/v1/runs/{run_id}")
+                durable_status = await status_response.json()
+
+        assert response.status == 409
+        assert data["status"] == "recovery_required"
+        assert data["run_id"] == run_id
+        assert data["reattach"]["required"] is True
+        mock_create.assert_not_called()
+        assert status_response.status == 200
+        assert durable_status["status"] == "recovery_required"
+
     @pytest.mark.asyncio
     async def test_start_returns_202(self, adapter):
         app = _create_runs_app(adapter)
