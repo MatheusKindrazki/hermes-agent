@@ -45,6 +45,19 @@ export const en: Translations = {
     off: 'Off'
   },
 
+  activeContext: {
+    unknownProfile: 'unknown profile',
+    unknownTenant: 'unknown tenant',
+    unknownDevice: 'unknown device',
+    newChat: 'New chat',
+    chat: 'Chat',
+    thisChat: 'This chat',
+    ownerUnknown: (profile, device) => `owner unknown — ${profile} on ${device}`,
+    ownerKnown: (profile, device) => `${profile} on ${device}`,
+    detail: (what, owner, tenant) => `${what}: ${owner}; tenant ${tenant}`,
+    text: (what, profile, tenant, device) => `${what} · ${profile} · ${tenant} · ${device}`
+  },
+
   fileMenu: {
     revealFinder: 'Reveal in Finder',
     revealExplorer: 'Reveal in File Explorer',

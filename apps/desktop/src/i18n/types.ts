@@ -93,6 +93,19 @@ export interface Translations {
     off: string
   }
 
+  activeContext: {
+    unknownProfile: string
+    unknownTenant: string
+    unknownDevice: string
+    newChat: string
+    chat: string
+    thisChat: string
+    ownerUnknown: (profile: string, device: string) => string
+    ownerKnown: (profile: string, device: string) => string
+    detail: (what: string, owner: string, tenant: string) => string
+    text: (what: string, profile: string, tenant: string, device: string) => string
+  }
+
   fileMenu: {
     revealFinder: string
     revealExplorer: string

@@ -34,7 +34,9 @@ Two tests:
 from __future__ import annotations
 
 import ast
+import asyncio
 import inspect
+from types import SimpleNamespace
 
 from gateway import run as gateway_run
 from gateway.config import GatewayConfig, Platform
@@ -197,3 +199,55 @@ class TestAutoResetLoadsCleanContext:
         # The old transcript is still searchable, not destroyed.
         assert len(store.load_transcript(bloated_sid)) == 120
 
+
+def test_compression_exhaustion_handoff_is_persisted_exactly_once():
+    """An ineffective compressor must not discard the active user turn."""
+
+    async def scenario():
+        runner = object.__new__(gateway_run.GatewayRunner)
+        rows = []
+        seen = set()
+
+        async def has_message(_session_id, message_id):
+            return message_id in seen
+
+        async def append(_session_id, row, **_kwargs):
+            rows.append(row)
+            seen.add(row["message_id"])
+
+        runner._async_session_store = SimpleNamespace(
+            _store=None,
+            has_platform_message_id=has_message,
+            append_to_transcript=append,
+        )
+        runner.session_store = None
+        entry = SimpleNamespace(session_id="fresh-handoff-session")
+        content = [
+            {"type": "text", "text": "preserve this checkpoint"},
+            {"type": "image_url", "image_url": {"url": "file:///tmp/pending.png"}},
+        ]
+        event = SimpleNamespace(message_id="platform-turn-7", timestamp=123.0)
+
+        first = await runner._persist_compression_handoff(
+            entry, event=event, content=content, source_session_id="oversized-parent"
+        )
+        second = await runner._persist_compression_handoff(
+            entry, event=event, content=content, source_session_id="oversized-parent"
+        )
+
+        assert first is True
+        assert second is False
+        assert rows == [
+            {
+                "role": "user",
+                "content": content,
+                "timestamp": 123.0,
+                "message_id": "platform-turn-7",
+                "_compression_handoff": {
+                    "source_session_id": "oversized-parent",
+                    "reason": "compression_exhausted",
+                },
+            }
+        ]
+
+    asyncio.run(scenario())

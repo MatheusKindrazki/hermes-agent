@@ -2005,6 +2005,55 @@ class TestWebServerEndpoints:
         assert payload["limit"] == 3
         assert len(payload["sessions"]) == 3
 
+    def test_get_sessions_emits_configured_active_context_v1_receipt(self):
+        """The production Desktop session entrypoint owns the v1 receipt."""
+        from hermes_cli.config import load_config, save_config
+        from hermes_state import SessionDB
+
+        config = load_config()
+        config.setdefault("gateway", {}).setdefault("reliability", {})[
+            "active_context"
+        ] = {
+            "enabled": True,
+            "connection_id": "mini-direct",
+            "tenant": "lugui",
+            "machine": "personal-mac-mini",
+            "gateway_generation": "gateway-sha",
+        }
+        save_config(config)
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="active-context-session", source="cli")
+            db.append_message(
+                session_id="active-context-session",
+                role="user",
+                content="hello",
+            )
+        finally:
+            db.close()
+
+        response = self.client.get("/api/sessions?limit=20&order=recent")
+
+        assert response.status_code == 200
+        session = next(
+            row
+            for row in response.json()["sessions"]
+            if row["id"] == "active-context-session"
+        )
+        assert session["active_context"] == {
+            "schema": "kindra.active-context/v1",
+            "connection_id": "mini-direct",
+            "profile": "default",
+            "tenant": "lugui",
+            "machine": "personal-mac-mini",
+            "gateway_generation": "gateway-sha",
+            "runtime_session_id": "active-context-session",
+            "stored_session_id": "active-context-session",
+            "xirp_session_id": None,
+            "work_id": None,
+        }
+
     def test_profiles_sessions_rejects_negative_limit(self):
         """Same guard on the cross-profile aggregate route — negative limit
         previously bypassed the per-profile 500-row clamp entirely."""

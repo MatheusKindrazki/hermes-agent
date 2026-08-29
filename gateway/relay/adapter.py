@@ -20,12 +20,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import secrets
 import time
 from collections import OrderedDict
 from typing import Any, Callable, Dict, Optional, Tuple, cast
 
 from gateway.config import Platform, PlatformConfig
+from gateway.egress_policy import EgressPolicy
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 from gateway.relay.descriptor import CapabilityDescriptor
 from gateway.relay.media import RelayMediaClient
@@ -41,6 +43,12 @@ logger = logging.getLogger(__name__)
 # reader, and ws.close (~3s), the full drain path stays inside 5s.
 _RELAY_GO_IDLE_ON_DISCONNECT_TIMEOUT_S = 2.0
 _RELAY_REVOCATION_MONITOR_TEARDOWN_TIMEOUT_S = 1.0
+
+# Link detection for the fresh-final unfurl route: raw http(s) URLs, Slack
+# mrkdwn link syntax (<https://...|label>), and markdown links. Cheap and
+# permissive on purpose — a false positive costs one fresh (non-edited)
+# final message; a false negative silently loses the preview.
+_URL_RE = re.compile(r"https?://|<https?:|\]\(https?:")
 
 # How many already-answered prompt ids to remember, so a duplicate answer for
 # one of them (a double tap, or a connector redelivery of the same forward) is
@@ -76,6 +84,7 @@ class RelayAdapter(BasePlatformAdapter):
         super().__init__(config, Platform.RELAY)
         self.descriptor = descriptor
         self._transport = transport
+        self._egress_policy = EgressPolicy.from_config()
         # Capability surface read by stream_consumer (getattr(..., 4096)).
         self.MAX_MESSAGE_LENGTH = descriptor.max_message_length
         # chat_id -> scope_id (server/workspace scope), learned from inbound
@@ -334,6 +343,55 @@ class RelayAdapter(BasePlatformAdapter):
         if self._slack_unfurl_hints(platform):
             return False
         return True
+
+    def prefers_fresh_final_streaming(
+        self,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        chat_id: Optional[str] = None,
+    ) -> bool:
+        """Deliver streamed finals as a FRESH send when Slack unfurl is forced on.
+
+        Slack evaluates link previews exactly once, at ``chat.postMessage``
+        time (live-probed 2026-08-28: URL at post + ``unfurl_links: true``
+        unfurls; a ``chat.update`` that INTRODUCES the URL never does, stamps
+        or not). Edit-based streaming posts its first frame before the model
+        has produced any URL — a tool-progress card or an early text frame —
+        so a configured ``unfurl_links/media: true`` can never surface a
+        preview through the edit lane: the only post Slack evaluates has no
+        link in it.
+
+        Returning True routes the completed reply through the consumer's
+        fresh-final path: one new ``send`` carrying the full content, which
+        ``send()`` stamps with the unfurl hints — URL and flags present at
+        the single moment Slack looks.
+
+        Scope: ONLY when the hints contain an explicit True. False-only
+        hints (the enterprise fail-closed posture) keep the edit lane —
+        suppression rides the placeholder post and an edit can never add a
+        preview afterwards, so ``false`` inherits correctly with zero
+        streaming-UX cost.
+        """
+        platform = None
+        if chat_id is not None:
+            platform = self._platform_by_chat.get(str(chat_id))
+        # The stream consumer's hook call passes (content, metadata=...) only
+        # — no chat_id — so resolve through the turn metadata's platform when
+        # present before falling back to the primary descriptor.
+        if platform is None and isinstance(metadata, dict):
+            platform = metadata.get("platform")
+        if platform is None:
+            platform = getattr(self.descriptor, "platform", None)
+        hints = self._slack_unfurl_hints(platform)
+        if not hints:
+            return False
+        if not any(v is True for v in hints.values()):
+            return False
+        # Only link-bearing finals benefit: without a URL there is nothing to
+        # unfurl, and the relay has no delete op (connector contract v1), so
+        # the streamed preview stays behind the fresh final. Keep the edit
+        # lane for linkless replies to avoid a pointless duplicate message.
+        return bool(_URL_RE.search(content or ""))
 
     def stream_is_message_for_chat(self, chat_id: str) -> bool:
         """Per-chat stream-is-the-message semantic (review r2, finding 2).
@@ -1740,6 +1798,41 @@ class RelayAdapter(BasePlatformAdapter):
             logger.debug("relay go_dormant failed", exc_info=True)
             return False
 
+    def _prepare_egress(
+        self,
+        *,
+        action: str,
+        destination: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> tuple[Dict[str, Any], Optional[SendResult]]:
+        prepared = dict(metadata or {})
+        checked_mode = prepared.pop("_egress_policy_checked", None)
+        if (
+            self._egress_policy.mode != "off"
+            and checked_mode == self._egress_policy.mode
+        ):
+            return prepared, None
+        prepared, decision = self._egress_policy.prepare_metadata(
+            action=action,
+            destination=destination,
+            content=content.encode("utf-8"),
+            metadata=prepared,
+        )
+        if decision.allowed:
+            return prepared, None
+        logger.warning(
+            "Egress policy rejected relay %s to %s: %s",
+            action,
+            destination,
+            ",".join(decision.reasons),
+        )
+        return prepared, SendResult(
+            success=False,
+            error="egress_policy_rejected",
+            error_kind="egress_policy_rejected",
+        )
+
     async def send_for_platform(
         self,
         logical_platform: Any,
@@ -1765,6 +1858,14 @@ class RelayAdapter(BasePlatformAdapter):
         # Gateway-internal interim marker (see send()): strip before the
         # wire; an interim send through this door also skips interception.
         _interim = bool(_sfp_metadata.pop("_interim_send", False))
+        _sfp_metadata, _egress_block = self._prepare_egress(
+            action="send",
+            destination=f"{platform_value}:{chat_id}",
+            content=content,
+            metadata=_sfp_metadata,
+        )
+        if _egress_block is not None:
+            return _egress_block
         # Finding #7 (live canary): the delivery resolver calls THIS method
         # directly (gateway/delivery.py), bypassing send() — an open native
         # stream must absorb the turn-final here too, or the stream is left
@@ -1928,6 +2029,17 @@ class RelayAdapter(BasePlatformAdapter):
         # plain-send duplicate (live finding, 2026-08-16 canary). The
         # marker is gateway-internal; strip before the wire.
         _interim = bool(send_metadata.pop("_interim_send", False))
+        destination_platform = explicit_platform or self._platform_by_chat.get(
+            str(chat_id)
+        ) or self.descriptor.platform
+        send_metadata, _egress_block = self._prepare_egress(
+            action="send",
+            destination=f"{destination_platform}:{chat_id}",
+            content=content,
+            metadata=send_metadata,
+        )
+        if _egress_block is not None:
+            return _egress_block
         # NS-658 seal-interception — checked BEFORE the explicit-platform
         # branch (finding #7, live canary): the delivery-resolver lane
         # (follow-up queue, media-accompanied finals, scheduled sends) routes
@@ -1958,6 +2070,8 @@ class RelayAdapter(BasePlatformAdapter):
                 seal.error,
             )
         if explicit_platform:
+            if self._egress_policy.mode != "off":
+                send_metadata["_egress_policy_checked"] = self._egress_policy.mode
             return await self.send_for_platform(
                 explicit_platform,
                 chat_id,
@@ -2218,6 +2332,14 @@ class RelayAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Edit a relayed message through the connector-owned platform API."""
+        edit_metadata, _egress_block = self._prepare_egress(
+            action="edit",
+            destination=f"{self._platform_by_chat.get(str(chat_id)) or self.descriptor.platform}:{chat_id}",
+            content=content,
+            metadata=metadata,
+        )
+        if _egress_block is not None:
+            return _egress_block
         if self._transport is None:
             return SendResult(success=False, error="no transport")
         result = await self._transport.send_outbound(
@@ -2231,7 +2353,8 @@ class RelayAdapter(BasePlatformAdapter):
                 # lane must signal block rendering too or streams would seal
                 # as plain text (boundary rule: every text egress lane).
                 "metadata": self._with_scope(
-                    chat_id, self._with_format_hints_for_chat(chat_id, metadata)
+                    chat_id,
+                    self._with_format_hints_for_chat(chat_id, edit_metadata),
                 ),
             },
             platform=self._platform_by_chat.get(str(chat_id)),
@@ -2241,6 +2364,44 @@ class RelayAdapter(BasePlatformAdapter):
             message_id=result.get("message_id") or message_id,
             error=result.get("error"),
         )
+
+    async def delete_message(
+        self,
+        chat_id: str,
+        message_id: str,
+    ) -> bool:
+        """Delete a relayed message through the connector-owned platform API.
+
+        Consumer: the stream consumer's fresh-final cleanup — on the Slack
+        unfurl force-on route the completed reply is re-delivered as a new
+        stamped post and the sealed streamed preview must go away, or the
+        user sees the answer twice.
+
+        Gated on the negotiated descriptor advertising the ``delete`` op
+        (additive within contract_version 1): older connectors never receive
+        an op they can't dispatch, and this returns False so the consumer's
+        best-effort cleanup degrades to leaving the preview in place —
+        exactly the pre-delete behavior.
+        """
+        if self._transport is None:
+            return False
+        desc = self._descriptor_for_chat(str(chat_id))
+        if "delete" not in (desc.supported_ops or ()):
+            return False
+        try:
+            result = await self._transport.send_outbound(
+                {
+                    "op": "delete",
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "metadata": self._with_scope(chat_id, {}),
+                },
+                platform=self._platform_by_chat.get(str(chat_id)),
+            )
+        except Exception:
+            logger.debug("relay delete_message failed", exc_info=True)
+            return False
+        return bool(result.get("success"))
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Egress a typing indicator through the connector.
