@@ -32,6 +32,9 @@ export interface ChatBarState {
 }
 
 export interface ChatBarProps {
+  /** Keep only the rich-text draft surface editable while every dispatch,
+   * steer, queue, voice, and attachment action remains disabled. */
+  allowDraftingWhileDisabled?: boolean
   busy: boolean
   disabled: boolean
   focusKey?: string | null

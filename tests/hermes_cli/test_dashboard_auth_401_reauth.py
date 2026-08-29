@@ -138,6 +138,12 @@ class TestApi401Envelope:
         assert "login_url" in body
         assert body["login_url"].startswith("/login")
 
+    def test_desktop_capabilities_requires_the_dashboard_session(self, gated_app):
+        response = gated_app.get("/v1/capabilities")
+
+        assert response.status_code == 401
+        assert response.json()["error"] == "unauthenticated"
+
 
     def test_invalid_cookie_clears_dead_cookie(self, gated_app):
         """Dead-cookie cleanup — Phase 6 requirement so the browser

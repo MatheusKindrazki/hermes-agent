@@ -56,11 +56,34 @@ vi.mock('./composer', async () => {
   const React = await import('react')
 
   return {
-    ChatBar: ({ onSubmit }: { onSubmit: (text: string) => void }) =>
+    ChatBar: ({
+      allowDraftingWhileDisabled,
+      disabled,
+      onSteer,
+      onSubmit
+    }: {
+      allowDraftingWhileDisabled?: boolean
+      disabled?: boolean
+      onSteer?: (text: string) => void
+      onSubmit: (text: string) => void
+    }) =>
       React.createElement(
-        'button',
-        { onClick: () => onSubmit('identity probe'), type: 'button' },
-        'submit identity probe'
+        'div',
+        {
+          'data-composer-disabled': disabled ? 'true' : 'false',
+          'data-drafting-while-disabled': allowDraftingWhileDisabled ? 'true' : 'false',
+          'data-testid': 'composer-probe'
+        },
+        React.createElement(
+          'button',
+          { onClick: () => onSubmit('identity probe'), type: 'button' },
+          'submit identity probe'
+        ),
+        React.createElement(
+          'button',
+          { onClick: () => onSteer?.('identity steer probe'), type: 'button' },
+          'steer identity probe'
+        )
       ),
     ChatBarFallback: () => null
   }
@@ -195,6 +218,7 @@ describe('ChatView render isolation', () => {
 
   it('blocks the production submit entrypoint when the backend receipt diverges', () => {
     const onSubmit = vi.fn()
+    const onSteer = vi.fn()
     $sessions.set([
       {
         active_context: {
@@ -238,7 +262,7 @@ describe('ChatView render isolation', () => {
       onReload: vi.fn(),
       onRemoveAttachment: vi.fn(),
       onRetryResume: vi.fn(),
-      onSteer: vi.fn(),
+      onSteer,
       onSubmit,
       onThreadMessagesChange: vi.fn(),
       onToggleSelectedPin: vi.fn()
@@ -257,11 +281,13 @@ describe('ChatView render isolation', () => {
     )
 
     fireEvent.click(screen.getByRole('button', { name: 'submit identity probe' }))
+    fireEvent.click(screen.getByRole('button', { name: 'steer identity probe' }))
 
     expect(onSubmit).not.toHaveBeenCalled()
+    expect(onSteer).not.toHaveBeenCalled()
   })
 
-  it('blocks a draft without a receipt when the backend capability enables the canary', async () => {
+  it('keeps a fresh draft editable but blocks submit and steer without a receipt when the canary is enabled', async () => {
     getApiCapabilities.mockResolvedValue({
       features: {
         active_context_v2: {
@@ -275,6 +301,7 @@ describe('ChatView render isolation', () => {
     $selectedStoredSessionId.set(null)
     $sessions.set([])
     const onSubmit = vi.fn()
+    const onSteer = vi.fn()
 
     const props = {
       gateway: null,
@@ -292,7 +319,7 @@ describe('ChatView render isolation', () => {
       onReload: vi.fn(),
       onRemoveAttachment: vi.fn(),
       onRetryResume: vi.fn(),
-      onSteer: vi.fn(),
+      onSteer,
       onSubmit,
       onThreadMessagesChange: vi.fn(),
       onToggleSelectedPin: vi.fn()
@@ -313,13 +340,15 @@ describe('ChatView render isolation', () => {
     await vi.waitFor(() => {
       const surface = screen.getByRole('button', { name: 'submit identity probe' }).closest('[data-chat-surface]')
 
-      expect(
-        surface?.getAttribute('data-active-context-submit')
-      ).toBe('blocked')
+      expect(surface?.getAttribute('data-active-context-submit')).toBe('blocked')
+      expect(screen.getByTestId('composer-probe').getAttribute('data-composer-disabled')).toBe('true')
+      expect(screen.getByTestId('composer-probe').getAttribute('data-drafting-while-disabled')).toBe('true')
     })
     fireEvent.click(screen.getByRole('button', { name: 'submit identity probe' }))
+    fireEvent.click(screen.getByRole('button', { name: 'steer identity probe' }))
 
     expect(onSubmit).not.toHaveBeenCalled()
+    expect(onSteer).not.toHaveBeenCalled()
   })
 
   it('blocks an immediate draft click while backend capability is pending', () => {

@@ -1593,6 +1593,8 @@ class TestWebServerEndpoints:
         assert resp.status_code == 401
         resp = unauth_client.get("/api/config")
         assert resp.status_code == 401
+        resp = unauth_client.get("/v1/capabilities")
+        assert resp.status_code == 401
         # Public endpoints should still work
         resp = unauth_client.get("/api/status")
         assert resp.status_code == 200

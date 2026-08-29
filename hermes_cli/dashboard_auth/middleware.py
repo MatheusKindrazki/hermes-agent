@@ -64,6 +64,21 @@ _GATE_PUBLIC_PREFIXES: tuple[str, ...] = (
     "/fonts-terminal/",
 )
 
+# The Desktop shares the standalone API server's stable capability URL while
+# sending the request to ``hermes serve``. It is still an API fetch for auth
+# semantics: never redirect it through an HTML login flow.
+_DASHBOARD_NON_API_PREFIX_ENDPOINTS: frozenset[str] = frozenset({
+    "/v1/capabilities",
+})
+
+
+def _path_is_api(path: str) -> bool:
+    return (
+        path == "/api"
+        or path.startswith("/api/")
+        or path in _DASHBOARD_NON_API_PREFIX_ENDPOINTS
+    )
+
 
 def _path_is_public(path: str) -> bool:
     """True if ``path`` bypasses the OAuth auth gate.
@@ -141,7 +156,7 @@ def _unauth_response(request: Request, *, reason: str) -> Response:
         else f"{prefix}/login"
     )
 
-    if path.startswith("/api/"):
+    if _path_is_api(path):
         # API routes never get redirects: the browser fetch() API would
         # follow a 302 into the cross-origin OAuth dance opaquely. Return
         # 401 with a structured envelope so the SPA can full-page-navigate
@@ -192,7 +207,7 @@ def _auto_sso_response(request: Request) -> Response | None:
     """
     path = request.url.path
     # APIs never auto-redirect (see _unauth_response). Only document loads.
-    if path.startswith("/api/"):
+    if _path_is_api(path):
         return None
 
     # Already bounced once and still no session → portal has no session for
@@ -260,15 +275,15 @@ def _safe_next_target(request: Request) -> str:
         for p in ("/login", "/auth/", "/api/auth/")
     ):
         return ""
-    # Reject ALL ``/api/*`` paths. The 401-envelope code path fires for
-    # any unauthenticated SPA fetch (e.g. ``GET /api/analytics/models``
+    # Reject all API paths. The 401-envelope code path fires for
+    # any unauthenticated SPA/native fetch (e.g. ``GET /api/analytics/models``
     # from ModelsPage), and the SPA's global 401 handler full-page
     # navigates to ``login_url``. After the OAuth round trip the user
     # would land on the API URL and see raw JSON instead of the
     # dashboard. SPA routes survive (they don't start with ``/api/``);
     # the SPA's own ``sessionStorage["hermes.lastLocation"]`` fallback
     # in ``web/src/lib/api.ts`` covers the deep-link case.
-    if path == "/api" or path.startswith("/api/"):
+    if _path_is_api(path):
         return ""
     # Preserve query string if present (e.g. /sessions?page=2).
     query = request.url.query

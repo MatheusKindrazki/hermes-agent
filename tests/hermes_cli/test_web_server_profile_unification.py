@@ -78,6 +78,58 @@ class TestProfileScopedConfig:
         assert resp.status_code == 404
 
 
+class TestProfileScopedCapabilities:
+    def test_active_context_capability_defaults_off_on_dashboard_server(
+        self, client, isolated_profiles
+    ):
+        response = client.get("/v1/capabilities")
+
+        assert response.status_code == 200
+        assert response.json()["features"]["active_context_v2"] == {
+            "enabled": False,
+            "receipt_schema": "kindra.active-context/v1",
+        }
+
+    def test_active_context_capability_reads_the_requested_profile(
+        self, client, isolated_profiles
+    ):
+        worker_config = {
+            "gateway": {
+                "reliability": {
+                    "active_context": {
+                        "enabled": True,
+                    }
+                }
+            }
+        }
+        (isolated_profiles["worker_beta"] / "config.yaml").write_text(
+            yaml.safe_dump(worker_config), encoding="utf-8"
+        )
+
+        default_response = client.get("/v1/capabilities")
+        worker_response = client.get(
+            "/v1/capabilities", params={"profile": "worker_beta"}
+        )
+
+        assert default_response.status_code == 200
+        assert (
+            default_response.json()["features"]["active_context_v2"]["enabled"]
+            is False
+        )
+        assert worker_response.status_code == 200
+        assert (
+            worker_response.json()["features"]["active_context_v2"]["enabled"]
+            is True
+        )
+
+    def test_unknown_profile_does_not_fall_back_to_dashboard_config(
+        self, client, isolated_profiles
+    ):
+        response = client.get("/v1/capabilities", params={"profile": "ghost"})
+
+        assert response.status_code == 404
+
+
 class TestProfileScopedEnv:
     def test_env_set_lands_in_target_profile_only(self, client, isolated_profiles):
         resp = client.put(
