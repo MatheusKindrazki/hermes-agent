@@ -10114,6 +10114,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return True
 
+    async def _wait_for_deferred_compression(self, session_key: str) -> None:
+        """Wait until a soft-deferred compression turn can be retried safely.
+
+        A compression-deferred result promises that a queued user turn will
+        run after the concurrent compressor releases or rotates the session.
+        Keep the pending drain serialized behind that lock instead of starting
+        a second agent against the old parent.
+        """
+        while await self._session_has_compression_in_flight(session_key):
+            await asyncio.sleep(0.1)
+
     @staticmethod
     def _lookup_session_id_under_store_lock(session_store, session_key: str):
         """Sync helper run in the thread pool: read session_id under the store lock."""
@@ -30199,6 +30210,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception:
                         pass
 
+            deferred_session_entry = None
+            if (
+                result
+                and result.get("compression_deferred") is True
+                and result.get("failed") is False
+                and (pending_event or pending)
+            ):
+                await self._wait_for_deferred_compression(session_key)
+                deferred_source = (
+                    getattr(pending_event, "source", None)
+                    if pending_event is not None
+                    else source
+                ) or source
+                # Compression may have rotated the session while the queued
+                # event waited. Resolve its own profile/route before preparing
+                # attachments or starting the recursive turn.
+                deferred_session_entry = (
+                    await self.async_session_store.get_or_create_session(
+                        deferred_source
+                    )
+                )
+
             if self._draining and (pending_event or pending):
                 logger.info(
                     "Discarding pending follow-up for session %s during gateway %s",
@@ -30277,6 +30310,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
                             session_key or "?",
                         )
+                    elif result.get("compression_deferred") is True:
+                        logger.info(
+                            "Compression-deferred turn for session %s has a queued "
+                            "follow-up; suppressing the transient defer response.",
+                            session_key or "?",
+                        )
                     elif first_response:
                         try:
                             if _already_streamed:
@@ -30336,6 +30375,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 next_message_id = None
                 next_channel_prompt = None
                 next_session_key = session_key
+                next_session_id = session_id
                 # #60671 — carry the pending event's message_type into the
                 # recursive call so queued voice turns can stream TTS and
                 # re-mark the generation for the final delivered turn.
@@ -30361,6 +30401,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_key or "?",
                             exc_info=True,
                         )
+                    if deferred_session_entry is not None:
+                        next_session_key = deferred_session_entry.session_key
+                        next_session_id = deferred_session_entry.session_id
                     next_message = await self._prepare_profile_scoped_inbound_message_text(
                         event=pending_event,
                         source=next_source,
@@ -30413,14 +30456,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # follow-up.  Use the same (session_key, session_id) the
                 # recursive call runs under so the snapshot matches exactly
                 # what the follow-up's guard will consult.  Fail-safe in helper.
-                await self._refresh_agent_cache_message_count(session_key, session_id)
+                await self._refresh_agent_cache_message_count(
+                    next_session_key, next_session_id
+                )
 
                 followup_result = await self._run_agent(
                     message=next_message,
                     context_prompt=context_prompt,
                     history=updated_history,
                     source=next_source,
-                    session_id=session_id,
+                    session_id=next_session_id,
                     session_key=next_session_key,
                     run_generation=run_generation,
                     _interrupt_depth=_interrupt_depth + 1,

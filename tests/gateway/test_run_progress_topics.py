@@ -3,9 +3,11 @@
 import asyncio
 import importlib
 import sys
+import threading
 import time
 import types
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -955,6 +957,70 @@ class QueuedFailedEmptyAgent:
         }
 
 
+class CompressionDeferredQueuedAgent:
+    """First turn soft-defers; queued turn must wait for lock release."""
+
+    calls = []
+    compression_started = threading.Event()
+    release_flag = threading.Event()
+    active = 0
+    max_active = 0
+
+    def __init__(self, **kwargs):
+        self.session_id = kwargs.get("session_id")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).active += 1
+        type(self).max_active = max(type(self).max_active, type(self).active)
+        try:
+            type(self).calls.append(
+                {
+                    "message": message,
+                    "history": list(conversation_history or []),
+                    "session_id": self.session_id,
+                }
+            )
+            if len(type(self).calls) == 1:
+                type(self).compression_started.set()
+                return {
+                    "final_response": "compression deferred",
+                    "messages": [
+                        {"role": "assistant", "content": "pending checkpoint"},
+                        {"role": "user", "content": "first turn"},
+                    ],
+                    "api_calls": 1,
+                    "completed": False,
+                    "partial": True,
+                    "failed": False,
+                    "compression_deferred": True,
+                    "session_id": self.session_id,
+                }
+            if not type(self).release_flag.is_set():
+                return {
+                    "final_response": "Streaming connection error",
+                    "messages": list(conversation_history or []),
+                    "api_calls": 1,
+                    "completed": False,
+                    "failed": True,
+                    "error": "Streaming connection error",
+                }
+            return {
+                "final_response": "queued turn processed",
+                "messages": [
+                    *(conversation_history or []),
+                    {"role": "user", "content": message},
+                    {"role": "assistant", "content": "queued turn processed"},
+                ],
+                "api_calls": 1,
+                "completed": True,
+                "failed": False,
+                "session_id": self.session_id,
+            }
+        finally:
+            type(self).active -= 1
+
+
 class BackgroundReviewAgent:
     def __init__(self, **kwargs):
         self.background_review_callback = kwargs.get("background_review_callback")
@@ -1379,6 +1445,153 @@ async def test_run_agent_sends_normalized_failure_before_queued_followup(
     assert QueuedFailedEmptyAgent.calls == 2
     assert result["final_response"] == "follow-up processed"
     assert any("The request failed: provider exploded" in text for text in sent_texts)
+
+
+def test_compression_deferred_followup_waits_retargets_and_runs_once(
+    monkeypatch, tmp_path
+):
+    asyncio.run(
+        _assert_compression_deferred_followup_waits_retargets_and_runs_once(
+            monkeypatch, tmp_path
+        )
+    )
+
+
+async def _assert_compression_deferred_followup_waits_retargets_and_runs_once(
+    monkeypatch, tmp_path
+):
+    """A queued user turn must survive a concurrent compression rotation."""
+    CompressionDeferredQueuedAgent.calls = []
+    CompressionDeferredQueuedAgent.compression_started = threading.Event()
+    CompressionDeferredQueuedAgent.release_flag = threading.Event()
+    CompressionDeferredQueuedAgent.active = 0
+    CompressionDeferredQueuedAgent.max_active = 0
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = CompressionDeferredQueuedAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = ProgressCaptureAdapter(platform=Platform.TELEGRAM)
+    runner = _make_runner(adapter)
+    runner._adapter_for_source = lambda _source: adapter
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    stale_source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="42",
+        chat_type="dm",
+        profile="luguistaff",
+    )
+    current_source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="42",
+        chat_type="dm",
+        profile="default",
+    )
+    stale_key = "profile:luguistaff:telegram:dm:42"
+    current_key = "profile:default:telegram:dm:42"
+    pending = MessageEvent(
+        text="second turn",
+        message_type=MessageType.PHOTO,
+        source=current_source,
+        message_id="queued-2",
+        media_urls=["/tmp/pending.png"],
+        media_types=["image/png"],
+        reply_to_message_id="checkpoint-msg",
+        reply_to_text="keep this reply checkpoint",
+        channel_prompt="default profile prompt",
+    )
+    adapter._pending_messages[stale_key] = pending
+
+    runner._session_key_for_source = (
+        lambda src: current_key if getattr(src, "profile", None) == "default" else stale_key
+    )
+    refreshed_entry = SimpleNamespace(
+        session_key=current_key,
+        session_id="default-session-after-compression",
+    )
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        get_or_create_session=AsyncMock(return_value=refreshed_entry)
+    )
+
+    async def compression_in_flight(_session_key):
+        return (
+            CompressionDeferredQueuedAgent.compression_started.is_set()
+            and not CompressionDeferredQueuedAgent.release_flag.is_set()
+        )
+
+    runner._session_has_compression_in_flight = compression_in_flight
+    prepared = []
+
+    async def prepare_pending(*, event, source, history, session_key):
+        prepared.append(
+            {
+                "event": event,
+                "source": source,
+                "history": list(history),
+                "session_key": session_key,
+            }
+        )
+        return [
+            {"type": "text", "text": event.text},
+            {"type": "image_url", "image_url": {"url": event.media_urls[0]}},
+        ]
+
+    runner._prepare_profile_scoped_inbound_message_text = prepare_pending
+
+    task = asyncio.create_task(
+        runner._run_agent(
+            message="first turn",
+            context_prompt="",
+            history=[],
+            source=stale_source,
+            session_id="luguistaff-ended-session",
+            session_key=stale_key,
+        )
+    )
+    deadline = asyncio.get_running_loop().time() + 2
+    while not CompressionDeferredQueuedAgent.calls and not task.done():
+        assert asyncio.get_running_loop().time() < deadline
+        await asyncio.sleep(0.01)
+    assert len(CompressionDeferredQueuedAgent.calls) == 1
+    assert not task.done(), "queued turn retried before compression released"
+
+    CompressionDeferredQueuedAgent.release_flag.set()
+    result = await asyncio.wait_for(task, timeout=2)
+
+    assert result["final_response"] == "queued turn processed"
+    assert result.get("failed") is False
+    assert result.get("compression_deferred") is not True
+    assert len(CompressionDeferredQueuedAgent.calls) == 2
+    assert CompressionDeferredQueuedAgent.max_active == 1
+    second = CompressionDeferredQueuedAgent.calls[1]
+    assert second["session_id"] == "default-session-after-compression"
+    assert second["history"].count(
+        {"role": "assistant", "content": "pending checkpoint"}
+    ) == 1
+    assert second["history"].count({"role": "user", "content": "first turn"}) == 1
+    assert prepared == [
+        {
+            "event": pending,
+            "source": current_source,
+            "history": [
+                {"role": "assistant", "content": "pending checkpoint"},
+                {"role": "user", "content": "first turn"},
+            ],
+            "session_key": current_key,
+        }
+    ]
+    assert second["message"][0]["text"] == "second turn"
+    assert second["message"][1]["type"] == "image_url"
+    assert all("compression deferred" not in call["content"].lower() for call in adapter.sent)
 
 
 @pytest.mark.asyncio
