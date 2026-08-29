@@ -6945,12 +6945,13 @@ class BasePlatformAdapter(ABC):
 
                         if not media_result.success:
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
-                            await self._notify_media_delivery_failure(
-                                event.source.chat_id,
-                                media_path,
-                                is_voice=is_voice,
-                                metadata=_final_thread_metadata,
-                            )
+                            if getattr(media_result, "error_kind", None) != "egress_policy_rejected":
+                                await self._notify_media_delivery_failure(
+                                    event.source.chat_id,
+                                    media_path,
+                                    is_voice=is_voice,
+                                    metadata=_final_thread_metadata,
+                                )
                     except Exception as media_err:
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
 
@@ -6991,11 +6992,12 @@ class BasePlatformAdapter(ABC):
                                 ext,
                                 file_result.error,
                             )
-                            await self._notify_media_delivery_failure(
-                                event.source.chat_id,
-                                file_path,
-                                metadata=_final_thread_metadata,
-                            )
+                            if getattr(file_result, "error_kind", None) != "egress_policy_rejected":
+                                await self._notify_media_delivery_failure(
+                                    event.source.chat_id,
+                                    file_path,
+                                    metadata=_final_thread_metadata,
+                                )
                     except Exception as file_err:
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
 

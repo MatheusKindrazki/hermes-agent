@@ -22849,7 +22849,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             for actual_path in actual_paths:
                 if in_voice_channel:
                     play_voice = cast(Callable[..., Awaitable[Any]], play_in_voice_channel)
-                    await play_voice(guild_id, actual_path)
+                    delivery = {
+                        "action": "play_in_voice_channel",
+                        "audio_path": actual_path,
+                        "guild_id": guild_id,
+                    }
+
+                    async def _deliver_voice_channel(_prepared_metadata):
+                        return await play_voice(guild_id, actual_path)
+
+                    await self._deliver_external_action(
+                        adapter=adapter,
+                        chat_id=event.source.chat_id,
+                        action="send_media",
+                        content=json.dumps(
+                            delivery, sort_keys=True, separators=(",", ":")
+                        ).encode("utf-8"),
+                        payload=delivery,
+                        metadata=thread_meta,
+                        event_type="gateway_runner_auto_tts",
+                        milestone="auto-tts",
+                        deliver=_deliver_voice_channel,
+                    )
                 elif callable(send_voice):
                     send_voice_call = cast(Callable[..., Awaitable[Any]], send_voice)
                     delivery = {
