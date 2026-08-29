@@ -29,6 +29,10 @@ from hermes_cli.web_models import (
     SessionPrune,
     SessionRename,
 )
+from gateway.active_context_receipt import (
+    build_active_context_receipt,
+    load_profile_config,
+)
 
 # Same logger the handlers used before extraction (identical logger object).
 _log = logging.getLogger("hermes_cli.web_server")
@@ -144,6 +148,8 @@ def get_sessions(
             # with the serving profile even when the request wasn't explicitly
             # scoped, so default-profile rows never circulate unowned.
             row_profile = profile_name or _cron_default_profile()
+            profile_home = _cron_profile_home(row_profile)[1]
+            receipt_config = load_profile_config(profile_home)
             for s in sessions:
                 s["is_active"] = (
                     s.get("ended_at") is None
@@ -154,6 +160,13 @@ def get_sessions(
                 # SQLite stores the flag as 0/1; expose a real JSON boolean.
                 s["archived"] = bool(s.get("archived"))
                 s["pinned"] = bool(s.get("pinned"))
+                receipt = build_active_context_receipt(
+                    config=receipt_config,
+                    profile=row_profile,
+                    session=s,
+                )
+                if receipt is not None:
+                    s["active_context"] = receipt
             if not full:
                 _strip_session_list_rows(sessions)
             return {"sessions": sessions, "total": total, "limit": limit, "offset": offset}
@@ -570,6 +583,13 @@ async def get_session_detail(session_id: str, profile: Optional[str] = None):
             _cron_profile_home(profile)[0] if profile else _cron_default_profile()
         )
         session["is_default_profile"] = session["profile"] == "default"
+        receipt = build_active_context_receipt(
+            config=load_profile_config(_cron_profile_home(session["profile"])[1]),
+            profile=session["profile"],
+            session=session,
+        )
+        if receipt is not None:
+            session["active_context"] = receipt
         return session
     finally:
         db.close()
