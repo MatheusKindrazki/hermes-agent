@@ -358,20 +358,28 @@ function validateBundle() {
     }
   }
 
-  // Renderer payload check (either unpacked or in the asar)
-  if (exists(APP.unpackedDistIndex)) {
-    return { stamp, nodeBinaries }
+  // Renderer payload check (either unpacked or in the asar). The icon is a
+  // main-process boot dependency, so validate its asar entry even when dist/
+  // is unpacked and could otherwise short-circuit this inspection.
+  if (!exists(APP.unpackedDistIndex) && !exists(APP.asarPath)) {
+    die(`Missing renderer payload: neither ${APP.unpackedDistIndex} nor ${APP.asarPath} exists`)
   }
   if (!exists(APP.asarPath)) {
-    die(`Missing renderer payload: neither ${APP.unpackedDistIndex} nor ${APP.asarPath} exists`)
+    die(`Missing app.asar required for packaged asset verification: ${APP.asarPath}`)
   }
   const files = listPackage(APP.asarPath)
   // Normalize separators because @electron/asar's listPackage returns
   // backslash-prefixed entries on Windows ('\\dist\\index.html') and
   // forward-slash on Unix.
   const normalized = files.map(f => f.replace(/\\/g, '/').replace(/^\/+/, ''))
-  if (!normalized.includes('dist/index.html')) {
+  if (!exists(APP.unpackedDistIndex) && !normalized.includes('dist/index.html')) {
     die(`Missing renderer payload file in app.asar: ${APP.asarPath} (expected dist/index.html)`)
+  }
+  if (!normalized.includes('public/apple-touch-icon.png') && !normalized.includes('dist/apple-touch-icon.png')) {
+    die(`Missing packaged app icon in app.asar: ${APP.asarPath}`)
+  }
+  if (PLATFORM === 'darwin' && !exists(path.join(APP.resourcesPath, 'icon.icns'))) {
+    die(`Missing packaged macOS icon fallback: ${path.join(APP.resourcesPath, 'icon.icns')}`)
   }
   return { stamp, nodeBinaries }
 }

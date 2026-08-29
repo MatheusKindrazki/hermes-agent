@@ -32,6 +32,7 @@ import {
 
 import { classifyActiveRuntime } from './active-runtime-state'
 import { destroyKeepaliveAgents, downloadAgentFor, jsonAgentFor, withRetry } from './api-transport'
+import { resolveAppIcon, windowIconOptions } from './app-icon'
 import { stopBackendChild as stopBackendChildImpl, stopBackendTreesForUpdate } from './backend-child'
 import {
   type BackendOutputTail,
@@ -878,6 +879,7 @@ const WINDOW_BUTTON_POSITION = {
 // assets/icon.ico (shipped to resources/ via extraResources) and only falls
 // back to the padded PNG if the ico is missing.
 const APP_ICON_PATHS = [
+  ...(IS_MAC ? [path.join(process.resourcesPath ?? '', 'icon.icns')] : []),
   ...(IS_WINDOWS
     ? [path.join(process.resourcesPath ?? '', 'icon.ico'), path.join(APP_ROOT, 'assets', 'icon.ico')]
     : []),
@@ -6383,7 +6385,7 @@ function registerPowerResumeListeners() {
 }
 
 function getAppIconPath() {
-  return APP_ICON_PATHS.find(fileExists)
+  return resolveAppIcon(APP_ICON_PATHS, fileExists)
 }
 
 function sendOpenUpdatesRequested() {
@@ -11890,7 +11892,7 @@ function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?
     titleBarOverlay: getTitleBarOverlayOptions(),
     trafficLightPosition: IS_MAC ? WINDOW_BUTTON_POSITION : undefined,
     ...chatWindowSurfaceOptions(),
-    icon,
+    ...windowIconOptions(icon),
     // Don't show until the renderer's first themed paint is ready. macOS
     // `vibrancy` ignores `backgroundColor` and paints a translucent OS
     // material (which follows the OS appearance, not the app theme), so a
@@ -11983,7 +11985,7 @@ function spawnBrowserWindow(tabId) {
     titleBarOverlay: getTitleBarOverlayOptions(),
     trafficLightPosition: IS_MAC ? WINDOW_BUTTON_POSITION : undefined,
     ...chatWindowSurfaceOptions(),
-    icon,
+    ...windowIconOptions(icon),
     show: false,
     webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
   })
@@ -12075,7 +12077,7 @@ function createInstanceWindow() {
     titleBarOverlay: getTitleBarOverlayOptions(),
     trafficLightPosition: IS_MAC ? WINDOW_BUTTON_POSITION : undefined,
     ...chatWindowSurfaceOptions(),
-    icon,
+    ...windowIconOptions(icon),
     show: false,
     webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
   })
@@ -13026,7 +13028,7 @@ function createWindow() {
     titleBarOverlay: getTitleBarOverlayOptions(),
     trafficLightPosition: IS_MAC ? WINDOW_BUTTON_POSITION : undefined,
     ...chatWindowSurfaceOptions(),
-    icon,
+    ...windowIconOptions(icon),
     // Hidden until the first themed paint so macOS `vibrancy` (which ignores
     // `backgroundColor` and follows the OS appearance) can't flash a light
     // material before the renderer paints the app theme. See createSessionWindow.
