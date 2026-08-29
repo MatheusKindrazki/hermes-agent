@@ -33,6 +33,7 @@ import { AttachmentList } from './attachments'
 import {
   acceptsTriggerCompletion,
   COMPOSER_FADE_BACKGROUND,
+  composerEditorIsDisabled,
   implicitSlashAcceptIndex,
   type QueueEditState,
   slashArgStage
@@ -87,6 +88,7 @@ import { chipTypedUrlOnSpace, linkifyUrls } from './url-refs'
 import { VoiceActivity, VoicePlaybackActivity } from './voice-activity'
 
 export function ChatBar({
+  allowDraftingWhileDisabled = false,
   busy,
   cwd,
   disabled,
@@ -222,6 +224,7 @@ export function ChatBar({
   const gatewayState = useStore($gatewayState)
   const reconnecting = gatewayState === 'closed' || gatewayState === 'error'
   const inputDisabled = disabled && !reconnecting
+  const editorDisabled = composerEditorIsDisabled({ allowDraftingWhileDisabled, disabled, reconnecting })
 
   // The draft engine — detached source of truth (DOM + draftRef + edge
   // selectors); typing never re-renders the chrome. ChatBar owns `queueEditRef`
@@ -243,7 +246,7 @@ export function ChatBar({
     setComposerText,
     stashAt,
     syncDraftFromEditor
-  } = useComposerDraft({ activeQueueSessionKey, focusKey, inputDisabled, queueEditRef, sessionId })
+  } = useComposerDraft({ activeQueueSessionKey, focusKey, inputDisabled: editorDisabled, queueEditRef, sessionId })
 
   // Undo/redo. The rich editor bypasses Chromium's editing pipeline for speed,
   // which also bypasses its undo stack — so we own the stack and every edit
@@ -1037,7 +1040,7 @@ export function ChatBar({
   const input = (
     <div className={cn('relative', stacked ? 'w-full' : 'min-w-(--composer-input-inline-min-width) flex-1')}>
       <div
-        aria-disabled={inputDisabled ? true : undefined}
+        aria-disabled={editorDisabled ? true : undefined}
         aria-label={t.composer.message}
         autoCapitalize="off"
         autoCorrect="off"
@@ -1051,7 +1054,7 @@ export function ChatBar({
           // becomes unclickable. Buttons use the global no-drag rule.
           hudNativeDrag && '[-webkit-app-region:no-drag]'
         )}
-        contentEditable={!inputDisabled}
+        contentEditable={!editorDisabled}
         data-placeholder={placeholder}
         data-slot={RICH_INPUT_SLOT}
         onBeforeInput={handleEditorBeforeInput}

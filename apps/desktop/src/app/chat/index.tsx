@@ -666,6 +666,11 @@ const ChatViewContent = memo(function ChatViewContent({
     [contextAllowsSubmit, onSubmit]
   )
 
+  const steerWithContextGuard = useCallback(
+    (text: string) => (contextAllowsSubmit ? onSteer(text) : false),
+    [contextAllowsSubmit, onSteer]
+  )
+
   // The URL points at a session the store hasn't loaded yet (sidebar / cmd-K /
   // direct nav). Derived in render so the swap reads instantly: the same frame
   // the id changes we drop the old transcript and show the loader, instead of
@@ -909,6 +914,7 @@ const ChatViewContent = memo(function ChatViewContent({
         {showChatBar && (
           <Suspense fallback={<ChatBarFallback />}>
             <ChatBar
+              allowDraftingWhileDisabled={gatewayOpen && !contextAllowsSubmit}
               busy={busy}
               cwd={currentCwd}
               disabled={!gatewayOpen || !contextAllowsSubmit}
@@ -926,7 +932,7 @@ const ChatViewContent = memo(function ChatViewContent({
               onPickFolders={onPickFolders}
               onPickImages={onPickImages}
               onRemoveAttachment={onRemoveAttachment}
-              onSteer={onSteer}
+              onSteer={steerWithContextGuard}
               onSubmit={submitWithContextGuard}
               onTranscribeAudio={onTranscribeAudio}
               queueSessionKey={queueSessionKey}

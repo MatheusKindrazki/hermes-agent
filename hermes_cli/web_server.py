@@ -984,7 +984,7 @@ async def _dashboard_auth_gate(request: Request, call_next):
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    """Require the session token on all /api/ routes except the public list."""
+    """Require the session token on dashboard API routes except the public list."""
     # A request already authenticated by the token-auth seam (a service caller
     # presenting a bearer token on a registered token route) carries
     # ``token_authenticated`` — never bounce it through the cookie/session gate.
@@ -997,7 +997,8 @@ async def auth_middleware(request: Request, call_next):
         return await call_next(request)
     path = request.url.path
     is_mcp_oauth_callback = path.startswith("/api/mcp/oauth/callback/")
-    if path.startswith("/api/") and path not in _PUBLIC_API_PATHS and not is_mcp_oauth_callback:
+    is_dashboard_api = path.startswith("/api/") or path == "/v1/capabilities"
+    if is_dashboard_api and path not in _PUBLIC_API_PATHS and not is_mcp_oauth_callback:
         if not _has_valid_session_token(request) and not _has_valid_query_token(request, path):
             return JSONResponse(
                 status_code=401,
@@ -3738,6 +3739,49 @@ def _merge_profile_gateway_platforms(
                 continue
             merged.setdefault(namespaced, _public_platform_entry(value))
     return merged
+
+
+@app.get("/v1/capabilities")
+async def get_desktop_api_capabilities(profile: Optional[str] = None):
+    """Advertise capability gates for the exact dashboard profile requested.
+
+    The native Desktop sends REST traffic to ``hermes serve`` while its chat
+    RPCs ride this process's embedded gateway WebSocket. The standalone API
+    server exposes the same path, but it is not necessarily running on a
+    Desktop connection; keeping this route here prevents a valid dashboard
+    connection from turning a missing endpoint into an ``unknown`` fail-closed
+    identity gate.
+    """
+    from gateway.active_context_receipt import (
+        ACTIVE_CONTEXT_SCHEMA,
+        active_context_v1_enabled,
+    )
+
+    def _read_active_context_gate() -> bool:
+        # Resolve the profile before the fail-safe config read. An invalid
+        # profile must remain a 400/404 instead of silently borrowing the
+        # dashboard process's config.
+        with _config_profile_scope(profile):
+            try:
+                return active_context_v1_enabled(load_config())
+            except Exception:
+                _log.exception(
+                    "Desktop capability config read failed; active_context_v2 remains off"
+                )
+                return False
+
+    active_context_enabled = await asyncio.to_thread(_read_active_context_gate)
+
+    return {
+        "object": "hermes.dashboard.capabilities",
+        "platform": "hermes-agent",
+        "features": {
+            "active_context_v2": {
+                "enabled": active_context_enabled,
+                "receipt_schema": ACTIVE_CONTEXT_SCHEMA,
+            }
+        },
+    }
 
 
 @app.get("/api/status")

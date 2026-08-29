@@ -54,6 +54,24 @@ export const DRAFT_PERSIST_DEBOUNCE_MS = 400
 
 export const pickPlaceholder = (pool: readonly string[]) => pool[Math.floor(Math.random() * pool.length)]
 
+/**
+ * The composer has two different safety states: dispatch may be blocked while
+ * the user's local draft remains editable. Keep this decision separate from
+ * the submit engine's `disabled` flag so enabling focus can never enable a
+ * send/steer path by accident.
+ */
+export function composerEditorIsDisabled({
+  allowDraftingWhileDisabled = false,
+  disabled,
+  reconnecting
+}: {
+  allowDraftingWhileDisabled?: boolean
+  disabled: boolean
+  reconnecting: boolean
+}): boolean {
+  return disabled && !reconnecting && !allowDraftingWhileDisabled
+}
+
 /** Completion items can carry an `action` (set in use-slash-completions) that
  *  runs a side effect on pick instead of inserting a chip — e.g. the session
  *  picker's "Browse all…" entry opens the overlay. Table-driven so new action

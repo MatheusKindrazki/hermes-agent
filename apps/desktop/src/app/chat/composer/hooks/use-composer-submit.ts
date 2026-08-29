@@ -120,12 +120,13 @@ export function useComposerSubmit({
           surfaceId !== null &&
           requestedSurfaceId === surfaceId &&
           paneVisible &&
+          !disabled &&
           !inputDisabled
         ) {
           dispatchSubmitRef.current(text, undefined, displayKind)
         }
       }),
-    [inputDisabled, paneVisible, scope.target, surfaceId]
+    [disabled, inputDisabled, paneVisible, scope.target, surfaceId]
   )
 
   const submitDraft = () => {
