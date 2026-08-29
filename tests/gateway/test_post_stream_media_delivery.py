@@ -12,13 +12,16 @@ and can strip the path from the visible reply, so auto-attach is intentional
 there. This file pins the asymmetry.
 """
 
+import sqlite3
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
 from gateway.config import Platform
+from gateway.egress_policy import EgressPolicy
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.reliability_outbox import ReliabilityOutbox
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 
@@ -43,6 +46,34 @@ def _fake_runner(thread_meta):
         _thread_metadata_for_source=lambda source, anchor=None: thread_meta,
         _reply_anchor_for_event=lambda event: None,
     )
+
+
+def _reliability_config(tmp_path, *, egress="enforce", outbox="shadow"):
+    return {
+        "gateway": {
+            "reliability": {
+                "egress": {"mode": egress},
+                "outbox": {
+                    "mode": outbox,
+                    "db_path": str(tmp_path / "outbox.sqlite3"),
+                    "payload_dir": str(tmp_path / "payloads"),
+                },
+            }
+        }
+    }
+
+
+def _identity():
+    return {
+        "profile": "luguistaff",
+        "tenant": "lugui",
+        "machine": "personal-mac-mini",
+        "work_id": "01a04a0f-455a-7bea-a064-4aa68b009d39",
+        "session_id": "runtime-sid",
+        "policy_version": "tone-v1",
+        "milestone": "turn-complete",
+        "version": "turn-media-1",
+    }
 
 
 def _adapter():
@@ -110,4 +141,51 @@ async def test_explicit_media_tag_still_delivers_post_stream(tmp_path, monkeypat
     assert images_kwargs["chat_id"] == "C123CHAN"
     assert str(media_file) in images_kwargs["images"][0][0]
 
+
+@pytest.mark.asyncio
+async def test_post_stream_media_enforce_blocks_before_native_adapter(tmp_path, monkeypatch):
+    media_file = _allowed_media_path(tmp_path, monkeypatch, "blocked.png")
+    adapter = _adapter()
+    runner = _fake_runner({})
+    runner._egress_policy = EgressPolicy.from_config(
+        _reliability_config(tmp_path, outbox="off")
+    )
+    runner._reliability_outbox = ReliabilityOutbox.disabled(hermes_home=tmp_path)
+
+    await GatewayRunner._deliver_media_from_response(
+        runner,
+        f"MEDIA:{media_file}",
+        _event(),
+        adapter,
+    )
+
+    adapter.send_multiple_images.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_post_stream_media_shadow_enqueues_without_native_adapter(tmp_path, monkeypatch):
+    media_file = _allowed_media_path(tmp_path, monkeypatch, "shadow.png")
+    adapter = _adapter()
+    config = _reliability_config(tmp_path)
+    runner = _fake_runner(_identity())
+    runner._egress_policy = EgressPolicy.from_config(config)
+    runner._reliability_outbox = ReliabilityOutbox.from_config(
+        config, hermes_home=tmp_path
+    )
+
+    await GatewayRunner._deliver_media_from_response(
+        runner,
+        f"MEDIA:{media_file}",
+        _event(),
+        adapter,
+    )
+
+    adapter.send_multiple_images.assert_not_awaited()
+    with sqlite3.connect(tmp_path / "outbox.sqlite3") as connection:
+        events = connection.execute(
+            "SELECT event_type,milestone,destination FROM outbox_events"
+        ).fetchall()
+    assert events == [
+        ("gateway_runner_media", "turn-complete", "SimpleNamespace:C123CHAN")
+    ]
 

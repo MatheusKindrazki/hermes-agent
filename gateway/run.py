@@ -28,6 +28,7 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import faulthandler
+import hashlib
 import inspect
 import json
 import logging
@@ -113,6 +114,17 @@ _USER_BOUNDARY_END_REASONS = (
 # transport cannot block the session-stall watcher pass (notify-only path;
 # on timeout the latch stays clear and the next tick retries).
 _STALL_NOTIFY_SEND_TIMEOUT_SECONDS = 15.0
+# How long one internal conclusion stays "already said" on a route
+# (_internal_event_equivalence_key). Long enough to span the gap between a
+# wrapped process and its wrapper exiting, plus the cascade turn each of them
+# would otherwise start — the 0.1s completion fan-in window and the 2.0s
+# delegation drain tick are both far too short for that. Short enough that a
+# genuinely repeated run minutes later still surfaces: this supersedes a
+# restatement, it does not mute a signal.
+_INTERNAL_EQUIVALENCE_TTL_SECONDS = 120.0
+# Bounded like every other per-lifetime gateway cache. Keys are small tuples
+# and only routes with recent internal traffic ever appear.
+_INTERNAL_EQUIVALENCE_MAX_ENTRIES = 256
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
@@ -2764,7 +2776,12 @@ from gateway.session_state import (
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
-from gateway.turn_context import TurnContext
+from gateway.turn_context import (
+    TurnContext,
+    compose_request_context,
+    request_context_scope,
+    request_context_v2_enabled,
+)
 from gateway.platforms.base import (
     BasePlatformAdapter,
     EphemeralReply,
@@ -5453,6 +5470,57 @@ class TurnRunner:
             _fut.add_done_callback(_track_status_id)
 
     def run_sync(self):
+        """Execute one turn under its immutable request authority snapshot.
+
+        Runtime model/provider resolution happens exactly once when the v2
+        gate is enabled, before the snapshot is published.  The scoped body
+        is the same production turn body used when the gate is disabled, so
+        tool workers inherit the ContextVar through the gateway's
+        ``copy_context`` executor seam without falling back to process globals.
+        """
+        ctx = self._ctx
+        if not request_context_v2_enabled(ctx.user_config):
+            return self._run_sync_inner()
+
+        try:
+            model, runtime_kwargs = self._runner._resolve_session_agent_runtime(
+                source=ctx.source,
+                session_key=ctx.session_key,
+                user_config=ctx.user_config,
+            )
+            request_cfg = (
+                ((ctx.user_config or {}).get("gateway") or {})
+                .get("reliability", {})
+                .get("request_context", {})
+            )
+            source_profile = str(getattr(ctx.source, "profile", "") or "").strip()
+            profile = source_profile or str(request_cfg.get("profile") or "").strip()
+            tenant = str(request_cfg.get("tenant") or "").strip()
+            approval = str(request_cfg.get("approval") or "").strip()
+            provider = str(runtime_kwargs.get("provider") or "").strip()
+            request_context = compose_request_context(
+                profile=profile,
+                tenant=tenant,
+                model=str(model or ""),
+                provider=provider,
+                approval=approval,
+                session_id=str(ctx.session_id or ctx.session_key or ""),
+            )
+        except Exception as exc:
+            return {
+                "final_response": f"⚠️ Provider authentication failed: {exc}",
+                "messages": [],
+                "api_calls": 0,
+                "tools": [],
+            }
+
+        ctx.request_context = request_context
+        with request_context_scope(request_context, config=ctx.user_config):
+            return self._run_sync_inner(
+                resolved_runtime=(model, runtime_kwargs),
+            )
+
+    def _run_sync_inner(self, *, resolved_runtime=None):
         ctx = self._ctx
         # Historical note: as a nested closure this body declared
         # `nonlocal message` because the conditional re-assignments below
@@ -5501,11 +5569,14 @@ class TurnRunner:
         max_iterations = _current_max_iterations()
 
         try:
-            model, runtime_kwargs = self._runner._resolve_session_agent_runtime(
-                source=ctx.source,
-                session_key=ctx.session_key,
-                user_config=ctx.user_config,
-            )
+            if resolved_runtime is None:
+                model, runtime_kwargs = self._runner._resolve_session_agent_runtime(
+                    source=ctx.source,
+                    session_key=ctx.session_key,
+                    user_config=ctx.user_config,
+                )
+            else:
+                model, runtime_kwargs = resolved_runtime
             logger.debug(
                 "run_agent resolved: model=%s provider=%s session=%s",
                 model, runtime_kwargs.get("provider"), ctx.session_key or "",
@@ -7271,6 +7342,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._completion_notification_batch_flush_tasks: set[asyncio.Task] = set()
         self._completion_notification_batch_window = 0.1
         self._completion_notification_batches_stopping = False
+        # Producer identity is not work identity. A wrapper script and the
+        # process it wraps are two producers reporting ONE conclusion, and they
+        # exit far enough apart to miss the 0.1s fan-in window above — so both
+        # became their own synthetic turn. Remember the conclusions recently
+        # injected on each route so an equivalent restatement is superseded
+        # instead of asking the agent the same question again. The key is
+        # reserved for the duration of an injection (_internal_equivalence_
+        # inflight), so two concurrent copies cannot both pass the check while
+        # the first is still awaiting the adapter.
+        self._internal_equivalence_seen: "OrderedDict[tuple[str, ...], tuple[float, Optional[int]]]" = OrderedDict()
+        self._internal_equivalence_inflight: "Dict[tuple[str, ...], asyncio.Future]" = {}
 
         # Cache AIAgent instances per session to preserve prompt caching.
         # Without this, a new AIAgent is created per message, rebuilding the
@@ -10323,6 +10405,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 exc_info=True,
             )
             return True
+
+    async def _wait_for_deferred_compression(self, session_key: str) -> None:
+        """Wait until a soft-deferred compression turn can be retried safely.
+
+        A compression-deferred result promises that a queued user turn will
+        run after the concurrent compressor releases or rotates the session.
+        Keep the pending drain serialized behind that lock instead of starting
+        a second agent against the old parent.
+        """
+        while await self._session_has_compression_in_flight(session_key):
+            await asyncio.sleep(0.1)
+
+    async def _persist_compression_handoff(
+        self,
+        session_entry,
+        *,
+        event,
+        content,
+        source_session_id: str,
+    ) -> bool:
+        """Carry one failed oversized user turn into the fresh reset session."""
+        platform_message_id = str(getattr(event, "message_id", "") or "").strip()
+        if platform_message_id:
+            handoff_id = platform_message_id
+        else:
+            payload = json.dumps(content, ensure_ascii=False, sort_keys=True, default=str)
+            digest = hashlib.sha256(
+                f"{source_session_id}\0{payload}".encode("utf-8", "replace")
+            ).hexdigest()[:24]
+            handoff_id = f"compression-handoff:{digest}"
+        if await self.async_session_store.has_platform_message_id(
+            session_entry.session_id, handoff_id
+        ):
+            return False
+        await self.async_session_store.append_to_transcript(
+            session_entry.session_id,
+            {
+                "role": "user",
+                "content": content,
+                "timestamp": getattr(event, "timestamp", None) or time.time(),
+                "message_id": handoff_id,
+                "_compression_handoff": {
+                    "source_session_id": source_session_id,
+                    "reason": "compression_exhausted",
+                },
+            },
+        )
+        return True
 
     @staticmethod
     def _lookup_session_id_under_store_lock(session_store, session_key: str):
@@ -21617,6 +21747,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_entry.session_id if session_entry else "?",
                 )
             elif agent_result.get("compression_exhausted") and session_entry and session_key:
+                exhausted_session_id = session_entry.session_id
                 logger.info(
                     "Auto-resetting session %s after compression exhaustion.",
                     session_entry.session_id,
@@ -21643,6 +21774,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # forever (#35809 — regression of the #9893/#10063 auto-reset).
                     # No-op on non-topic lanes.
                     session_entry = new_entry
+                    handoff_content = (
+                        persist_user_message
+                        if persist_user_message is not None
+                        else message_text
+                    )
+                    handoff_created = await self._persist_compression_handoff(
+                        session_entry,
+                        event=event,
+                        content=handoff_content,
+                        source_session_id=exhausted_session_id,
+                    )
+                    logger.info(
+                        "Compression-exhaustion handoff %s in fresh session %s",
+                        "created" if handoff_created else "already present",
+                        session_entry.session_id,
+                    )
                     await asyncio.to_thread(
                         self._sync_telegram_topic_binding,
                         source, session_entry, reason="compression-exhausted-reset",
@@ -21650,7 +21797,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 response = (response or "") + (
                     "\n\n🔄 Session auto-reset — the conversation exceeded the "
                     "maximum context size and could not be compressed further. "
-                    "Your next message will start a fresh session."
+                    "Your turn was carried into a fresh handoff session; your "
+                    "next message can continue from it."
                 )
 
             ts = time.time()  # Unix epoch float — consistent with DB storage
@@ -23259,16 +23407,57 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             for actual_path in actual_paths:
                 if in_voice_channel:
                     play_voice = cast(Callable[..., Awaitable[Any]], play_in_voice_channel)
-                    await play_voice(guild_id, actual_path)
+                    delivery = {
+                        "action": "play_in_voice_channel",
+                        "audio_path": actual_path,
+                        "guild_id": guild_id,
+                    }
+
+                    async def _deliver_voice_channel(_prepared_metadata):
+                        return await play_voice(guild_id, actual_path)
+
+                    await self._deliver_external_action(
+                        adapter=adapter,
+                        chat_id=event.source.chat_id,
+                        action="send_media",
+                        content=json.dumps(
+                            delivery, sort_keys=True, separators=(",", ":")
+                        ).encode("utf-8"),
+                        payload=delivery,
+                        metadata=thread_meta,
+                        event_type="gateway_runner_auto_tts",
+                        milestone="auto-tts",
+                        deliver=_deliver_voice_channel,
+                    )
                 elif callable(send_voice):
                     send_voice_call = cast(Callable[..., Awaitable[Any]], send_voice)
-                    send_kwargs: Dict[str, Any] = {
-                        "chat_id": event.source.chat_id,
+                    delivery = {
+                        "action": "send_voice",
                         "audio_path": actual_path,
                         "reply_to": reply_anchor,
-                        "metadata": thread_meta,
                     }
-                    await send_voice_call(**send_kwargs)
+
+                    async def _deliver_voice(prepared_metadata):
+                        return await send_voice_call(
+                            chat_id=event.source.chat_id,
+                            audio_path=actual_path,
+                            reply_to=reply_anchor,
+                            metadata=prepared_metadata,
+                        )
+
+                    await self._deliver_external_action(
+                        adapter=adapter,
+                        chat_id=event.source.chat_id,
+                        action="send_media",
+                        content=json.dumps(
+                            delivery, sort_keys=True, separators=(",", ":")
+                        ).encode("utf-8"),
+                        payload=delivery,
+                        metadata=thread_meta,
+                        event_type="gateway_runner_auto_tts",
+                        milestone="auto-tts",
+                        deliver=_deliver_voice,
+                    )
         except Exception as e:
             logger.warning("Auto voice reply failed: %s", e, exc_info=True)
         finally:
@@ -23360,10 +23549,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if image_paths:
                 try:
                     images = [(f"file://{_quote(p)}", "") for p in image_paths]
-                    await adapter.send_multiple_images(
+                    delivery = {"action": "send_multiple_images", "images": images}
+
+                    async def _send_images(prepared_metadata):
+                        return await adapter.send_multiple_images(
+                            chat_id=event.source.chat_id,
+                            images=images,
+                            metadata=prepared_metadata,
+                        )
+
+                    await GatewayRunner._deliver_external_action(
+                        self,
+                        adapter=adapter,
                         chat_id=event.source.chat_id,
-                        images=images,
+                        action="send_media",
+                        content=json.dumps(
+                            delivery, sort_keys=True, separators=(",", ":")
+                        ).encode("utf-8"),
+                        payload=delivery,
                         metadata=_thread_meta,
+                        event_type="gateway_runner_media",
+                        milestone="media-delivery",
+                        deliver=_send_images,
                     )
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
@@ -23372,29 +23579,118 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 try:
                     ext = Path(media_path).suffix.lower()
                     if should_send_media_as_audio(event.source.platform, ext, is_voice=is_voice):
-                        await adapter.send_voice(
-                            chat_id=event.source.chat_id,
-                            audio_path=media_path,
-                            metadata=_thread_meta,
-                            is_voice=is_voice,
-                        )
+                        method_name = "send_voice"
+                        path_key = "audio_path"
                     elif ext in _VIDEO_EXTS:
-                        await adapter.send_video(
-                            chat_id=event.source.chat_id,
-                            video_path=media_path,
-                            metadata=_thread_meta,
-                        )
+                        method_name = "send_video"
+                        path_key = "video_path"
                     else:
-                        await adapter.send_document(
+                        method_name = "send_document"
+                        path_key = "file_path"
+                    delivery = {
+                        "action": method_name,
+                        path_key: str(media_path),
+                    }
+
+                    async def _send_media(prepared_metadata):
+                        method = getattr(adapter, method_name)
+                        return await method(
                             chat_id=event.source.chat_id,
-                            file_path=media_path,
-                            metadata=_thread_meta,
+                            **{path_key: media_path},
+                            metadata=prepared_metadata,
                         )
+
+                    await GatewayRunner._deliver_external_action(
+                        self,
+                        adapter=adapter,
+                        chat_id=event.source.chat_id,
+                        action="send_media",
+                        content=json.dumps(
+                            delivery, sort_keys=True, separators=(",", ":")
+                        ).encode("utf-8"),
+                        payload=delivery,
+                        metadata=_thread_meta,
+                        event_type="gateway_runner_media",
+                        milestone="media-delivery",
+                        deliver=_send_media,
+                    )
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
 
         except Exception as e:
             logger.warning("Post-stream media extraction failed: %s", e)
+
+    async def _deliver_external_action(
+        self,
+        *,
+        adapter,
+        chat_id: str,
+        action: str,
+        content: bytes,
+        payload: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]],
+        event_type: str,
+        milestone: str,
+        deliver: Callable[[Optional[Dict[str, Any]]], Awaitable[Any]],
+        version: Optional[str] = None,
+    ):
+        """Apply policy/outbox at the last seam before any native egress."""
+        from gateway.external_egress import deliver_external_action
+
+        return await deliver_external_action(
+            owner=self,
+            adapter=adapter,
+            chat_id=chat_id,
+            action=action,
+            content=content,
+            payload=payload,
+            metadata=metadata,
+            event_type=event_type,
+            milestone=milestone,
+            deliver=deliver,
+            version=version,
+        )
+
+    async def _deliver_external_final(
+        self,
+        *,
+        adapter,
+        chat_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        message_id: Optional[str] = None,
+    ):
+        """Gate the completed external text before send/edit reconciliation."""
+        async def _deliver(prepared_metadata):
+            if message_id:
+                return await adapter.edit_message(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    content=content,
+                    finalize=True,
+                    metadata=prepared_metadata,
+                )
+            return await adapter.send(chat_id, content, metadata=prepared_metadata)
+
+        identity = dict(metadata or {})
+        return await self._deliver_external_action(
+            adapter=adapter,
+            chat_id=chat_id,
+            action="edit" if message_id else "send",
+            content=content.encode("utf-8"),
+            payload={"action": "edit" if message_id else "send", "content": content},
+            metadata=identity,
+            event_type="gateway_runner_final",
+            milestone="turn-complete",
+            version=str(
+                identity.get("version")
+                or identity.get("client_turn_id")
+                or identity.get("session_id")
+                or ""
+            )
+            or None,
+            deliver=_deliver,
+        )
 
     async def _deliver_queued_first_response(
         self,
@@ -23427,11 +23723,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     and not getattr(stream_consumer, "_turn_split_delivery", False)
                 ):
                     try:
-                        _edit_res = await adapter.edit_message(
+                        _edit_res = await self._deliver_external_final(
+                            adapter=adapter,
                             chat_id=source.chat_id,
                             message_id=_sc_msg_id,
                             content=text_content,
-                            finalize=True,
+                            metadata=metadata,
                         )
                         if getattr(_edit_res, "success", False):
                             _reconciled = True
@@ -23445,9 +23742,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _qe,
                         )
                 if not _reconciled:
-                    await adapter.send(
-                        source.chat_id,
-                        text_content,
+                    await self._deliver_external_final(
+                        adapter=adapter,
+                        chat_id=source.chat_id,
+                        content=text_content,
                         metadata=metadata,
                     )
 
@@ -23554,6 +23852,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
 
+        async def _background_action(
+            *,
+            delivery: Dict[str, Any],
+            deliver: Callable[[Optional[Dict[str, Any]]], Awaitable[Any]],
+            action: str = "send",
+        ):
+            return await self._deliver_external_action(
+                adapter=adapter,
+                chat_id=source.chat_id,
+                action=action,
+                content=json.dumps(
+                    delivery, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8"),
+                payload=delivery,
+                metadata=_thread_metadata,
+                event_type="gateway_background_result",
+                milestone="background-complete",
+                deliver=deliver,
+            )
+
+        async def _send_background_text(content: str):
+            async def _deliver(prepared_metadata):
+                return await adapter.send(
+                    chat_id=source.chat_id,
+                    content=content,
+                    metadata=prepared_metadata,
+                )
+
+            return await _background_action(
+                delivery={"action": "send", "content": content},
+                deliver=_deliver,
+            )
+
         try:
             user_config = _load_gateway_config()
             model, runtime_kwargs = self._resolve_session_agent_runtime(
@@ -23561,10 +23892,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_config=user_config,
             )
             if not runtime_kwargs.get("api_key"):
-                await adapter.send(
-                    source.chat_id,
-                    f"❌ Background task {task_id} failed: no provider credentials configured.",
-                    metadata=_thread_metadata,
+                await _send_background_text(
+                    f"❌ Background task {task_id} failed: no provider credentials configured."
                 )
                 return
 
@@ -23670,26 +23999,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
 
                 if text_content:
-                    await adapter.send(
-                        chat_id=source.chat_id,
-                        content=header + text_content,
-                        metadata=_thread_metadata,
-                    )
+                    await _send_background_text(header + text_content)
                 elif not images and not media_files:
-                    await adapter.send(
-                        chat_id=source.chat_id,
-                        content=header + "(No response generated)",
-                        metadata=_thread_metadata,
-                    )
+                    await _send_background_text(header + "(No response generated)")
 
                 # Send extracted images
                 for image_url, alt_text in (images or []):
                     try:
-                        await adapter.send_image(
-                            chat_id=source.chat_id,
-                            image_url=image_url,
-                            caption=alt_text,
-                            metadata=_thread_metadata,
+                        delivery = {
+                            "action": "send_image",
+                            "caption": alt_text,
+                            "image_url": image_url,
+                        }
+
+                        async def _deliver_image(prepared_metadata):
+                            return await adapter.send_image(
+                                chat_id=source.chat_id,
+                                image_url=image_url,
+                                caption=alt_text,
+                                metadata=prepared_metadata,
+                            )
+
+                        await _background_action(
+                            delivery=delivery,
+                            deliver=_deliver_image,
+                            action="send_media",
                         )
                     except Exception:
                         pass
@@ -23706,48 +24040,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _ext = os.path.splitext(media_path)[1].lower()
                     try:
                         if _should_send_media_as_audio(source.platform, _ext, _is_voice):
-                            await adapter.send_voice(
-                                chat_id=source.chat_id,
-                                audio_path=media_path,
-                                metadata=_thread_metadata,
-                                is_voice=_is_voice,
-                            )
+                            method_name = "send_voice"
+                            path_key = "audio_path"
                         elif _ext in _VIDEO_EXTS:
-                            await adapter.send_video(
-                                chat_id=source.chat_id,
-                                video_path=media_path,
-                                metadata=_thread_metadata,
-                            )
+                            method_name = "send_video"
+                            path_key = "video_path"
                         elif _ext in _IMAGE_EXTS:
-                            await adapter.send_image_file(
-                                chat_id=source.chat_id,
-                                image_path=media_path,
-                                metadata=_thread_metadata,
-                            )
+                            method_name = "send_image_file"
+                            path_key = "image_path"
                         else:
-                            await adapter.send_document(
+                            method_name = "send_document"
+                            path_key = "file_path"
+                        delivery = {
+                            "action": method_name,
+                            path_key: media_path,
+                        }
+
+                        async def _deliver_media(prepared_metadata):
+                            method = getattr(adapter, method_name)
+                            return await method(
                                 chat_id=source.chat_id,
-                                file_path=media_path,
-                                metadata=_thread_metadata,
+                                **{path_key: media_path},
+                                metadata=prepared_metadata,
                             )
+
+                        await _background_action(
+                            delivery=delivery,
+                            deliver=_deliver_media,
+                            action="send_media",
+                        )
                     except Exception:
                         pass
             else:
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-                await adapter.send(
-                    chat_id=source.chat_id,
-                    content=f'✅ Background task complete\nPrompt: "{preview}"\n\n(No response generated)',
-                    metadata=_thread_metadata,
+                await _send_background_text(
+                    f'✅ Background task complete\nPrompt: "{preview}"\n\n(No response generated)'
                 )
 
         except Exception as e:
             logger.exception("Background task %s failed", task_id)
             try:
-                await adapter.send(
-                    chat_id=source.chat_id,
-                    content=f"❌ Background task {task_id} failed: {e}",
-                    metadata=_thread_metadata,
-                )
+                await _send_background_text(f"❌ Background task {task_id} failed: {e}")
             except Exception:
                 pass
 
@@ -24979,6 +25312,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await self._send_update_notification()
             return
 
+        async def _send_update_text(
+            text: str,
+            *,
+            event_type: str = "gateway_update_notification",
+            milestone: str = "update-progress",
+        ):
+            send_metadata = _non_conversational_metadata(metadata, platform=platform)
+
+            async def _deliver(prepared_metadata):
+                return await adapter.send(
+                    chat_id,
+                    text,
+                    metadata=prepared_metadata,
+                )
+
+            return await GatewayRunner._deliver_external_action(
+                self,
+                adapter=adapter,
+                chat_id=chat_id,
+                action="send_notification",
+                content=text.encode("utf-8"),
+                payload={"action": "send", "content": text},
+                metadata=send_metadata,
+                event_type=event_type,
+                milestone=milestone,
+                deliver=_deliver,
+            )
+
         def _strip_ansi(text: str) -> str:
             from tools.ansi_strip import strip_ansi
             return strip_ansi(text)
@@ -25014,10 +25375,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             chunks = [clean[i:i + max_chunk] for i in range(0, len(clean), max_chunk)]
             for chunk in chunks:
                 try:
-                    await adapter.send(
-                        chat_id,
+                    await _send_update_text(
                         f"```\n{chunk}\n```",
-                        metadata=_non_conversational_metadata(metadata, platform=platform),
+                        event_type="gateway_update_progress",
+                        milestone="update-progress",
                     )
                 except Exception as e:
                     logger.debug("Update stream send failed: %s", e)
@@ -25040,16 +25401,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     exit_code_raw = exit_code_path.read_text(encoding="utf-8").strip() or "1"
                     exit_code = int(exit_code_raw)
                     if exit_code == 0:
-                        await adapter.send(
-                            chat_id,
+                        await _send_update_text(
                             "✅ Hermes update finished.",
-                            metadata=_non_conversational_metadata(metadata, platform=platform),
+                            milestone="update-complete",
                         )
                     else:
-                        await adapter.send(
-                            chat_id,
+                        await _send_update_text(
                             "❌ Hermes update failed (exit code {}).".format(exit_code),
-                            metadata=_non_conversational_metadata(metadata, platform=platform),
+                            milestone="update-complete",
                         )
                     logger.info("Update finished (exit=%s), notified %s", exit_code, session_key)
                 except Exception as e:
@@ -25102,26 +25461,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         sent_buttons = False
                         if getattr(type(adapter), "send_update_prompt", None) is not None:
                             try:
-                                await adapter.send_update_prompt(
-                                    chat_id=chat_id,
-                                    prompt=prompt_text,
-                                    default=default,
-                                    session_key=session_key,
-                                    metadata=_non_conversational_metadata(metadata, platform=platform),
+                                prompt_metadata = _non_conversational_metadata(
+                                    metadata, platform=platform
                                 )
-                                sent_buttons = True
+
+                                async def _deliver_prompt(prepared_metadata):
+                                    return await adapter.send_update_prompt(
+                                        chat_id=chat_id,
+                                        prompt=prompt_text,
+                                        default=default,
+                                        session_key=session_key,
+                                        metadata=prepared_metadata,
+                                    )
+
+                                prompt_result = await GatewayRunner._deliver_external_action(
+                                    self,
+                                    adapter=adapter,
+                                    chat_id=chat_id,
+                                    action="send_notification",
+                                    content=json.dumps(
+                                        {"default": default, "prompt": prompt_text},
+                                        sort_keys=True,
+                                        separators=(",", ":"),
+                                    ).encode("utf-8"),
+                                    payload={
+                                        "action": "send_update_prompt",
+                                        "default": default,
+                                        "prompt": prompt_text,
+                                    },
+                                    metadata=prompt_metadata,
+                                    event_type="gateway_update_prompt",
+                                    milestone="update-input-required",
+                                    deliver=_deliver_prompt,
+                                )
+                                sent_buttons = getattr(prompt_result, "success", True) is not False
                             except Exception as btn_err:
                                 logger.debug("Button-based update prompt failed: %s", btn_err)
                         if not sent_buttons:
                             default_hint = f" (default: {default})" if default else ""
                             _p = getattr(adapter, "typed_command_prefix", "/")
-                            await adapter.send(
-                                chat_id,
+                            await _send_update_text(
                                 f"⚕ **Update needs your input:**\n\n"
                                 f"{prompt_text}{default_hint}\n\n"
                                 f"Reply `{_p}approve` (yes) or `{_p}deny` (no), "
                                 f"or type your answer directly.",
-                                metadata=_non_conversational_metadata(metadata, platform=platform),
+                                event_type="gateway_update_prompt",
+                                milestone="update-input-required",
                             )
                         # Keep the prompt marker on disk until the user
                         # answers. If the gateway restarts mid-prompt, the
@@ -25144,10 +25529,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             exit_code_path.write_text("124", encoding="utf-8")
             await _flush_buffer()
             try:
-                await adapter.send(
-                    chat_id,
+                await _send_update_text(
                     "❌ Hermes update timed out after 30 minutes.",
-                    metadata=_non_conversational_metadata(metadata, platform=platform),
+                    milestone="update-timeout",
                 )
             except Exception:
                 pass
@@ -25256,10 +25640,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     msg = "✅ Hermes update finished successfully."
                 else:
                     msg = "❌ Hermes update failed. Check the gateway logs or run `hermes update` manually for details."
-                await adapter.send(
-                    chat_id,
-                    msg,
-                    metadata=_non_conversational_metadata(metadata, platform=platform),
+
+                send_metadata = _non_conversational_metadata(
+                    metadata, platform=platform
+                )
+
+                async def _deliver(prepared_metadata):
+                    return await adapter.send(
+                        chat_id,
+                        msg,
+                        metadata=prepared_metadata,
+                    )
+
+                await GatewayRunner._deliver_external_action(
+                    self,
+                    adapter=adapter,
+                    chat_id=chat_id,
+                    action="send_notification",
+                    content=msg.encode("utf-8"),
+                    payload={"action": "send", "content": msg},
+                    metadata=send_metadata,
+                    event_type="gateway_update_notification",
+                    milestone="update-complete",
+                    deliver=_deliver,
                 )
                 logger.info(
                     "Sent post-update notification to %s:%s (exit=%s)",
@@ -26141,7 +26544,243 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as exc:
                 logger.error("Watch notification injection error: %s", exc)
 
+    @staticmethod
+    def _internal_event_equivalence_key(evt: dict) -> "Optional[tuple[str, ...]]":
+        """Return a work+route+conclusion key shared by equivalent internal events.
+
+        ``None`` means "no equivalence claim" — the event is always injected.
+
+        Three things must agree before two internal events count as
+        restatements of one conclusion:
+
+        * the **unit of work** — ``task_id``, the grouping key every registry
+          producer already stamps (``_check_watch_patterns`` and
+          ``_move_to_finished`` in ``tools/process_registry.py``). An event
+          without one is legacy or unstamped and fails OPEN: it is delivered,
+          never suppressed. That is the same stance
+          :meth:`_completion_delivery_identity` takes for process events with
+          no ``started_at`` — risk a duplicate turn, never a lost result.
+        * the **route** — the full gateway routing tuple, so two chats that
+          happen to watch the same log stay two conversations.
+        * the **conclusion** — the payload itself.
+
+        Producer fields are deliberately absent. ``session_id``, ``command``
+        and ``started_at`` are what make a wrapper and the process it wraps
+        look like two events; ``type`` and ``pattern`` are what make a
+        ``watch_match`` and the ``completion`` that follows it look like two
+        events. Neither pair is a different conclusion.
+
+        ``async_delegation`` is excluded outright. A delegation IS its own unit
+        of work — two delegation ids are two pieces of work even when their
+        summaries read alike — and its delivery is arbitrated by the durable
+        claim/ack ledger in ``tools.async_delegation``. Suppressing one here
+        would either strand its row pending forever or ack work the user never
+        saw; neither is an honest ack.
+
+        Accepted trade: two genuinely different commands inside ONE task whose
+        payloads are byte-identical collapse into one turn. Distinguishing them
+        would need ``command`` in the key, which is exactly the field a wrapper
+        and its child disagree on.
+        """
+        if str(evt.get("type") or "completion") == "async_delegation":
+            return None
+        task_id = str(evt.get("task_id") or "").strip()
+        if not task_id:
+            return None
+        payload = str(evt.get("output") or evt.get("message") or "").strip()
+        if not payload:
+            # No conclusion is no evidence of sameness — two silent jobs
+            # finishing on one route are two results, not one restated.
+            return None
+        digest = hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()
+        return (task_id, digest, *GatewayRunner._equivalence_route(evt))
+
+    @staticmethod
+    def _equivalence_route(evt: dict) -> "tuple[str, ...]":
+        """The conversation an internal event lands in.
+
+        ``session_key`` alone when present: it already encodes platform, chat
+        type, chat and thread. The full
+        :meth:`_completion_notification_batch_key` tuple cannot be used here
+        because producers disagree about which routing fields they stamp — a
+        registry ``watch_match`` carries no ``chat_type`` while the
+        gateway-built ``completion`` for the very same process does, so keying
+        on the wide tuple would put one conclusion's two shapes on two routes
+        and never collapse them. Events with no session key fall back to the
+        wide tuple.
+        """
+        session_key = str(evt.get("session_key") or "").strip()
+        if session_key:
+            return (session_key,)
+        return GatewayRunner._completion_notification_batch_key(evt)
+
+    @staticmethod
+    def _internal_event_exit_code(evt: dict) -> Optional[int]:
+        """The event's exit status, or ``None`` when it does not report one."""
+        code = evt.get("exit_code")
+        return code if isinstance(code, int) else None
+
+    def _equivalence_store(self) -> "OrderedDict[tuple[str, ...], tuple[float, Optional[int]]]":
+        """Conclusions recently injected, keyed as above. Value: (when, exit).
+
+        Created lazily: focused lifecycle tests build a runner with
+        ``object.__new__`` and no ``__init__`` (the AGENTS.md pitfall), so this
+        seam must not depend on the constructor having run.
+        """
+        store = getattr(self, "_internal_equivalence_seen", None)
+        if store is None:
+            store = OrderedDict()
+            self._internal_equivalence_seen = store
+        return store
+
+    def _equivalence_inflight(self) -> "Dict[tuple[str, ...], asyncio.Future]":
+        """One in-flight injection per key, so check-then-record cannot race."""
+        inflight = getattr(self, "_internal_equivalence_inflight", None)
+        if inflight is None:
+            inflight = {}
+            self._internal_equivalence_inflight = inflight
+        return inflight
+
+    @staticmethod
+    def _outcomes_are_equivalent(
+        seen_code: Optional[int], incoming_code: Optional[int],
+    ) -> bool:
+        """Whether two reports of one payload describe the same outcome.
+
+        ``None`` means the event reports no exit status at all — a
+        ``watch_match`` scans output, it does not wait for an exit. Unknown is
+        compatible with **success only**. Letting unknown absorb a non-zero
+        exit would mean a marker line observed first could hide that the
+        process then failed, which is the one conclusion that must never be
+        swallowed. Two known outcomes are equivalent only when equal, so a
+        wrapper that masks its child's failure still gets its own turn.
+        """
+        if seen_code is None and incoming_code is None:
+            return True
+        if seen_code is None:
+            return incoming_code == 0
+        if incoming_code is None:
+            return seen_code == 0
+        return seen_code == incoming_code
+
+    def _internal_event_superseded_locked(
+        self, key: "tuple[str, ...]", evt: dict,
+    ) -> bool:
+        """Whether this conclusion already reached this route. Lock held."""
+        entry = self._equivalence_store().get(key)
+        if entry is None:
+            return False
+        _recorded_at, seen_code = entry
+        return self._outcomes_are_equivalent(
+            seen_code, self._internal_event_exit_code(evt),
+        )
+
+    def _record_internal_event_equivalence(self, evt: dict) -> None:
+        """Remember a conclusion that the adapter accepted."""
+        key = self._internal_event_equivalence_key(evt)
+        if key is None:
+            return
+        with self._completion_delivery_lock:
+            self._record_internal_equivalence_locked(key, evt)
+
+    def _record_internal_equivalence_locked(
+        self, key: "tuple[str, ...]", evt: dict,
+    ) -> None:
+        """Store one accepted conclusion. Caller holds the delivery lock."""
+        now = time.monotonic()
+        store = self._equivalence_store()
+        store.pop(key, None)
+        store[key] = (now, self._internal_event_exit_code(evt))
+        self._prune_internal_equivalence(now)
+
+    def _prune_internal_equivalence(self, now: float) -> None:
+        """Drop expired/overflowing entries. Caller holds the delivery lock."""
+        seen = self._equivalence_store()
+        while seen:
+            oldest_key = next(iter(seen))
+            recorded_at, _code = seen[oldest_key]
+            if now - recorded_at < _INTERNAL_EQUIVALENCE_TTL_SECONDS and (
+                len(seen) <= _INTERNAL_EQUIVALENCE_MAX_ENTRIES
+            ):
+                break
+            seen.pop(oldest_key, None)
+
     async def _inject_watch_notification(
+        self, synth_text: str, evt: dict,
+    ) -> Optional[bool]:
+        """Inject an internal notification unless it restates a fresh conclusion.
+
+        Wraps :meth:`_inject_watch_notification_now` with the work-scoped
+        supersession described in :meth:`_internal_event_equivalence_key`.
+
+        The key is **reserved** for the duration of the injection, not merely
+        checked before it. A bare check-await-record would let two concurrent
+        injections of one conclusion both pass the check while the first was
+        still awaiting the adapter, which is precisely the fan-out this exists
+        to collapse. A second caller instead waits on the first attempt and
+        only stands down if that attempt actually reached the adapter; if it
+        did not, the second caller retries rather than being dropped, so a
+        failed delivery never swallows the event behind it.
+
+        Returning ``None`` for a superseded event matches the existing "another
+        caller already owns this delivery" contract, so callers treat it as
+        handled rather than replaying it forever. Suppression only ever removes
+        a synthetic turn — it never splices text into a running one, so strict
+        user/assistant alternation is untouched.
+        """
+        key = self._internal_event_equivalence_key(evt)
+        if key is None:
+            return await self._inject_watch_notification_now(synth_text, evt)
+
+        while True:
+            owner: Optional[asyncio.Future] = None
+            waiter: Optional[asyncio.Future] = None
+            with self._completion_delivery_lock:
+                self._prune_internal_equivalence(time.monotonic())
+                if self._internal_event_superseded_locked(key, evt):
+                    logger.debug(
+                        "Superseding internal %s event for %s: an equivalent "
+                        "conclusion already reached this route within %.0fs",
+                        evt.get("type", "completion"),
+                        evt.get("session_id") or "<unknown>",
+                        _INTERNAL_EQUIVALENCE_TTL_SECONDS,
+                    )
+                    return None
+                inflight = self._equivalence_inflight()
+                waiter = inflight.get(key)
+                if waiter is None:
+                    owner = asyncio.get_running_loop().create_future()
+                    inflight[key] = owner
+
+            if owner is None:
+                # Another injection of this same conclusion is in flight.
+                delivered_by_other = False
+                try:
+                    delivered_by_other = bool(await waiter)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    delivered_by_other = False
+                if delivered_by_other:
+                    return None
+                # It did not reach the adapter. This event must not be lost
+                # behind it — loop and take the attempt ourselves.
+                continue
+
+            result: Optional[bool] = None
+            try:
+                result = await self._inject_watch_notification_now(synth_text, evt)
+                return result
+            finally:
+                with self._completion_delivery_lock:
+                    if self._equivalence_inflight().get(key) is owner:
+                        self._equivalence_inflight().pop(key, None)
+                    if result is True:
+                        self._record_internal_equivalence_locked(key, evt)
+                if not owner.done():
+                    owner.set_result(result is True)
+
+    async def _inject_watch_notification_now(
         self, synth_text: str, evt: dict,
     ) -> Optional[bool]:
         """Inject a watch/completion notification as a synthetic message event.
@@ -26585,6 +27224,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _record_coalesced_completion_siblings(self, events: list[dict]) -> None:
         """Extend a successful primary delivery claim to its batched siblings."""
+        # A sibling's conclusion rode along inside the consolidated text, so it
+        # HAS reached the user — claim its equivalence key too, or a later
+        # restatement of that same conclusion would start its own turn.
+        for evt in events:
+            self._record_internal_event_equivalence(evt)
         with self._completion_delivery_lock:
             for evt in events:
                 identity = self._completion_delivery_identity(evt)
@@ -27027,6 +27671,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "type": "completion",
                         "session_id": session_id,
                         "session_key": session_key,
+                        # The registry stamps task_id on every notification it
+                        # emits (_move_to_finished, _check_watch_patterns); the
+                        # watcher dict never carried it, so this gateway-built
+                        # copy used to be the one completion event with no
+                        # unit-of-work grouping key at all. Read it off the live
+                        # session so a wrapper and the process it wraps can be
+                        # recognised as one piece of work.
+                        "task_id": getattr(session, "task_id", "") or "",
                         "platform": platform_name,
                         "chat_type": watcher.get("chat_type", ""),
                         "chat_id": chat_id,
@@ -30497,6 +31149,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception:
                         pass
 
+            deferred_session_entry = None
+            if (
+                result
+                and result.get("compression_deferred") is True
+                and result.get("failed") is False
+                and (pending_event or pending)
+            ):
+                await self._wait_for_deferred_compression(session_key)
+                deferred_source = (
+                    getattr(pending_event, "source", None)
+                    if pending_event is not None
+                    else source
+                ) or source
+                # Compression may have rotated the session while the queued
+                # event waited. Resolve its own profile/route before preparing
+                # attachments or starting the recursive turn.
+                deferred_session_entry = (
+                    await self.async_session_store.get_or_create_session(
+                        deferred_source
+                    )
+                )
+
             if self._draining and (pending_event or pending):
                 logger.info(
                     "Discarding pending follow-up for session %s during gateway %s",
@@ -30575,6 +31249,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
                             session_key or "?",
                         )
+                    elif result.get("compression_deferred") is True:
+                        logger.info(
+                            "Compression-deferred turn for session %s has a queued "
+                            "follow-up; suppressing the transient defer response.",
+                            session_key or "?",
+                        )
                     elif first_response:
                         try:
                             if _already_streamed:
@@ -30634,6 +31314,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 next_message_id = None
                 next_channel_prompt = None
                 next_session_key = session_key
+                next_session_id = session_id
                 # #60671 — carry the pending event's message_type into the
                 # recursive call so queued voice turns can stream TTS and
                 # re-mark the generation for the final delivered turn.
@@ -30659,6 +31340,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_key or "?",
                             exc_info=True,
                         )
+                    if deferred_session_entry is not None:
+                        next_session_key = deferred_session_entry.session_key
+                        next_session_id = deferred_session_entry.session_id
                     next_message = await self._prepare_profile_scoped_inbound_message_text(
                         event=pending_event,
                         source=next_source,
@@ -30711,14 +31395,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # follow-up.  Use the same (session_key, session_id) the
                 # recursive call runs under so the snapshot matches exactly
                 # what the follow-up's guard will consult.  Fail-safe in helper.
-                await self._refresh_agent_cache_message_count(session_key, session_id)
+                await self._refresh_agent_cache_message_count(
+                    next_session_key, next_session_id
+                )
 
                 followup_result = await self._run_agent(
                     message=next_message,
                     context_prompt=context_prompt,
                     history=updated_history,
                     source=next_source,
-                    session_id=session_id,
+                    session_id=next_session_id,
                     session_key=next_session_key,
                     run_generation=run_generation,
                     _interrupt_depth=_interrupt_depth + 1,
@@ -30900,11 +31586,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 elif _sc_msg_id and _sc_msg_id != "__no_edit__" and _sc_adapter is not None:
                     try:
-                        _reconcile_res = await _sc_adapter.edit_message(
+                        _reconcile_res = await self._deliver_external_final(
+                            adapter=_sc_adapter,
                             chat_id=source.chat_id,
                             message_id=_sc_msg_id,
                             content=_final,
-                            finalize=True,
+                            metadata=_status_thread_metadata,
                         )
                         if getattr(_reconcile_res, "success", True):
                             response["already_sent"] = True
@@ -30934,11 +31621,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _sc_msg_id = _sc.message_id
                 if _sc_msg_id:
                     try:
-                        await _sc.adapter.edit_message(
+                        await self._deliver_external_final(
+                            adapter=_sc.adapter,
                             chat_id=source.chat_id,
                             message_id=_sc_msg_id,
                             content=response["final_response"],
-                            finalize=True,
+                            metadata=_status_thread_metadata,
                         )
                         response["already_sent"] = True
                         logger.info(

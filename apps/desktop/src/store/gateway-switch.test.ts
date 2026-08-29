@@ -6,6 +6,7 @@ import {
   $cronSessions,
   $freshDraftReady,
   $messagingSessions,
+  $selectedStoredSessionId,
   $sessionProfilesTruncated,
   $sessions,
   $sessionsLoading,
@@ -13,6 +14,7 @@ import {
   setCronSessions,
   setFreshDraftReady,
   setMessagingSessions,
+  setSelectedStoredSessionId,
   setSessionProfilesTruncated,
   setSessions,
   setSessionsLoading
@@ -47,6 +49,8 @@ describe('wipeSessionListsForGatewaySwitch', () => {
   beforeEach(() => {
     $gatewaySwitching.set(false)
     setSessions([{ id: 's1', title: 'old', profile: 'default' } as never])
+    setActiveSessionId('runtime-old')
+    setSelectedStoredSessionId('stored-old')
     setSessionProfilesTruncated({ default: true })
     setCronSessions([{ id: 'c1', title: 'cron', profile: 'default' } as never])
     setMessagingSessions([{ id: 'm1', title: 'tg', profile: 'default' } as never])
@@ -59,6 +63,8 @@ describe('wipeSessionListsForGatewaySwitch', () => {
   afterEach(() => {
     resetSessionsLimit()
     setSessions([])
+    setActiveSessionId(null)
+    setSelectedStoredSessionId(null)
     setCronSessions([])
     setMessagingSessions([])
     $stalledSessionIds.set([])
@@ -77,6 +83,8 @@ describe('wipeSessionListsForGatewaySwitch', () => {
     expect($sessionsLoading.get()).toBe(true)
     expect($sessionsLimit.get()).toBe(SIDEBAR_SESSIONS_PAGE_SIZE)
     expect($freshDraftReady.get()).toBe(true)
+    expect($activeSessionId.get()).toBeNull()
+    expect($selectedStoredSessionId.get()).toBeNull()
   })
 
   it('strands in-flight profile-list fetches so the old backend cannot repaint the rail (#85731)', () => {

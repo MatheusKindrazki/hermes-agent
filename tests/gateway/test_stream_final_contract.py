@@ -18,11 +18,45 @@ Three invariants:
 """
 
 import asyncio
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
 
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+from gateway.egress_policy import EgressPolicy
+from gateway.reliability_outbox import ReliabilityOutbox
+
+
+WORK_ID = "01a04a0f-455a-7bea-a064-4aa68b009d39"
+
+
+def _reliability_config(tmp_path, *, egress="enforce", outbox="shadow"):
+    return {
+        "gateway": {
+            "reliability": {
+                "egress": {"mode": egress},
+                "outbox": {
+                    "mode": outbox,
+                    "db_path": str(tmp_path / "outbox.sqlite3"),
+                    "payload_dir": str(tmp_path / "payloads"),
+                },
+            }
+        }
+    }
+
+
+def _final_identity():
+    return {
+        "profile": "luguistaff",
+        "tenant": "lugui",
+        "machine": "personal-mac-mini",
+        "work_id": WORK_ID,
+        "session_id": "runtime-sid",
+        "policy_version": "tone-v1",
+        "milestone": "turn-complete",
+        "version": "turn-7",
+    }
 
 
 def _make_draft_adapter():
@@ -61,6 +95,45 @@ def _make_draft_adapter():
 
 
 class TestConsumerDeclaredFinal:
+    @pytest.mark.asyncio
+    async def test_enforced_final_uses_shadow_outbox_without_native_adapter(self, tmp_path):
+        """The production stream-final seam must gate and enqueue atomically.
+
+        Enforce holds previews until the complete identity can be checked;
+        shadow outbox then owns delivery, so no native send/edit is allowed.
+        """
+        adapter = _make_draft_adapter()
+        cfg = _reliability_config(tmp_path)
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "D1",
+            StreamConsumerConfig(
+                transport="auto", chat_type="dm", edit_interval=0.01,
+                buffer_threshold=1, cursor="",
+            ),
+            metadata=_final_identity(),
+            egress_policy=EgressPolicy.from_config(cfg),
+            reliability_outbox=ReliabilityOutbox.from_config(
+                cfg, hermes_home=tmp_path,
+            ),
+        )
+
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta("prefix-stable final")
+        await asyncio.sleep(0.04)
+        consumer.finish("prefix-stable final")
+        await task
+
+        assert adapter.draft_calls == []
+        assert adapter.send_calls == []
+        assert adapter.edit_calls == []
+        with sqlite3.connect(tmp_path / "outbox.sqlite3") as conn:
+            row = conn.execute(
+                "SELECT event_type, destination, state FROM outbox_events"
+            ).fetchone()
+        assert row == ("gateway_stream_final", "StreamIsMsgAdapter:D1", "pending")
+        assert consumer.delivered_final_matches("prefix-stable final") is True
+
     @pytest.mark.asyncio
     async def test_finish_final_text_rides_the_final_send(self):
         """The footer-bearing final_response must BE the finalize payload —
@@ -222,6 +295,37 @@ class TestFinalAdoptionGuards:
 
 
 class TestQueuedLaneReconcile:
+    @pytest.mark.asyncio
+    async def test_direct_runner_final_uses_same_policy_and_shadow_outbox(self, tmp_path):
+        from gateway.run import GatewayRunner
+
+        cfg = _reliability_config(tmp_path)
+        runner = object.__new__(GatewayRunner)
+        runner._egress_policy = EgressPolicy.from_config(cfg)
+        runner._reliability_outbox = ReliabilityOutbox.from_config(
+            cfg, hermes_home=tmp_path,
+        )
+        adapter = _make_draft_adapter()
+        source = SimpleNamespace(chat_id="D1")
+
+        await GatewayRunner._deliver_queued_first_response(
+            runner,
+            "direct completed response",
+            source=source,
+            adapter=adapter,
+            metadata=_final_identity(),
+            text_already_delivered=False,
+            deliver_media=False,
+        )
+
+        assert adapter.send_calls == []
+        assert adapter.edit_calls == []
+        with sqlite3.connect(tmp_path / "outbox.sqlite3") as conn:
+            events = conn.execute(
+                "SELECT event_type, destination FROM outbox_events"
+            ).fetchall()
+        assert events == [("gateway_runner_final", "StreamIsMsgAdapter:D1")]
+
     @pytest.mark.asyncio
     async def test_queued_first_response_edits_in_place(self):
         from gateway.run import GatewayRunner

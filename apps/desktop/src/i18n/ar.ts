@@ -61,6 +61,18 @@ export const ar = defineLocale({
     on: 'مفعل',
     off: 'معطل'
   },
+  activeContext: {
+    unknownProfile: 'ملف شخصي غير معروف',
+    unknownTenant: 'مستأجر غير معروف',
+    unknownDevice: 'جهاز غير معروف',
+    newChat: 'محادثة جديدة',
+    chat: 'محادثة',
+    thisChat: 'هذه المحادثة',
+    ownerUnknown: (profile, device) => `المالك غير معروف — ${profile} على ${device}`,
+    ownerKnown: (profile, device) => `${profile} على ${device}`,
+    detail: (what, owner, tenant) => `${what}: ${owner}؛ المستأجر ${tenant}`,
+    text: (what, profile, tenant, device) => `${what} · ${profile} · ${tenant} · ${device}`
+  },
   fileMenu: {
     revealFinder: 'إظهار في Finder',
     revealExplorer: 'إظهار في File Explorer',

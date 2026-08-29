@@ -6,6 +6,7 @@ import type * as React from 'react'
 import { memo, Suspense, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useLocation } from 'react-router'
 
+import { getApiCapabilities } from '@/api/capabilities'
 import type { SubmitTextOptions } from '@/app/session/hooks/use-prompt-actions/utils'
 import { sessionShouldHaveTranscript } from '@/app/session/hooks/use-session-actions/utils'
 import { Thread } from '@/components/assistant-ui/thread'
@@ -28,11 +29,19 @@ import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
 import { migrateSessionDraft } from '@/store/composer'
 import { migrateQueuedPrompts, parkQueuedPrompts } from '@/store/composer-queue'
+import { $connectionsRegistry } from '@/store/connection-registry-state'
+import { $activeConnectionId } from '@/store/connections'
 import { $introSplash } from '@/store/intro-splash'
 import { $pinnedSessionIds } from '@/store/layout'
 import { $petActive } from '@/store/pet'
 import { $petOverlayActive } from '@/store/pet-overlay'
-import { $activeGatewayProfile, $gatewaySwapTarget, $hydrationSyncProfile, $profiles } from '@/store/profile'
+import {
+  $activeGatewayProfile,
+  $gatewaySwapTarget,
+  $hydrationSyncProfile,
+  $profiles,
+  resolveNewChatOwnerRoute
+} from '@/store/profile'
 import {
   $connection,
   $contextSuggestions,
@@ -43,6 +52,7 @@ import {
   $resumeExhaustedSessionId,
   $sessions,
   getSessionOwnerHint,
+  knownSessionOwner,
   resolveComposerSessionKey,
   sessionMatchesStoredId,
   sessionPinId,
@@ -56,6 +66,14 @@ import type { ModelOptionsResponse } from '@/types/hermes'
 import { primaryRouteSelectedSessionId, routeSessionId } from '../routes'
 import { titlebarHeaderBaseClass, titlebarHeaderShadowClass, titlebarHeaderTitleClass } from '../shell/titlebar'
 
+import {
+  type ActiveContext,
+  activeContextCanSubmit,
+  activeContextCapabilityDecision,
+  activeContextCorrelationFromReceipt,
+  resolveActiveContext
+} from './active-context'
+import { ActiveContextChip } from './active-context-chip'
 import { ChatDropOverlay } from './chat-drop-overlay'
 import { ChatSwapOverlay, ChatSyncBadge } from './chat-swap-overlay'
 import { ChatBar, ChatBarFallback } from './composer'
@@ -79,6 +97,12 @@ import {
   transcriptBackfillAvailable
 } from './transcript-backfill'
 import { advanceTranscriptWindow, type TranscriptWindowState } from './transcript-window'
+
+// The pane tree suppresses old titlebar bands by matching this legacy height
+// token literally. Active context is no longer decorative title chrome: it is
+// the fail-closed destination receipt for Enter, so give it an explicit pane
+// height and keep it rendered in the workspace zone.
+const activeContextHeaderBaseClass = titlebarHeaderBaseClass.replace('h-(--titlebar-height)', 'h-7')
 
 interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   gateway: HermesGateway | null
@@ -107,36 +131,84 @@ interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   onRetryResume: (sessionId: string) => void
   onTranscribeAudio?: (audio: Blob) => Promise<string>
   onDismissError?: (messageId: string) => void
+  /** Internal/default-off rollout gate for kindra.active-context/v1. */
+  identityV2Enabled?: boolean
 }
 
 interface ChatHeaderProps {
+  activeContext?: ActiveContext
   activeSessionId: null | string
   isRoutedSessionView: boolean
   onDeleteSelectedSession: () => void
   onToggleSelectedPin: () => void
+  /** The session the next message TARGETS — route first, exactly as
+   *  resolve-target-session does. On a tile this is the tile's own id. */
+  routedSessionId: null | string
   selectedSessionId: null | string
 }
 
 function ChatHeader({
+  activeContext: suppliedActiveContext,
   activeSessionId,
   isRoutedSessionView,
   onDeleteSelectedSession,
   onToggleSelectedPin,
+  routedSessionId,
   selectedSessionId
 }: ChatHeaderProps) {
   const sessions = useStore($sessions)
   const pinnedSessionIds = useStore($pinnedSessionIds)
   const profiles = useStore($profiles)
+  const connectionsRegistry = useStore($connectionsRegistry)
+  // resolveNewChatOwnerRoute() reads atoms with .get(), which does not
+  // subscribe. Subscribe to the two that move it so a draft's chip cannot go
+  // on naming the previous destination after a profile pick or a connection
+  // apply — the exact staleness this chip exists to expose.
+  const activeGatewayProfile = useStore($activeGatewayProfile)
+  const activeConnectionId = useStore($activeConnectionId)
 
   const activeStoredSession =
     (selectedSessionId && sessions.find(session => sessionMatchesStoredId(session, selectedSessionId))) || null
 
   const title = activeStoredSession ? sessionTitle(activeStoredSession) : NEW_SESSION_TITLE
 
-  // Which agent/persona owns this chat — glanceable in the header once a
-  // second profile exists, so the open session's ownership is never ambiguous
-  // (#66003). Single-profile users see the unchanged header.
+  // Where the next message actually lands — profile AND connection AND
+  // session, derived from the same resolvers the submit path uses so the
+  // chrome cannot drift from routing.
+  //
+  // The old predicate suppressed identity whenever no session row was loaded,
+  // which is precisely the state a connection/mode apply leaves behind: the
+  // header read "New session" with no owner at all while the route still
+  // named a conversation on the backend just left. Identity is now stated
+  // whenever more than one destination EXISTS — including on a draft, which
+  // is exactly when the user most needs to know where Enter goes.
+  // Bound to the SEND TARGET, route first — the same precedence
+  // resolve-target-session applies. Reading the selected id instead is exactly
+  // how the visible identity and the real destination came apart.
+  const targetStoredSessionId = routedSessionId ?? selectedSessionId
+
+  const newChatRoute = useMemo(() => {
+    // The resolver reads these atoms imperatively; touch the subscribed values
+    // so React recomputes in the same render that moves the send authority.
+    void activeConnectionId
+    void activeGatewayProfile
+
+    return resolveNewChatOwnerRoute()
+  }, [activeConnectionId, activeGatewayProfile])
+
+  const derivedActiveContext = useMemo(
+    () =>
+      resolveActiveContext({
+        newChatRoute,
+        owner: knownSessionOwner(sessions, targetStoredSessionId),
+        targetStoredSessionId
+      }),
+    [newChatRoute, sessions, targetStoredSessionId]
+  )
+
+  const activeContext = suppliedActiveContext ?? derivedActiveContext
   const showProfileTag = profiles.length > 1 && Boolean(activeStoredSession)
+  const showContext = profiles.length > 1 || (connectionsRegistry?.connections.length ?? 0) > 1
 
   // Pins live on the durable lineage-root id, but selectedSessionId is the live
   // (tip) id — resolve through the loaded row so the menu reflects the pin
@@ -149,21 +221,40 @@ function ChatHeader({
 
   // Secondary windows (new-session scratch, subagent watch, cmd-click pop-out)
   // are compact side panels — they drop the session-actions header + border
-  // entirely. A brand-new draft has nothing to pin/delete/rename either.
-  if (isAuxiliaryWindow() || (!selectedSessionId && !activeSessionId && !isRoutedSessionView)) {
+  // entirely.
+  //
+  // A brand-new draft has nothing to pin/delete/rename, which is why it used
+  // to drop the header too. But that reasoning is about the ACTIONS, and the
+  // header is now also where the destination is stated. Dropping it whenever
+  // more than one destination exists is the ambiguity itself: after a
+  // connection apply the window sits on exactly this state, and a header that
+  // is simply absent tells the user even less than one reading "New session".
+  // The actions below already degrade on their own (`selectedSessionId ? ... :
+  // undefined`), so keeping the header costs nothing.
+  const isBareDraft = !selectedSessionId && !activeSessionId && !isRoutedSessionView
+
+  if (isAuxiliaryWindow() || (isBareDraft && !showContext)) {
     return null
   }
 
   return (
-    <header className={cn(titlebarHeaderBaseClass, isRoutedSessionView && titlebarHeaderShadowClass)}>
+    <header
+      className={cn(
+        showContext ? activeContextHeaderBaseClass : titlebarHeaderBaseClass,
+        isRoutedSessionView && titlebarHeaderShadowClass
+      )}
+    >
       <div
-        className={cn(titlebarHeaderTitleClass, showProfileTag && 'flex items-center')}
+        className={cn(titlebarHeaderTitleClass, (showProfileTag || showContext) && 'flex items-center')}
         style={{
           maxWidth:
             'calc(100vw - var(--titlebar-content-inset,0px) - var(--titlebar-tools-right) - var(--titlebar-tools-width) - 1.5rem)'
         }}
       >
         {showProfileTag && <ProfileTag className="pointer-events-auto mr-1.5" profile={activeStoredSession?.profile} />}
+        {showContext && (
+          <ActiveContextChip className="pointer-events-auto mr-1.5 inline-flex items-center" context={activeContext} />
+        )}
         <SessionActionsMenu
           align="start"
           onDelete={selectedSessionId ? onDeleteSelectedSession : undefined}
@@ -382,7 +473,8 @@ const ChatViewContent = memo(function ChatViewContent({
   onRestoreToMessage,
   onRetryResume,
   onTranscribeAudio,
-  onDismissError
+  onDismissError,
+  identityV2Enabled: identityV2Override
 }: ChatViewProps) {
   const location = useLocation()
   const { t } = useI18n()
@@ -407,6 +499,7 @@ const ChatViewContent = memo(function ChatViewContent({
   const awaitingResponse = useStore(view.$awaitingResponse)
   const busy = useStore(view.$busy)
   const activeGatewayProfile = useStore($activeGatewayProfile)
+  const activeConnectionId = useStore($activeConnectionId)
   const contextSuggestions = useStore($contextSuggestions)
   // Per-session (SessionView) reads — a tile IS its session, so these come
   // from the view slice, not the global atoms (which track the primary only).
@@ -481,6 +574,97 @@ const ChatViewContent = memo(function ChatViewContent({
   // A tile IS its session — no route involved, never "mismatched".
   const routedSessionId = isPrimary ? routeSessionId(location.pathname) : selectedSessionId
   const isRoutedSessionView = Boolean(routedSessionId)
+  const targetStoredSessionId = routedSessionId ?? selectedSessionId
+
+  const targetSession = targetStoredSessionId
+    ? (sessions.find(session => sessionMatchesStoredId(session, targetStoredSessionId)) ?? null)
+    : null
+
+  const owner = knownSessionOwner(sessions, targetStoredSessionId)
+
+  const draftRoute = useMemo(() => {
+    void activeConnectionId
+    void activeGatewayProfile
+
+    return resolveNewChatOwnerRoute()
+  }, [activeConnectionId, activeGatewayProfile])
+
+  const ownerConnectionId =
+    owner && typeof owner === 'object' && 'connectionId' in owner
+      ? owner.connectionId
+      : targetSession?.connection_id || draftRoute?.connectionId || activeConnectionId
+
+  const ownerProfile =
+    owner && typeof owner === 'object' && 'connectionId' in owner
+      ? owner.targetProfile || owner.profile
+      : typeof owner === 'string'
+        ? owner
+        : targetSession?.profile || draftRoute?.profile || activeGatewayProfile
+
+  const activeContextCapabilityQuery = useQuery({
+    queryKey: ['active-context-capability', ownerConnectionId ?? 'local', ownerProfile ?? 'default'],
+    queryFn: () =>
+      getApiCapabilities({
+        connectionId: ownerConnectionId,
+        profile: ownerProfile
+      }),
+    enabled: gatewayOpen && identityV2Override === undefined,
+    retry: false,
+    staleTime: 30_000
+  })
+
+  const activeContextCapability = activeContextCapabilityQuery.data?.features?.active_context_v2
+
+  // Capability and receipt are separate authority signals. A canary-enabled
+  // backend can legitimately have no receipt (missing identity config, draft,
+  // malformed row); that absence must block rather than silently falling back
+  // to legacy routing. Tests may force the gate through the internal prop.
+  const activeContextCapabilityDecisionResult = activeContextCapabilityDecision({
+    feature: activeContextCapability,
+    override: identityV2Override,
+    status: activeContextCapabilityQuery.status
+  })
+
+  const identityV2Enabled = activeContextCapabilityDecisionResult.v2
+
+  const activeContext = useMemo(() => {
+    // The legacy local door intentionally returns no explicit draft route:
+    // its submit is ambient. The ambient destination is still exact at this
+    // render because these two atoms are the same active connection/profile
+    // the request dispatcher uses. Carry that pair for display only; never
+    // infer either field from a title, session id, or profile name.
+    const displayedDraftRoute =
+      draftRoute ??
+      (!targetStoredSessionId && ownerConnectionId && ownerProfile
+        ? { connectionId: ownerConnectionId, profile: ownerProfile }
+        : null)
+
+    return resolveActiveContext({
+      activeRuntimeSessionId: activeSessionId,
+      correlation: activeContextCorrelationFromReceipt(targetSession?.active_context),
+      identityV2: identityV2Enabled,
+      newChatRoute: displayedDraftRoute,
+      owner,
+      targetStoredSessionId
+    })
+  }, [
+    activeSessionId,
+    draftRoute,
+    identityV2Enabled,
+    owner,
+    ownerConnectionId,
+    ownerProfile,
+    targetSession,
+    targetStoredSessionId
+  ])
+
+  const contextAllowsSubmit =
+    activeContextCapabilityDecisionResult.known && activeContextCanSubmit(activeContext, identityV2Enabled)
+
+  const submitWithContextGuard = useCallback(
+    (text: string, options?: SubmitTextOptions) => (contextAllowsSubmit ? onSubmit(text, options) : false),
+    [contextAllowsSubmit, onSubmit]
+  )
 
   // The URL points at a session the store hasn't loaded yet (sidebar / cmd-K /
   // direct nav). Derived in render so the swap reads instantly: the same frame
@@ -617,6 +801,15 @@ const ChatViewContent = memo(function ChatViewContent({
         'relative isolate flex h-full min-w-0 flex-col overflow-hidden bg-(--ui-chat-surface-background)',
         className
       )}
+      data-active-context-capability={
+        activeContextCapabilityDecisionResult.known
+          ? identityV2Enabled
+            ? 'enabled'
+            : 'disabled'
+          : activeContextCapabilityQuery.status
+      }
+      data-active-context-submit={contextAllowsSubmit ? 'allowed' : 'blocked'}
+      data-active-context-v2={identityV2Enabled ? 'enabled' : 'legacy'}
       data-chat-surface=""
       data-chat-unfocused={surfaceFocused ? undefined : ''}
       data-composer-surface-id={composerSurfaceId}
@@ -628,10 +821,12 @@ const ChatViewContent = memo(function ChatViewContent({
           prompt overlays stay active-session-scoped in the primary surface. */}
       {isPrimary && (
         <ChatHeader
+          activeContext={activeContext}
           activeSessionId={activeSessionId}
           isRoutedSessionView={isRoutedSessionView}
           onDeleteSelectedSession={onDeleteSelectedSession}
           onToggleSelectedPin={onToggleSelectedPin}
+          routedSessionId={routedSessionId}
           selectedSessionId={selectedSessionId}
         />
       )}
@@ -716,7 +911,7 @@ const ChatViewContent = memo(function ChatViewContent({
             <ChatBar
               busy={busy}
               cwd={currentCwd}
-              disabled={!gatewayOpen}
+              disabled={!gatewayOpen || !contextAllowsSubmit}
               focusKey={activeSessionId}
               gateway={gateway}
               maxRecordingSeconds={maxVoiceRecordingSeconds}
@@ -732,7 +927,7 @@ const ChatViewContent = memo(function ChatViewContent({
               onPickImages={onPickImages}
               onRemoveAttachment={onRemoveAttachment}
               onSteer={onSteer}
-              onSubmit={onSubmit}
+              onSubmit={submitWithContextGuard}
               onTranscribeAudio={onTranscribeAudio}
               queueSessionKey={queueSessionKey}
               sessionId={activeSessionId}

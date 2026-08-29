@@ -148,6 +148,10 @@ from gateway.platforms.base import (
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
+from gateway.run_idempotency import (
+    RunIdempotencyConflict,
+    RunIdempotencyLedger,
+)
 from gateway.browser_control_artifacts import (
     ArtifactError,
     ArtifactRateLimiter,
@@ -1564,6 +1568,8 @@ class APIServerAdapter(BasePlatformAdapter):
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
+        self._run_idempotency = RunIdempotencyLedger()
+        self._run_idempotent_ids: set[str] = set()
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
         self._session_dbs: Dict[str, Any] = {}
         self._session_db_cache_lock = threading.Lock()
@@ -3321,6 +3327,19 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        from gateway.active_context_receipt import (
+            ACTIVE_CONTEXT_SCHEMA,
+            active_context_v1_enabled,
+        )
+        from hermes_cli.config import load_config
+
+        try:
+            active_context_enabled = active_context_v1_enabled(load_config())
+        except Exception:
+            # Capability discovery must remain available when config loading is
+            # degraded. The rollout is fail-safe default-off in that case.
+            active_context_enabled = False
+
         return web.json_response({
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
@@ -3358,6 +3377,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat_streaming": True,
                 "session_fork": True,
                 "session_model_lock": True,
+                "active_context_v2": {
+                    "enabled": active_context_enabled,
+                    "receipt_schema": ACTIVE_CONTEXT_SCHEMA,
+                },
                 "admin_config_rw": False,
                 "jobs_admin": False,
                 "memory_write_api": False,
@@ -7495,7 +7518,37 @@ class APIServerAdapter(BasePlatformAdapter):
         current.setdefault("created_at", fields.pop("created_at", now))
         current.update(fields)
         self._run_statuses[run_id] = current
+        if run_id in self._run_idempotent_ids:
+            try:
+                self._run_idempotency.update_state(run_id, status, current)
+            except Exception:
+                logger.exception(
+                    "[api_server] failed to persist idempotent run receipt %s",
+                    run_id,
+                )
         return current
+
+    def _recovery_required_run_receipt(self, run_id: str) -> Dict[str, Any]:
+        receipt = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "recovery_required",
+            "deduplicated": True,
+            "reattach": {
+                "required": True,
+                "method": "POST",
+                "reason": "durable_receipt_has_no_live_worker",
+            },
+        }
+        try:
+            self._run_idempotency.update_state(
+                run_id, "recovery_required", receipt
+            )
+        except Exception:
+            logger.exception(
+                "[api_server] failed to persist recovery receipt %s", run_id
+            )
+        return receipt
 
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
@@ -7598,20 +7651,16 @@ class APIServerAdapter(BasePlatformAdapter):
         if key_err is not None:
             return key_err
 
-        # Enforce concurrency limit (shared across all agent-serving
-        # endpoints; configurable via gateway.api_server.max_concurrent_runs).
-        limited = self._concurrency_limited_response()
-        if limited is not None:
-            return limited
-
         try:
             body = await request.json()
         except Exception:
             return web.json_response(_openai_error("Invalid JSON"), status=400)
 
-        raw_input = body.get("input")
+        raw_input = body.get("input") or body.get("message")
         if not raw_input:
-            return web.json_response(_openai_error("Missing 'input' field"), status=400)
+            return web.json_response(
+                _openai_error("Missing 'input' or 'message' field"), status=400
+            )
 
         user_message = raw_input if isinstance(raw_input, str) else (raw_input[-1].get("content", "") if isinstance(raw_input, list) else "")
         if not user_message:
@@ -7677,7 +7726,139 @@ class APIServerAdapter(BasePlatformAdapter):
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
 
-        run_id = f"run_{uuid.uuid4().hex}"
+        idempotency_key = str(
+            request.headers.get("Idempotency-Key") or ""
+        ).strip()
+        request_sha256 = ""
+        payload_sha256 = ""
+        reattached = False
+        recoverable_run_id: Optional[str] = None
+
+        def _deduplicated_response(existing_run_id: str) -> "web.Response":
+            response_headers = (
+                {"X-Hermes-Session-Key": gateway_session_key}
+                if gateway_session_key
+                else {}
+            )
+            return web.json_response(
+                {
+                    "run_id": existing_run_id,
+                    "status": "started",
+                    "deduplicated": True,
+                },
+                status=202,
+                headers=response_headers,
+            )
+
+        if idempotency_key:
+            if len(idempotency_key) > 200 or not all(
+                character.isalnum() or character in {":", ".", "_", "-"}
+                for character in idempotency_key
+            ):
+                return web.json_response(
+                    _openai_error(
+                        "Invalid Idempotency-Key header",
+                        code="invalid_idempotency_key",
+                    ),
+                    status=400,
+                )
+            metadata = body.get("metadata")
+            metadata = metadata if isinstance(metadata, dict) else {}
+            request_sha256 = str(
+                metadata.get("request_sha256")
+                or body.get("request_sha256")
+                or ""
+            ).strip().lower()
+            if (
+                len(request_sha256) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in request_sha256
+                )
+            ):
+                return web.json_response(
+                    _openai_error(
+                        "Idempotency-Key requires a 64-character request_sha256",
+                        code="invalid_request_sha256",
+                    ),
+                    status=400,
+                )
+            payload_sha256 = hashlib.sha256(
+                json.dumps(
+                    body,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            try:
+                existing_record = self._run_idempotency.lookup_record(
+                    idempotency_key=idempotency_key,
+                    request_sha256=request_sha256,
+                    payload_sha256=payload_sha256,
+                )
+            except RunIdempotencyConflict:
+                return web.json_response(
+                    _openai_error(
+                        "Idempotency-Key was reused for a different payload",
+                        code="idempotency_payload_mismatch",
+                    ),
+                    status=409,
+                )
+            if existing_record is not None:
+                existing_run_id = existing_record.run_id
+                if (
+                    existing_run_id in self._run_statuses
+                    or existing_run_id in self._active_run_tasks
+                ):
+                    return _deduplicated_response(existing_run_id)
+                if existing_record.state == "claimed":
+                    # The durable claim exists but no worker was ever attached.
+                    # The exact retry body is present on this request, so reuse
+                    # the original run id and start the missing worker.
+                    recoverable_run_id = existing_run_id
+                    reattached = True
+                elif existing_record.state in {"completed", "failed", "cancelled"}:
+                    durable = dict(existing_record.receipt)
+                    durable.setdefault("object", "hermes.run")
+                    durable.setdefault("run_id", existing_run_id)
+                    durable.setdefault("status", existing_record.state)
+                    durable["deduplicated"] = True
+                    return web.json_response(durable, status=202)
+                else:
+                    return web.json_response(
+                        self._recovery_required_run_receipt(existing_run_id),
+                        status=409,
+                    )
+
+        # Let durable retries return the original receipt before applying the
+        # shared concurrency limit. A retry must not become 429 merely because
+        # the worker it already started occupies the final slot.
+        limited = self._concurrency_limited_response()
+        if limited is not None:
+            return limited
+
+        run_id = recoverable_run_id or f"run_{uuid.uuid4().hex}"
+        if idempotency_key and recoverable_run_id is None:
+            try:
+                claim = self._run_idempotency.claim(
+                    idempotency_key=idempotency_key,
+                    request_sha256=request_sha256,
+                    payload_sha256=payload_sha256,
+                    proposed_run_id=run_id,
+                )
+            except RunIdempotencyConflict:
+                return web.json_response(
+                    _openai_error(
+                        "Idempotency-Key was reused for a different payload",
+                        code="idempotency_payload_mismatch",
+                    ),
+                    status=409,
+                )
+            run_id = claim.run_id
+            if not claim.inserted:
+                return _deduplicated_response(run_id)
+
         session_id = session_id or run_id
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
@@ -8003,6 +8184,12 @@ class APIServerAdapter(BasePlatformAdapter):
         self._activate_admitted_request()
         task = asyncio.create_task(_run_and_close())
         self._active_run_tasks[run_id] = task
+        if idempotency_key:
+            self._run_idempotent_ids.add(run_id)
+            self._run_idempotency.attach(
+                run_id,
+                dict(self._run_statuses.get(run_id, {"run_id": run_id, "status": "queued"})),
+            )
         try:
             self._background_tasks.add(task)
         except TypeError:
@@ -8013,8 +8200,11 @@ class APIServerAdapter(BasePlatformAdapter):
         response_headers = (
             {"X-Hermes-Session-Key": gateway_session_key} if gateway_session_key else {}
         )
+        response_body = {"run_id": run_id, "status": "started"}
+        if reattached:
+            response_body["reattached"] = True
         return web.json_response(
-            {"run_id": run_id, "status": "started"},
+            response_body,
             status=202,
             headers=response_headers,
         )
@@ -8028,10 +8218,21 @@ class APIServerAdapter(BasePlatformAdapter):
         run_id = request.match_info["run_id"]
         status = self._run_statuses.get(run_id)
         if status is None:
-            return web.json_response(
-                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
-                status=404,
-            )
+            durable = self._run_idempotency.lookup_run(run_id)
+            if durable is None:
+                return web.json_response(
+                    _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                    status=404,
+                )
+            if durable.state in {"completed", "failed", "cancelled"}:
+                status = dict(durable.receipt)
+                status.setdefault("object", "hermes.run")
+                status.setdefault("run_id", run_id)
+                status.setdefault("status", durable.state)
+            elif durable.state == "recovery_required":
+                status = dict(durable.receipt)
+            else:
+                status = self._recovery_required_run_receipt(run_id)
         return web.json_response(status)
 
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":

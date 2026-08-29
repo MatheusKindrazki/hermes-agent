@@ -45,6 +45,19 @@ export const zhHant = defineLocale({
     off: '關閉'
   },
 
+  activeContext: {
+    unknownProfile: '未知設定檔',
+    unknownTenant: '未知租戶',
+    unknownDevice: '未知裝置',
+    newChat: '新聊天',
+    chat: '對話',
+    thisChat: '此對話',
+    ownerUnknown: (profile, device) => `擁有者未知 — ${profile}（${device}）`,
+    ownerKnown: (profile, device) => `${profile}（${device}）`,
+    detail: (what, owner, tenant) => `${what}：${owner}；租戶 ${tenant}`,
+    text: (what, profile, tenant, device) => `${what} · ${profile} · ${tenant} · ${device}`
+  },
+
   fileMenu: {
     revealFinder: '在 Finder 中顯示',
     revealExplorer: '在檔案總管中顯示',

@@ -84,6 +84,9 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
+from gateway.egress_policy import EgressPolicy
+from gateway.reliability_outbox import ReliabilityOutbox
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT_SECONDS = 10
@@ -96,7 +99,16 @@ QUEUE_MAX_SIZE = 256
 _TOOL_SCOPED_EVENTS = {"pre_tool_call", "post_tool_call"}
 
 # kwargs promoted to top-level payload keys (mirrors shell hooks wire).
-_TOP_LEVEL_PAYLOAD_KEYS = {"tool_name", "args", "session_id", "parent_session_id"}
+_TOP_LEVEL_PAYLOAD_KEYS = {
+    "tool_name",
+    "args",
+    "session_id",
+    "parent_session_id",
+    "timestamp",
+}
+
+_SHADOW_UNKNOWN_TIMESTAMP = "1970-01-01T00:00:00Z"
+_OUTBOX_PRODUCER = "hermes-agent.agent.outbound_webhooks"
 
 # (event, url) pairs already wired to the plugin manager in this process.
 _registered: Set[Tuple[str, str]] = set()
@@ -182,6 +194,8 @@ def register_from_config(cfg: Optional[Dict[str, Any]]) -> List[WebhookTarget]:
     from hermes_cli.plugins import get_plugin_manager
 
     manager = get_plugin_manager()
+    reliability_outbox = ReliabilityOutbox.from_config(cfg)
+    egress_policy = EgressPolicy.from_config(cfg)
 
     registered: List[WebhookTarget] = []
     with _registered_lock:
@@ -192,7 +206,12 @@ def register_from_config(cfg: Optional[Dict[str, Any]]) -> List[WebhookTarget]:
                 if key in _registered:
                     continue
                 manager._hooks.setdefault(event, []).append(
-                    _make_callback(event, target)
+                    _make_callback(
+                        event,
+                        target,
+                        reliability_outbox=reliability_outbox,
+                        egress_policy=egress_policy,
+                    )
                 )
                 _registered.add(key)
                 wired_any = True
@@ -377,20 +396,77 @@ def _resolve_secret(index: int, raw: Dict[str, Any]) -> Optional[str]:
 # Callback + delivery
 # ---------------------------------------------------------------------------
 
-def _make_callback(event: str, target: WebhookTarget):
+def _make_callback(
+    event: str,
+    target: WebhookTarget,
+    *,
+    reliability_outbox: Optional[ReliabilityOutbox] = None,
+    egress_policy: Optional[EgressPolicy] = None,
+):
     """Build the notify-only closure ``invoke_hook()`` calls per firing."""
 
     def _callback(**kwargs: Any) -> None:
         if event in _TOOL_SCOPED_EVENTS:
             if not target.matches_tool(kwargs.get("tool_name")):
                 return None
-        delivery_id = uuid.uuid4().hex
+        shadow_enabled = (
+            reliability_outbox is not None
+            and reliability_outbox.mode == "shadow"
+        )
+        outbox_version = _shadow_version(event, target, kwargs) if shadow_enabled else ""
+        delivery_id = (
+            _shadow_delivery_id(event, target, kwargs, outbox_version)
+            if shadow_enabled
+            else uuid.uuid4().hex
+        )
+        payload_timestamp = (
+            str(kwargs.get("timestamp") or _SHADOW_UNKNOWN_TIMESTAMP)
+            if shadow_enabled
+            else None
+        )
         try:
-            body = _serialize_payload(event, kwargs, delivery_id)
+            body = _serialize_payload(
+                event,
+                kwargs,
+                delivery_id,
+                timestamp=payload_timestamp,
+            )
         except Exception:  # defensive — a bad payload must not hurt the loop
             logger.warning(
                 "outbound webhook payload serialization failed (event=%s "
                 "target=%s)", event, target.label, exc_info=True,
+            )
+            return None
+        if egress_policy is not None:
+            egress_decision = egress_policy.evaluate_delivery(
+                action="webhook",
+                destination=target.url,
+                content=body,
+                metadata=kwargs,
+            )
+            if not egress_decision.allowed:
+                logger.warning(
+                    "Egress policy rejected outbound webhook %s -> %s: %s",
+                    event,
+                    target.label,
+                    ",".join(egress_decision.reasons),
+                )
+                return None
+        if shadow_enabled:
+            receipt = reliability_outbox.enqueue(
+                payload=body,
+                producer=_OUTBOX_PRODUCER,
+                work_id=str(kwargs.get("work_id") or ""),
+                event_type=event,
+                milestone=str(kwargs.get("milestone") or event),
+                version=outbox_version,
+                destination=target.url,
+            )
+            logger.debug(
+                "outbound webhook shadow-enqueued: %s -> %s (%s)",
+                event,
+                target.label,
+                receipt.event_id,
             )
             return None
         _enqueue(_build_delivery(event, target, body, delivery_id))
@@ -401,8 +477,58 @@ def _make_callback(event: str, target: WebhookTarget):
     return _callback
 
 
+def _shadow_version(
+    event: str,
+    target: WebhookTarget,
+    kwargs: Dict[str, Any],
+) -> str:
+    explicit = str(kwargs.get("version") or "").strip()
+    if explicit:
+        return explicit
+    stable_kwargs = {
+        key: value
+        for key, value in kwargs.items()
+        if key not in {"timestamp", "delivery_id"}
+    }
+    material = json.dumps(
+        {
+            "destination": target.url,
+            "event": event,
+            "payload": stable_kwargs,
+        },
+        ensure_ascii=False,
+        default=str,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(material).hexdigest()
+
+
+def _shadow_delivery_id(
+    event: str,
+    target: WebhookTarget,
+    kwargs: Dict[str, Any],
+    version: str,
+) -> str:
+    material = "\0".join(
+        (
+            _OUTBOX_PRODUCER,
+            str(kwargs.get("work_id") or ""),
+            event,
+            str(kwargs.get("milestone") or event),
+            version,
+            target.url,
+        )
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+
+
 def _serialize_payload(
-    event: str, kwargs: Dict[str, Any], delivery_id: str,
+    event: str,
+    kwargs: Dict[str, Any],
+    delivery_id: str,
+    *,
+    timestamp: Optional[str] = None,
 ) -> bytes:
     """Render the POST body.  Same top-level shape as shell hooks' stdin
     (documented in :mod:`agent.shell_hooks`), plus delivery metadata.
@@ -424,11 +550,16 @@ def _serialize_payload(
         "cwd": cwd,
         "extra": extras,
         "delivery_id": delivery_id,
-        "timestamp": datetime.now(tz=timezone.utc)
-        .isoformat()
-        .replace("+00:00", "Z"),
+        "timestamp": timestamp
+        or datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z"),
     }
-    return json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        default=str,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
 
 
 def _build_delivery(

@@ -83,3 +83,7 @@ export function appIconCandidates(opts: {
     path.join(unpackedPathFor(appRoot), 'dist', 'apple-touch-icon.png')
   ]
 }
+
+export function windowIconOptions(icon: string | undefined): { icon?: string } {
+  return icon ? { icon } : {}
+}
