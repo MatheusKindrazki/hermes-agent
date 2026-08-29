@@ -68,6 +68,7 @@ import { titlebarHeaderBaseClass, titlebarHeaderShadowClass, titlebarHeaderTitle
 import {
   type ActiveContext,
   activeContextCanSubmit,
+  activeContextCapabilityDecision,
   activeContextCorrelationFromReceipt,
   resolveActiveContext
 } from './active-context'
@@ -617,10 +618,12 @@ const ChatViewContent = memo(function ChatViewContent({
   // backend can legitimately have no receipt (missing identity config, draft,
   // malformed row); that absence must block rather than silently falling back
   // to legacy routing. Tests may force the gate through the internal prop.
-  const identityV2Enabled =
-    identityV2Override ??
-    (activeContextCapability?.enabled === true &&
-      activeContextCapability.receipt_schema === 'kindra.active-context/v1')
+  const activeContextCapabilityDecisionResult = activeContextCapabilityDecision({
+    feature: activeContextCapability,
+    override: identityV2Override,
+    status: activeContextCapabilityQuery.status
+  })
+  const identityV2Enabled = activeContextCapabilityDecisionResult.v2
 
   const activeContext = useMemo(() => {
     // The legacy local door intentionally returns no explicit draft route:
@@ -653,7 +656,8 @@ const ChatViewContent = memo(function ChatViewContent({
     targetStoredSessionId
   ])
 
-  const contextAllowsSubmit = activeContextCanSubmit(activeContext, identityV2Enabled)
+  const contextAllowsSubmit =
+    activeContextCapabilityDecisionResult.known && activeContextCanSubmit(activeContext, identityV2Enabled)
 
   const submitWithContextGuard = useCallback(
     (text: string, options?: SubmitTextOptions) => (contextAllowsSubmit ? onSubmit(text, options) : false),
@@ -783,6 +787,13 @@ const ChatViewContent = memo(function ChatViewContent({
         'relative isolate flex h-full min-w-0 flex-col overflow-hidden bg-(--ui-chat-surface-background)',
         className
       )}
+      data-active-context-capability={
+        activeContextCapabilityDecisionResult.known
+          ? identityV2Enabled
+            ? 'enabled'
+            : 'disabled'
+          : activeContextCapabilityQuery.status
+      }
       data-active-context-submit={contextAllowsSubmit ? 'allowed' : 'blocked'}
       data-active-context-v2={identityV2Enabled ? 'enabled' : 'legacy'}
       data-chat-surface=""

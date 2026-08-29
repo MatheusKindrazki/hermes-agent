@@ -7,6 +7,7 @@ import { NEW_CHAT_ROUTE, routeSessionId, SETTINGS_ROUTE } from '../routes'
 import {
   type ActiveContext,
   activeContextCanSubmit,
+  activeContextCapabilityDecision,
   activeContextLabels,
   resolveActiveContext,
   sameActiveContext,
@@ -27,6 +28,28 @@ const V2_CORRELATION = {
   workId: 'work-1',
   xirpSessionId: null
 }
+
+describe('activeContextCapabilityDecision', () => {
+  it.each(['pending', 'error'] as const)('fails closed while capability is %s', status => {
+    expect(
+      activeContextCapabilityDecision({
+        feature: undefined,
+        override: undefined,
+        status
+      })
+    ).toEqual({ known: false, v2: false })
+  })
+
+  it('treats an authoritative disabled response as known legacy mode', () => {
+    expect(
+      activeContextCapabilityDecision({
+        feature: { enabled: false, receipt_schema: 'kindra.active-context/v1' },
+        override: undefined,
+        status: 'success'
+      })
+    ).toEqual({ known: true, v2: false })
+  })
+})
 
 describe('resolveActiveContext', () => {
   it('emits the complete v1 correlation contract when every authority agrees', () => {

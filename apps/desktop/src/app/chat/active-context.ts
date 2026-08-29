@@ -52,6 +52,36 @@ export interface ActiveContextCorrelation {
   workId: null | string
 }
 
+export interface ActiveContextCapabilityFeature {
+  enabled?: boolean
+  receipt_schema?: string
+}
+
+/** Resolve the rollout gate without collapsing pending/error/malformed to off. */
+export function activeContextCapabilityDecision({
+  feature,
+  override,
+  status
+}: {
+  feature: ActiveContextCapabilityFeature | undefined
+  override: boolean | undefined
+  status: 'error' | 'pending' | 'success'
+}): { known: boolean; v2: boolean } {
+  if (override !== undefined) {
+    return { known: true, v2: override }
+  }
+
+  if (
+    status !== 'success' ||
+    typeof feature?.enabled !== 'boolean' ||
+    feature.receipt_schema !== 'kindra.active-context/v1'
+  ) {
+    return { known: false, v2: false }
+  }
+
+  return { known: true, v2: feature.enabled }
+}
+
 /** Translate the backend receipt without filling any identity field locally. */
 export function activeContextCorrelationFromReceipt(
   receipt: ActiveContextReceipt | null | undefined
