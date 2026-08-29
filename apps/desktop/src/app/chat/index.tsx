@@ -6,6 +6,7 @@ import type * as React from 'react'
 import { memo, Suspense, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useLocation } from 'react-router'
 
+import { getApiCapabilities } from '@/api/capabilities'
 import type { SubmitTextOptions } from '@/app/session/hooks/use-prompt-actions/utils'
 import { Thread } from '@/components/assistant-ui/thread'
 import { TranscriptWindowProvider } from '@/components/assistant-ui/thread/transcript-window'
@@ -598,11 +599,27 @@ const ChatViewContent = memo(function ChatViewContent({
         ? owner
         : targetSession?.profile || draftRoute?.profile || activeGatewayProfile
 
-  // A v1 receipt is itself the backend capability signal: it is emitted only
-  // when that profile's config canary is enabled and every required authority
-  // field is explicit. Tests may force the gate through the internal prop.
+  const activeContextCapabilityQuery = useQuery({
+    queryKey: ['active-context-capability', ownerConnectionId ?? 'local', ownerProfile ?? 'default'],
+    queryFn: () =>
+      getApiCapabilities({
+        connectionId: ownerConnectionId,
+        profile: ownerProfile
+      }),
+    enabled: gatewayOpen && identityV2Override === undefined,
+    retry: false,
+    staleTime: 30_000
+  })
+  const activeContextCapability = activeContextCapabilityQuery.data?.features?.active_context_v2
+
+  // Capability and receipt are separate authority signals. A canary-enabled
+  // backend can legitimately have no receipt (missing identity config, draft,
+  // malformed row); that absence must block rather than silently falling back
+  // to legacy routing. Tests may force the gate through the internal prop.
   const identityV2Enabled =
-    identityV2Override ?? targetSession?.active_context?.schema === 'kindra.active-context/v1'
+    identityV2Override ??
+    (activeContextCapability?.enabled === true &&
+      activeContextCapability.receipt_schema === 'kindra.active-context/v1')
 
   const activeContext = useMemo(() => {
     // The legacy local door intentionally returns no explicit draft route:
@@ -765,6 +782,8 @@ const ChatViewContent = memo(function ChatViewContent({
         'relative isolate flex h-full min-w-0 flex-col overflow-hidden bg-(--ui-chat-surface-background)',
         className
       )}
+      data-active-context-submit={contextAllowsSubmit ? 'allowed' : 'blocked'}
+      data-active-context-v2={identityV2Enabled ? 'enabled' : 'legacy'}
       data-chat-surface=""
       data-chat-unfocused={surfaceFocused ? undefined : ''}
       data-composer-surface-id={composerSurfaceId}

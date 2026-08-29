@@ -3326,6 +3326,19 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        from gateway.active_context_receipt import (
+            ACTIVE_CONTEXT_SCHEMA,
+            active_context_v1_enabled,
+        )
+        from hermes_cli.config import load_config
+
+        try:
+            active_context_enabled = active_context_v1_enabled(load_config())
+        except Exception:
+            # Capability discovery must remain available when config loading is
+            # degraded. The rollout is fail-safe default-off in that case.
+            active_context_enabled = False
+
         return web.json_response({
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
@@ -3363,6 +3376,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat_streaming": True,
                 "session_fork": True,
                 "session_model_lock": True,
+                "active_context_v2": {
+                    "enabled": active_context_enabled,
+                    "receipt_schema": ACTIVE_CONTEXT_SCHEMA,
+                },
                 "admin_config_rw": False,
                 "jobs_admin": False,
                 "memory_write_api": False,

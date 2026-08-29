@@ -22,6 +22,9 @@ import {
 } from '@/store/session'
 
 const threadRenderCount = vi.hoisted(() => ({ current: 0 }))
+const getApiCapabilities = vi.hoisted(() => vi.fn())
+
+vi.mock('@/api/capabilities', () => ({ getApiCapabilities }))
 
 vi.mock('@/components/assistant-ui/thread', async () => {
   const React = await import('react')
@@ -86,6 +89,14 @@ function assistantMessage(id: string, text: string): ChatMessage {
 
 describe('ChatView render isolation', () => {
   beforeEach(() => {
+    getApiCapabilities.mockResolvedValue({
+      features: {
+        active_context_v2: {
+          enabled: false,
+          receipt_schema: 'kindra.active-context/v1'
+        }
+      }
+    })
     threadRenderCount.current = 0
     $activeSessionId.set('runtime-1')
     $awaitingResponse.set(false)
@@ -245,6 +256,63 @@ describe('ChatView render isolation', () => {
       </QueryClientProvider>
     )
 
+    fireEvent.click(screen.getByRole('button', { name: 'submit identity probe' }))
+
+    expect(onSubmit).not.toHaveBeenCalled()
+  })
+
+  it('blocks a draft without a receipt when the backend capability enables the canary', async () => {
+    getApiCapabilities.mockResolvedValue({
+      features: {
+        active_context_v2: {
+          enabled: true,
+          receipt_schema: 'kindra.active-context/v1'
+        }
+      }
+    })
+    $gatewayState.set('open')
+    $activeSessionId.set(null)
+    $selectedStoredSessionId.set(null)
+    $sessions.set([])
+    const onSubmit = vi.fn()
+    const props = {
+      gateway: null,
+      onAddContextRef: vi.fn(),
+      onAddUrl: vi.fn(),
+      onAttachDroppedItems: vi.fn(),
+      onAttachImageBlob: vi.fn(),
+      onCancel: vi.fn(),
+      onDeleteSelectedSession: vi.fn(),
+      onEdit: vi.fn(),
+      onPasteClipboardImage: vi.fn(),
+      onPickFiles: vi.fn(),
+      onPickFolders: vi.fn(),
+      onPickImages: vi.fn(),
+      onReload: vi.fn(),
+      onRemoveAttachment: vi.fn(),
+      onRetryResume: vi.fn(),
+      onSteer: vi.fn(),
+      onSubmit,
+      onThreadMessagesChange: vi.fn(),
+      onToggleSelectedPin: vi.fn()
+    }
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } }
+    })
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={['/']}>
+          <ChatView {...props} />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+
+    await vi.waitFor(() => {
+      expect(
+        document.querySelector('[data-chat-surface]')?.getAttribute('data-active-context-submit')
+      ).toBe('blocked')
+    })
     fireEvent.click(screen.getByRole('button', { name: 'submit identity probe' }))
 
     expect(onSubmit).not.toHaveBeenCalled()
