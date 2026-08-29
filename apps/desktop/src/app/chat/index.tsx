@@ -610,6 +610,7 @@ const ChatViewContent = memo(function ChatViewContent({
     retry: false,
     staleTime: 30_000
   })
+
   const activeContextCapability = activeContextCapabilityQuery.data?.features?.active_context_v2
 
   // Capability and receipt are separate authority signals. A canary-enabled

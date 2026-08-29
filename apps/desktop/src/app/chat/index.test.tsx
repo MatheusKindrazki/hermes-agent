@@ -275,6 +275,7 @@ describe('ChatView render isolation', () => {
     $selectedStoredSessionId.set(null)
     $sessions.set([])
     const onSubmit = vi.fn()
+
     const props = {
       gateway: null,
       onAddContextRef: vi.fn(),
@@ -296,6 +297,7 @@ describe('ChatView render isolation', () => {
       onThreadMessagesChange: vi.fn(),
       onToggleSelectedPin: vi.fn()
     }
+
     const queryClient = new QueryClient({
       defaultOptions: { queries: { retry: false } }
     })
@@ -309,8 +311,10 @@ describe('ChatView render isolation', () => {
     )
 
     await vi.waitFor(() => {
+      const surface = screen.getByRole('button', { name: 'submit identity probe' }).closest('[data-chat-surface]')
+
       expect(
-        document.querySelector('[data-chat-surface]')?.getAttribute('data-active-context-submit')
+        surface?.getAttribute('data-active-context-submit')
       ).toBe('blocked')
     })
     fireEvent.click(screen.getByRole('button', { name: 'submit identity probe' }))
