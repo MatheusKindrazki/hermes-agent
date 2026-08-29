@@ -31,6 +31,7 @@ class EgressSettings:
     profile: str = ""
     tenant: str = ""
     machine: str = ""
+    work_id: str = ""
     policy_version: str = "tone-v1"
 
 
@@ -98,6 +99,7 @@ def resolve_egress_settings(
         profile=str(raw.get("profile") or "").strip(),
         tenant=str(raw.get("tenant") or "").strip(),
         machine=str(raw.get("machine") or "").strip(),
+        work_id=str(raw.get("work_id") or "").strip(),
         policy_version=str(raw.get("policy_version") or "tone-v1").strip()
         or "tone-v1",
     )
@@ -144,17 +146,34 @@ class EgressPolicy:
         except Exception:
             session_profile = ""
             session_id = ""
+        try:
+            from gateway.turn_context import current_request_context
+
+            request_context = current_request_context()
+        except Exception:
+            request_context = None
 
         digest = hashlib.sha256(content).hexdigest()
         envelope = {
             "schema": "kindra.egress/v1",
             "profile": str(
-                value("profile", session_profile or self.settings.profile) or ""
+                getattr(request_context, "profile", "")
+                or session_profile
+                or self.settings.profile
+                or value("profile", "")
             ),
-            "tenant": str(value("tenant", self.settings.tenant) or ""),
+            "tenant": str(
+                getattr(request_context, "tenant", "")
+                or self.settings.tenant
+                or value("tenant", "")
+            ),
             "machine": str(value("machine", self.settings.machine) or ""),
-            "work_id": str(value("work_id", "") or ""),
-            "session_id": str(value("session_id", session_id) or ""),
+            "work_id": str(self.settings.work_id or value("work_id", "") or ""),
+            "session_id": str(
+                getattr(request_context, "session_id", "")
+                or session_id
+                or value("session_id", "")
+            ),
             "policy_version": str(
                 value("policy_version", self.settings.policy_version) or ""
             ),

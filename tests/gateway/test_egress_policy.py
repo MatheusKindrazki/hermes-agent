@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+from pathlib import Path
+
 import pytest
 
 from agent import outbound_webhooks
@@ -10,6 +13,8 @@ from gateway.delivery import DeliveryRouter, DeliveryTarget
 from gateway.egress_policy import EgressPolicy, resolve_egress_settings
 from gateway.relay.adapter import RelayAdapter
 from gateway.relay.descriptor import CONTRACT_VERSION, CapabilityDescriptor
+from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+from gateway.turn_context import RequestContext, request_context_scope
 
 
 WORK_ID = "01a04a0f-455a-7bea-a064-4aa68b009d39"
@@ -211,6 +216,63 @@ async def test_relay_send_and_edit_cannot_bypass_enforced_gate():
     assert [call[0]["op"] for call in transport.calls] == ["send", "edit"]
     assert allowed_send.success is True
     assert allowed_edit.success is True
+
+
+@pytest.mark.asyncio
+async def test_runner_stream_relay_derives_identity_before_adapter():
+    """Placement metadata is not an identity envelope.
+
+    The runner-created consumer must carry the task-local authority into the
+    Relay gate so a legitimate thread/scope send is accepted without callers
+    duplicating tenant/profile/work identity in arbitrary metadata.
+    """
+    transport = _RelayTransport()
+    relay = _relay(transport)
+    cfg = {
+        "gateway": {
+            "reliability": {
+                "request_context": {"enabled": True},
+                "egress": {
+                    "mode": "enforce",
+                    "machine": "personal-mac-mini",
+                    "work_id": WORK_ID,
+                    "policy_version": "tone-v1",
+                },
+            }
+        }
+    }
+    policy = EgressPolicy.from_config(cfg)
+    relay._egress_policy = policy
+    request_context = RequestContext(
+        profile="luguistaff",
+        tenant="lugui",
+        hermes_home=Path("/authority/lugui"),
+        workspace=Path("/workspace/lugui"),
+        model="model-a",
+        provider="provider-a",
+        approval="approval-a",
+        session_id="runtime-sid",
+        secret_scope_bound=True,
+    )
+
+    with request_context_scope(request_context, config=cfg):
+        consumer = GatewayStreamConsumer(
+            relay,
+            "C123",
+            StreamConsumerConfig(
+                transport="edit", edit_interval=0.01,
+                buffer_threshold=1, cursor="",
+            ),
+            metadata={"thread_id": "T123", "scope_id": "lugui-workspace"},
+            egress_policy=policy,
+        )
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta("legitimate final")
+        consumer.finish("legitimate final")
+        await task
+
+    assert [call[0]["op"] for call in transport.calls] == ["send"]
+    assert consumer.final_response_sent is True
 
 
 def test_outbound_webhook_cannot_bypass_enforced_gate(monkeypatch):
