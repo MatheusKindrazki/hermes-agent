@@ -212,17 +212,39 @@ class EgressPolicy:
             session_profile = get_session_env("HERMES_SESSION_PROFILE", "")
         except Exception:
             session_profile = ""
+        try:
+            from gateway.turn_context import current_request_context
+
+            request_context = current_request_context()
+        except Exception:
+            request_context = None
         supplied = _mapping(metadata)
-        expected_profile = session_profile or self.settings.profile or None
+        nested = _mapping(supplied.get("egress"))
+        caller_tenant = (
+            nested.get("tenant")
+            if "tenant" in nested
+            else supplied.get("tenant")
+        )
+        expected_profile = (
+            getattr(request_context, "profile", "")
+            or session_profile
+            or self.settings.profile
+            or None
+        )
         expected_tenant = (
-            self.settings.tenant
-            or str(supplied.get("expected_tenant") or "").strip()
+            getattr(request_context, "tenant", "")
+            or self.settings.tenant
             or None
         )
         return self.evaluate(
             envelope,
             expected_profile=expected_profile,
             expected_tenant=expected_tenant,
+            supplied_tenant=(
+                str(caller_tenant).strip()
+                if caller_tenant is not None
+                else None
+            ),
         )
 
     def prepare_metadata(
@@ -250,6 +272,7 @@ class EgressPolicy:
         *,
         expected_profile: Optional[str] = None,
         expected_tenant: Optional[str] = None,
+        supplied_tenant: Optional[str] = None,
     ) -> EgressDecision:
         """Evaluate metadata only; message content never enters this policy."""
         if self.mode == "off":
@@ -268,6 +291,13 @@ class EgressPolicy:
         if expected_profile is not None and profile != expected_profile:
             reasons.append("profile_mismatch")
         if expected_tenant is not None and tenant != expected_tenant:
+            reasons.append("tenant_mismatch")
+        if (
+            expected_tenant is not None
+            and supplied_tenant is not None
+            and supplied_tenant != expected_tenant
+            and "tenant_mismatch" not in reasons
+        ):
             reasons.append("tenant_mismatch")
 
         action = envelope.get("action")

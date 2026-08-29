@@ -89,6 +89,88 @@ def test_enforce_rejects_identity_mismatch(field, actual, expected_reason):
     assert expected_reason in decision.reasons
 
 
+def test_caller_cannot_replace_request_context_expected_tenant():
+    cfg = {
+        "gateway": {
+            "reliability": {
+                "request_context": {"enabled": True},
+                "egress": {
+                    "mode": "enforce",
+                    "machine": "personal-mac-mini",
+                    "work_id": WORK_ID,
+                },
+            }
+        }
+    }
+    context = RequestContext(
+        profile="luguistaff",
+        tenant="lugui",
+        hermes_home=Path("/authority/lugui"),
+        workspace=Path("/workspace/lugui"),
+        model="model-a",
+        provider="provider-a",
+        approval="manual",
+        session_id="runtime-sid",
+        secret_scope_bound=True,
+    )
+    policy = EgressPolicy.from_config(cfg)
+
+    with request_context_scope(context, config=cfg):
+        decision = policy.evaluate_delivery(
+            action="send",
+            destination="slack:C123",
+            content=b"lugui payload",
+            metadata={
+                "expected_tenant": "applause",
+                "machine": "personal-mac-mini",
+            },
+        )
+
+    assert decision.allowed is True
+    assert decision.envelope["tenant"] == "lugui"
+
+
+def test_caller_tenant_divergence_from_request_context_is_blocked():
+    cfg = {
+        "gateway": {
+            "reliability": {
+                "request_context": {"enabled": True},
+                "egress": {
+                    "mode": "enforce",
+                    "machine": "personal-mac-mini",
+                    "work_id": WORK_ID,
+                },
+            }
+        }
+    }
+    context = RequestContext(
+        profile="luguistaff",
+        tenant="lugui",
+        hermes_home=Path("/authority/lugui"),
+        workspace=Path("/workspace/lugui"),
+        model="model-a",
+        provider="provider-a",
+        approval="manual",
+        session_id="runtime-sid",
+        secret_scope_bound=True,
+    )
+    policy = EgressPolicy.from_config(cfg)
+
+    with request_context_scope(context, config=cfg):
+        decision = policy.evaluate_delivery(
+            action="send",
+            destination="slack:C123",
+            content=b"wrong tenant",
+            metadata={
+                "tenant": "applause",
+                "machine": "personal-mac-mini",
+            },
+        )
+
+    assert decision.allowed is False
+    assert "tenant_mismatch" in decision.reasons
+
+
 def test_high_risk_requires_approval_and_shadow_only_reports_would_block():
     high_risk = _envelope(risk="high")
 
