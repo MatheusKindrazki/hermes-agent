@@ -45,6 +45,19 @@ export const zh: Translations = {
     off: '关'
   },
 
+  activeContext: {
+    unknownProfile: '未知配置档案',
+    unknownTenant: '未知租户',
+    unknownDevice: '未知设备',
+    newChat: '新对话',
+    chat: '对话',
+    thisChat: '此对话',
+    ownerUnknown: (profile, device) => `所有者未知 — ${profile}（${device}）`,
+    ownerKnown: (profile, device) => `${profile}（${device}）`,
+    detail: (what, owner, tenant) => `${what}：${owner}；租户 ${tenant}`,
+    text: (what, profile, tenant, device) => `${what} · ${profile} · ${tenant} · ${device}`
+  },
+
   fileMenu: {
     revealFinder: '在访达中显示',
     revealExplorer: '在文件资源管理器中显示',

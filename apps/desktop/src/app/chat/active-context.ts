@@ -1,3 +1,4 @@
+import type { Translations } from '@/i18n'
 import type { SessionOwnerScope } from '@/store/session-request-router'
 import type { ActiveContextReceipt } from '@/types/hermes'
 
@@ -259,10 +260,6 @@ export interface ActiveContextLabels {
   text: string
 }
 
-const UNKNOWN_PROFILE = 'unknown profile'
-const UNKNOWN_TENANT = 'unknown tenant'
-const UNKNOWN_DEVICE = 'unknown device'
-
 /**
  * Compose what the chip SHOWS and what it says in full.
  *
@@ -279,14 +276,20 @@ const UNKNOWN_DEVICE = 'unknown device'
  * pass null when the registry cannot name it (then the id, if any, is used —
  * a raw id still tells two machines apart, which is the job).
  */
-export function activeContextLabels(context: ActiveContext, connectionLabel: null | string): ActiveContextLabels {
-  const profile = context.profile ?? UNKNOWN_PROFILE
-  const tenant = context.tenant?.trim() || UNKNOWN_TENANT
-  const device = connectionLabel?.trim() || context.machine?.trim() || context.connectionId?.trim() || UNKNOWN_DEVICE
+export function activeContextLabels(
+  context: ActiveContext,
+  connectionLabel: null | string,
+  copy: Translations['activeContext']
+): ActiveContextLabels {
+  const profile = context.profile ?? copy.unknownProfile
+  const tenant = context.tenant?.trim() || copy.unknownTenant
+  const device =
+    connectionLabel?.trim() || context.machine?.trim() || context.connectionId?.trim() || copy.unknownDevice
 
-  const what = context.source === 'draft' ? 'New chat' : context.source === 'unknown' ? 'Chat' : 'This chat'
+  const what = context.source === 'draft' ? copy.newChat : context.source === 'unknown' ? copy.chat : copy.thisChat
 
-  const owner = context.source === 'unknown' ? `owner unknown — ${profile} on ${device}` : `${profile} on ${device}`
+  const owner =
+    context.source === 'unknown' ? copy.ownerUnknown(profile, device) : copy.ownerKnown(profile, device)
 
-  return { detail: `${what}: ${owner}; tenant ${tenant}`, text: `${what} · ${profile} · ${tenant} · ${device}` }
+  return { detail: copy.detail(what, owner, tenant), text: copy.text(what, profile, tenant, device) }
 }

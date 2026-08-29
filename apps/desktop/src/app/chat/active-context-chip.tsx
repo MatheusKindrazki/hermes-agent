@@ -1,6 +1,7 @@
 import { useStore } from '@nanostores/react'
 
 import { Tip } from '@/components/ui/tooltip'
+import { useI18n } from '@/i18n'
 import { HelpCircle } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { $connectionsRegistry } from '@/store/connection-registry-state'
@@ -28,12 +29,13 @@ import { ConnectionGlyph } from './sidebar/connection-glyph'
  */
 export function ActiveContextChip({ className, context }: { className?: string; context: ActiveContext }) {
   const registry = useStore($connectionsRegistry)
+  const { t } = useI18n()
 
   const connection = context.connectionId
     ? registry?.connections.find(candidate => candidate.id === context.connectionId)
     : undefined
 
-  const { detail, text } = activeContextLabels(context, connection?.label ?? null)
+  const { detail, text } = activeContextLabels(context, connection?.label ?? null, t.activeContext)
   const conversation = context.storedSessionId?.trim() || (context.source === 'draft' ? 'draft' : 'unknown')
 
   return (

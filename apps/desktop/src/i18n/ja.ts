@@ -45,6 +45,19 @@ export const ja = defineLocale({
     off: 'オフ'
   },
 
+  activeContext: {
+    unknownProfile: '不明なプロファイル',
+    unknownTenant: '不明なテナント',
+    unknownDevice: '不明なデバイス',
+    newChat: '新しいチャット',
+    chat: 'チャット',
+    thisChat: 'このチャット',
+    ownerUnknown: (profile, device) => `所有者不明 — ${profile}（${device}）`,
+    ownerKnown: (profile, device) => `${profile}（${device}）`,
+    detail: (what, owner, tenant) => `${what}: ${owner}; テナント ${tenant}`,
+    text: (what, profile, tenant, device) => `${what} · ${profile} · ${tenant} · ${device}`
+  },
+
   fileMenu: {
     revealFinder: 'Finder で表示',
     revealExplorer: 'エクスプローラーで表示',

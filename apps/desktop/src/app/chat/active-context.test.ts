@@ -1,14 +1,20 @@
 import { describe, expect, it } from 'vitest'
 
+import { en } from '@/i18n/en'
+
 import { NEW_CHAT_ROUTE, routeSessionId, SETTINGS_ROUTE } from '../routes'
 
 import {
+  type ActiveContext,
   activeContextCanSubmit,
   activeContextLabels,
   resolveActiveContext,
   sameActiveContext,
   shouldPreserveRouteAcrossGatewaySwitch
 } from './active-context'
+
+const labelsFor = (context: ActiveContext, connectionLabel: null | string) =>
+  activeContextLabels(context, connectionLabel, en.activeContext)
 
 const V2_CORRELATION = {
   connectionId: 'homelab',
@@ -212,7 +218,7 @@ describe('shouldPreserveRouteAcrossGatewaySwitch', () => {
 
 describe('activeContextLabels', () => {
   it('renders conversation, profile, tenant and machine for a draft', () => {
-    const labels = activeContextLabels(
+    const labels = labelsFor(
       {
         connectionId: 'local',
         machine: 'personal-mac-mini',
@@ -230,7 +236,7 @@ describe('activeContextLabels', () => {
   })
 
   it('paints profile AND machine — identity must not be tooltip-only', () => {
-    const labels = activeContextLabels(
+    const labels = labelsFor(
       { connectionId: 'homelab', profile: 'research', source: 'session', storedSessionId: 'chat-a' },
       'Homelab'
     )
@@ -241,7 +247,7 @@ describe('activeContextLabels', () => {
   })
 
   it('spells unknowns out instead of dropping the half it cannot derive', () => {
-    const labels = activeContextLabels(
+    const labels = labelsFor(
       { connectionId: null, profile: null, source: 'unknown', storedSessionId: 'chat-a' },
       null
     )
@@ -251,7 +257,7 @@ describe('activeContextLabels', () => {
   })
 
   it('states where a draft would land', () => {
-    const labels = activeContextLabels(
+    const labels = labelsFor(
       { connectionId: 'work', profile: 'default', source: 'draft', storedSessionId: null },
       'Work laptop'
     )
@@ -262,7 +268,7 @@ describe('activeContextLabels', () => {
 
   it('falls back to the connection id when the registry cannot name it', () => {
     // A raw id still tells two machines apart, which is the job.
-    const labels = activeContextLabels(
+    const labels = labelsFor(
       { connectionId: 'conn-7', profile: 'p', source: 'session', storedSessionId: 's' },
       null
     )
@@ -272,7 +278,7 @@ describe('activeContextLabels', () => {
 
   it('never produces empty visible text', () => {
     for (const source of ['draft', 'session', 'unknown'] as const) {
-      const labels = activeContextLabels({ connectionId: null, profile: null, source, storedSessionId: null }, null)
+      const labels = labelsFor({ connectionId: null, profile: null, source, storedSessionId: null }, null)
 
       expect(labels.text.trim().length).toBeGreaterThan(0)
     }
