@@ -14,6 +14,7 @@ profile's path is used.  They are the productionized form of the manual smoke
 probes used to confirm the bug class.
 """
 
+import asyncio
 import threading
 from pathlib import Path
 
@@ -23,6 +24,15 @@ from hermes_constants import (
     get_hermes_home,
     reset_hermes_home_override,
     set_hermes_home_override,
+)
+from agent.runtime_cwd import clear_session_cwd, resolve_agent_cwd, set_session_cwd
+from agent.secret_scope import get_secret, reset_secret_scope, set_secret_scope
+from gateway.turn_context import (
+    TurnContext,
+    compose_request_context,
+    current_request_context,
+    request_context_scope,
+    request_context_v2_enabled,
 )
 
 
@@ -157,3 +167,168 @@ class TestThreadContextPropagation:
 
         seen = _under_override(prof_b, lambda: asyncio.run(driver()))
         assert seen == str(prof_b)
+
+
+class TestRequestContextV2Isolation:
+    @staticmethod
+    def _config(enabled: bool) -> dict:
+        return {
+            "gateway": {
+                "reliability": {
+                    "request_context": {"enabled": enabled},
+                }
+            }
+        }
+
+    def test_request_context_v2_is_default_off(self):
+        assert request_context_v2_enabled({}) is False
+        assert request_context_v2_enabled(self._config(True)) is True
+
+    @pytest.mark.asyncio
+    async def test_concurrent_requests_keep_all_authority_fields_isolated(
+        self, two_profiles, tmp_path
+    ):
+        prof_a, prof_b = two_profiles
+        workspace_a = tmp_path / "workspace-a"
+        workspace_b = tmp_path / "workspace-b"
+        workspace_a.mkdir()
+        workspace_b.mkdir()
+        both_bound = asyncio.Event()
+        arrivals = 0
+        arrivals_lock = asyncio.Lock()
+
+        async def run_request(
+            *,
+            home: Path,
+            workspace: Path,
+            profile: str,
+            tenant: str,
+            model: str,
+            provider: str,
+            approval: str,
+            api_key: str,
+            session_id: str,
+        ):
+            nonlocal arrivals
+            home_token = set_hermes_home_override(home)
+            set_session_cwd(str(workspace))
+            secret_token = set_secret_scope({"TEST_PROVIDER_KEY": api_key})
+            try:
+                request_context = compose_request_context(
+                    profile=profile,
+                    tenant=tenant,
+                    model=model,
+                    provider=provider,
+                    approval=approval,
+                    session_id=session_id,
+                )
+                turn = TurnContext(request_context=request_context)
+                with request_context_scope(
+                    request_context,
+                    config=self._config(True),
+                ):
+                    async with arrivals_lock:
+                        arrivals += 1
+                        if arrivals == 2:
+                            both_bound.set()
+                    await asyncio.wait_for(both_bound.wait(), timeout=1)
+                    current = current_request_context()
+                    return {
+                        "request": current,
+                        "turn": turn.request_context,
+                        "home": get_hermes_home(),
+                        "workspace": resolve_agent_cwd(),
+                        "api_key": get_secret("TEST_PROVIDER_KEY"),
+                    }
+            finally:
+                reset_secret_scope(secret_token)
+                clear_session_cwd()
+                reset_hermes_home_override(home_token)
+
+        first, second = await asyncio.gather(
+            run_request(
+                home=prof_a,
+                workspace=workspace_a,
+                profile="luguistaff",
+                tenant="lugui",
+                model="model-a",
+                provider="provider-a",
+                approval="approval-a",
+                api_key="secret-a",
+                session_id="session-a",
+            ),
+            run_request(
+                home=prof_b,
+                workspace=workspace_b,
+                profile="applausestaff",
+                tenant="applause",
+                model="model-b",
+                provider="provider-b",
+                approval="approval-b",
+                api_key="secret-b",
+                session_id="session-b",
+            ),
+        )
+
+        assert (
+            first["request"].profile,
+            first["request"].tenant,
+            first["request"].model,
+            first["request"].provider,
+            first["request"].approval,
+            first["request"].session_id,
+            first["home"],
+            first["workspace"],
+            first["api_key"],
+        ) == (
+            "luguistaff",
+            "lugui",
+            "model-a",
+            "provider-a",
+            "approval-a",
+            "session-a",
+            prof_a,
+            workspace_a,
+            "secret-a",
+        )
+        assert (
+            second["request"].profile,
+            second["request"].tenant,
+            second["request"].model,
+            second["request"].provider,
+            second["request"].approval,
+            second["request"].session_id,
+            second["home"],
+            second["workspace"],
+            second["api_key"],
+        ) == (
+            "applausestaff",
+            "applause",
+            "model-b",
+            "provider-b",
+            "approval-b",
+            "session-b",
+            prof_b,
+            workspace_b,
+            "secret-b",
+        )
+        assert first["turn"] is first["request"]
+        assert second["turn"] is second["request"]
+        assert first["request"] is not second["request"]
+
+    def test_disabled_scope_does_not_publish_request_context(self, two_profiles):
+        prof_a, _ = two_profiles
+        home_token = set_hermes_home_override(prof_a)
+        try:
+            request_context = compose_request_context(
+                profile="luguistaff",
+                tenant="lugui",
+                model="model-a",
+                provider="provider-a",
+                approval="approval-a",
+                session_id="session-a",
+            )
+            with request_context_scope(request_context, config=self._config(False)):
+                assert current_request_context() is None
+        finally:
+            reset_hermes_home_override(home_token)
