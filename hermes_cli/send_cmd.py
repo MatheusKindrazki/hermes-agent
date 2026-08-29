@@ -371,6 +371,24 @@ def cmd_send(args: argparse.Namespace) -> None:
     if subject:
         message = f"{subject}\n\n{message.lstrip()}"
 
+    # Local, source-agnostic suppression for noisy automation. This is evaluated
+    # after stdin/--file resolution so remote scripts cannot bypass it by changing
+    # how the body is supplied. One literal prefix per line; blank/# lines ignored.
+    try:
+        from hermes_cli.config import get_hermes_home
+
+        suppress_file = get_hermes_home() / "outbound-suppress-prefixes.txt"
+        prefixes = (
+            line.strip()
+            for line in suppress_file.read_text(encoding="utf-8").splitlines()
+        ) if suppress_file.exists() else ()
+        if any(message.lstrip().startswith(prefix) for prefix in prefixes if prefix and not prefix.startswith("#")):
+            if not getattr(args, "quiet", False):
+                print("hermes send: skipped by local outbound suppression policy")
+            sys.exit(_SUCCESS_EXIT)
+    except OSError:
+        pass  # fail open: a broken preference file must not kill operational alerts
+
     # Import lazily so `hermes send --help` stays fast and does not pull in
     # the full tool registry / gateway config stack.
     from tools.send_message_tool import send_message_tool

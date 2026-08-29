@@ -64,12 +64,48 @@ def fake_tool(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_local_outbound_suppression_skips_matching_prefix(
+    fake_tool, capsys, monkeypatch, tmp_path
+):
+    """A local prefix policy suppresses noisy remote automations before delivery."""
+    import hermes_cli.config as hermes_config
+
+    (tmp_path / "outbound-suppress-prefixes.txt").write_text(
+        "# quota noise\nClaude 5h \nClaude 7d \nClaude: telemetria\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(hermes_config, "get_hermes_home", lambda: tmp_path)
+
+    args = _parse([
+        "--to",
+        "telegram:1044339184",
+        "Claude 7d 85% - applause (Team 5x)\nconta teste",
+    ])
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+
+    assert exc.value.code == 0
+    assert fake_tool.calls == []
+    assert "skipped by local outbound suppression policy" in capsys.readouterr().out
 
 
+def test_local_outbound_suppression_does_not_hide_other_alerts(
+    fake_tool, monkeypatch, tmp_path
+):
+    import hermes_cli.config as hermes_config
 
+    (tmp_path / "outbound-suppress-prefixes.txt").write_text(
+        "Claude 7d \n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(hermes_config, "get_hermes_home", lambda: tmp_path)
 
+    args = _parse(["--to", "telegram:1044339184", "Deploy production failed"])
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
 
-
+    assert exc.value.code == 0
+    assert fake_tool.calls[0]["message"] == "Deploy production failed"
 
 
 # ---------------------------------------------------------------------------
