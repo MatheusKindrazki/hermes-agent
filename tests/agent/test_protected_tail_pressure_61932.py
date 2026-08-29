@@ -14,11 +14,14 @@ This is the core compressor contract — not Desktop/Windows-specific.
 from __future__ import annotations
 
 from unittest.mock import patch
+from types import SimpleNamespace
 
 import pytest
 
 from agent.context_compressor import (
     ContextCompressor,
+    _LEAN_DIGEST_CHUNK_CHARS,
+    _LEAN_DIGEST_MAX_CHUNKS,
     _MAX_TAIL_MESSAGE_FLOOR,
     _PRESSURE_KEEP_RECENT_MESSAGES,
 )
@@ -146,6 +149,71 @@ class TestProtectedTailPressure61932:
         # progress (never a pure no-op dead-end above the window).
         assert tok < c.threshold_tokens or last_progress
 
+    def test_hierarchical_fallback_bounds_every_chunk_and_preserves_live_tail(
+        self, compressor_128k
+    ):
+        """A transcript above the model window must never create a giant chunk.
+
+        The old max-chunk branch divided the entire region by 28, so a 1M+
+        token history produced chunks larger than the auxiliary model window.
+        The live user turn and its attachment/checkpoint must remain in the
+        protected tail exactly once while older context is reduced in bounded
+        map chunks.
+        """
+        c = compressor_128k
+        del c._generate_summary
+        c._SUMMARY_INPUT_MAX_CHARS = 40_000
+        attachment_turn = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "continue with this checkpoint"},
+                {"type": "image_url", "image_url": {"url": "file:///tmp/live.png"}},
+            ],
+            "checkpoint": {"reply_to_message_id": "reply-42"},
+        }
+        messages = [
+            {"role": "system", "content": "You are Hermes."},
+            {"role": "user", "content": "old task"},
+            {"role": "assistant", "content": "old acknowledgement"},
+        ]
+        for i in range(_LEAN_DIGEST_MAX_CHUNKS * 3):
+            messages.extend(
+                [
+                    {"role": "user", "content": f"turn-{i}: " + ("u" * 24_000)},
+                    {"role": "assistant", "content": f"result-{i}: " + ("a" * 24_000)},
+                ]
+            )
+        messages.append(attachment_turn)
+        before = estimate_messages_tokens_rough(messages)
+        assert before > c.context_length
+
+        prompts: list[str] = []
+
+        def bounded_llm(**kwargs):
+            prompt = kwargs["messages"][0]["content"]
+            prompts.append(prompt)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="bounded checkpoint"))]
+            )
+
+        with patch("agent.context_compressor.call_llm", side_effect=bounded_llm), patch(
+            "agent.auxiliary_client.call_llm", side_effect=bounded_llm
+        ):
+            out = c.compress(messages, current_tokens=before)
+
+        assert len(prompts) <= _LEAN_DIGEST_MAX_CHUNKS + 1
+        digest_prompts = [p for p in prompts if "TRANSCRIPT SEGMENT:" in p]
+        assert digest_prompts
+        assert all(
+            len(p) <= _LEAN_DIGEST_CHUNK_CHARS + 2_500 for p in digest_prompts
+        )
+        assert c._last_compression_telemetry["chunking"] is True
+        assert c._last_compression_telemetry["chunk_count"] == len(digest_prompts)
+        assert estimate_messages_tokens_rough(out) < c.context_length
+        assert sum(message is attachment_turn for message in out) == 0
+        preserved = [m for m in out if m.get("checkpoint") == attachment_turn["checkpoint"]]
+        assert preserved == [attachment_turn]
+
     def test_all_oversized_tail_dead_end_shape_now_compresses(
         self, compressor_128k
     ):
@@ -203,4 +271,3 @@ class TestProtectedTailPressure61932:
             assert rid in call_ids, f"orphaned tool result {rid!r}"
         for cid in call_ids:
             assert cid in tool_result_ids, f"orphaned tool call {cid!r}"
-

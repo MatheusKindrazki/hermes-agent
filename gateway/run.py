@@ -10125,6 +10125,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         while await self._session_has_compression_in_flight(session_key):
             await asyncio.sleep(0.1)
 
+    async def _persist_compression_handoff(
+        self,
+        session_entry,
+        *,
+        event,
+        content,
+        source_session_id: str,
+    ) -> bool:
+        """Carry one failed oversized user turn into the fresh reset session."""
+        platform_message_id = str(getattr(event, "message_id", "") or "").strip()
+        if platform_message_id:
+            handoff_id = platform_message_id
+        else:
+            payload = json.dumps(content, ensure_ascii=False, sort_keys=True, default=str)
+            digest = hashlib.sha256(
+                f"{source_session_id}\0{payload}".encode("utf-8", "replace")
+            ).hexdigest()[:24]
+            handoff_id = f"compression-handoff:{digest}"
+        if await self.async_session_store.has_platform_message_id(
+            session_entry.session_id, handoff_id
+        ):
+            return False
+        await self.async_session_store.append_to_transcript(
+            session_entry.session_id,
+            {
+                "role": "user",
+                "content": content,
+                "timestamp": getattr(event, "timestamp", None) or time.time(),
+                "message_id": handoff_id,
+                "_compression_handoff": {
+                    "source_session_id": source_session_id,
+                    "reason": "compression_exhausted",
+                },
+            },
+        )
+        return True
+
     @staticmethod
     def _lookup_session_id_under_store_lock(session_store, session_key: str):
         """Sync helper run in the thread pool: read session_id under the store lock."""
@@ -21093,6 +21130,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_entry.session_id if session_entry else "?",
                 )
             elif agent_result.get("compression_exhausted") and session_entry and session_key:
+                exhausted_session_id = session_entry.session_id
                 logger.info(
                     "Auto-resetting session %s after compression exhaustion.",
                     session_entry.session_id,
@@ -21119,6 +21157,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # forever (#35809 — regression of the #9893/#10063 auto-reset).
                     # No-op on non-topic lanes.
                     session_entry = new_entry
+                    handoff_content = (
+                        persist_user_message
+                        if persist_user_message is not None
+                        else message_text
+                    )
+                    handoff_created = await self._persist_compression_handoff(
+                        session_entry,
+                        event=event,
+                        content=handoff_content,
+                        source_session_id=exhausted_session_id,
+                    )
+                    logger.info(
+                        "Compression-exhaustion handoff %s in fresh session %s",
+                        "created" if handoff_created else "already present",
+                        session_entry.session_id,
+                    )
                     await asyncio.to_thread(
                         self._sync_telegram_topic_binding,
                         source, session_entry, reason="compression-exhausted-reset",
@@ -21126,7 +21180,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 response = (response or "") + (
                     "\n\n🔄 Session auto-reset — the conversation exceeded the "
                     "maximum context size and could not be compressed further. "
-                    "Your next message will start a fresh session."
+                    "Your turn was carried into a fresh handoff session; your "
+                    "next message can continue from it."
                 )
 
             ts = time.time()  # Unix epoch float — consistent with DB storage

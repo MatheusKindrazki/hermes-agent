@@ -4531,15 +4531,46 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         if not text:
             return ""
         chunk_size = _LEAN_DIGEST_CHUNK_CHARS
-        n_chunks = max(1, (len(text) + chunk_size - 1) // chunk_size)
-        if n_chunks > _LEAN_DIGEST_MAX_CHUNKS:
-            chunk_size = (len(text) + _LEAN_DIGEST_MAX_CHUNKS - 1) // _LEAN_DIGEST_MAX_CHUNKS
-            n_chunks = _LEAN_DIGEST_MAX_CHUNKS
+        total_chunks = max(1, (len(text) + chunk_size - 1) // chunk_size)
+        if total_chunks <= _LEAN_DIGEST_MAX_CHUNKS:
+            selected_indices = list(range(total_chunks))
+        else:
+            # Never grow a chunk to satisfy the call-count cap. That inverted
+            # the safety bound for very large histories: a ~1.2M-token epoch
+            # was divided into 28 oversized prompts and every map call still
+            # exceeded the auxiliary model window. Keep bounded edge chunks;
+            # omitted middle detail remains recoverable from session history.
+            head_count = _LEAN_DIGEST_MAX_CHUNKS // 2
+            tail_count = _LEAN_DIGEST_MAX_CHUNKS - head_count
+            selected_indices = [
+                *range(head_count),
+                *range(total_chunks - tail_count, total_chunks),
+            ]
+        telemetry = getattr(self, "_active_compression_telemetry", None)
+        if isinstance(telemetry, dict):
+            telemetry["chunking"] = total_chunks > 1
+            telemetry["chunk_count"] = len(selected_indices)
         digests: list[str] = []
-        for ci in range(n_chunks):
+        previous_index = -1
+        for progress_index, ci in enumerate(selected_indices, start=1):
+            if ci > previous_index + 1:
+                omitted = ci - previous_index - 1
+                digests.append(
+                    f"### Segments {previous_index + 2}-{ci}/{total_chunks}\n"
+                    f"[{omitted} bounded segment(s) omitted from the live handoff; "
+                    "recover exact detail with session_search]"
+                )
             segment = text[ci * chunk_size:(ci + 1) * chunk_size]
             if not segment.strip():
                 continue
+            if not self.quiet_mode:
+                logger.info(
+                    "Compression digest progress %d/%d (source segment %d/%d)",
+                    progress_index,
+                    len(selected_indices),
+                    ci + 1,
+                    total_chunks,
+                )
             try:
                 from agent.auxiliary_client import call_llm
 
@@ -4559,9 +4590,10 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
 
                 body = strip_think_blocks(None, body).strip()
             except Exception as exc:
-                logger.warning("lean chunk digest %d/%d failed: %s", ci + 1, n_chunks, exc)
-                body = f"[digest unavailable for segment {ci + 1}/{n_chunks} — recover via session_search]"
-            digests.append(f"### Segment {ci + 1}/{n_chunks}\n{body}")
+                logger.warning("lean chunk digest %d/%d failed: %s", ci + 1, total_chunks, exc)
+                body = f"[digest unavailable for segment {ci + 1}/{total_chunks} — recover via session_search]"
+            digests.append(f"### Segment {ci + 1}/{total_chunks}\n{body}")
+            previous_index = ci
         if not digests:
             return ""
         return (
