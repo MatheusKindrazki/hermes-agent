@@ -171,8 +171,23 @@ class ReliabilityOutbox:
         conn.execute("PRAGMA synchronous=FULL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.executescript(_OUTBOX_SCHEMA)
-        os.chmod(self.settings.db_path, 0o600)
+        self._ensure_owner_only_sqlite_modes()
         return conn
+
+    def _ensure_owner_only_sqlite_modes(self) -> None:
+        """Keep the database and live WAL sidecars private to their owner."""
+        for path in (
+            self.settings.db_path,
+            Path(f"{self.settings.db_path}-wal"),
+            Path(f"{self.settings.db_path}-shm"),
+        ):
+            try:
+                os.chmod(path, 0o600)
+            except FileNotFoundError:
+                # SQLite creates/removes sidecars around transactions. A
+                # missing sidecar is safe; the active transaction seam calls
+                # this again immediately after BEGIN IMMEDIATE.
+                continue
 
     @staticmethod
     def canonical_key(
@@ -229,6 +244,7 @@ class ReliabilityOutbox:
 
         with self._lock, closing(self._connect()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
+            self._ensure_owner_only_sqlite_modes()
             existing = conn.execute(
                 "SELECT event_id, payload_ref, payload_sha256 FROM outbox_events "
                 "WHERE idempotency_key = ?",

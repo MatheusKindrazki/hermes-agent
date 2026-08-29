@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import stat
 from pathlib import Path
 
 import pytest
@@ -82,6 +84,35 @@ def test_shadow_enqueue_is_durable_owner_only_and_idempotent(tmp_path):
     assert payload_path.read_bytes() == b"private payload"
     assert payload_path.stat().st_mode & 0o777 == 0o600
     assert client.settings.payload_dir.stat().st_mode & 0o777 == 0o700
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX owner-only mode contract")
+def test_active_transaction_keeps_database_wal_and_shm_owner_only(tmp_path):
+    client = ReliabilityOutbox.from_config(
+        _config(tmp_path, "shadow"), hermes_home=tmp_path
+    )
+    previous_umask = os.umask(0)
+    conn = None
+    try:
+        conn = client._connect()
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("CREATE TABLE IF NOT EXISTS outbox_mode_probe(value TEXT)")
+
+        paths = [
+            client.settings.db_path,
+            Path(f"{client.settings.db_path}-wal"),
+            Path(f"{client.settings.db_path}-shm"),
+        ]
+        assert all(path.exists() for path in paths)
+        assert {
+            path.name: stat.S_IMODE(path.stat().st_mode)
+            for path in paths
+        } == {path.name: 0o600 for path in paths}
+    finally:
+        if conn is not None:
+            conn.rollback()
+            conn.close()
+        os.umask(previous_umask)
 
 
 @pytest.mark.asyncio
