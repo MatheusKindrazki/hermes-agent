@@ -670,6 +670,13 @@ _MICRO_COMPACT_MAX_CONSECUTIVE_FAILURES = 3
 # test_compression_small_ctx_threshold_floor.py).
 _SUMMARY_INPUT_MAX_CHARS = 160_000
 
+# Above this estimated input size automatic compression must finish without
+# auxiliary I/O. This is deliberately absolute as well as window-relative:
+# ordinary small-context tests and configured providers still exercise their
+# auth/cooldown behavior, while the observed 1M-token failure class gets a
+# deterministic handoff before the host's 600s compression ceiling.
+_OVERSIZED_LOCAL_FALLBACK_MIN_TOKENS = 1_000_000
+
 # Placeholder used when pruning old tool results
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
 
@@ -4262,6 +4269,8 @@ class ContextCompressor(ContextEngine):
         self,
         turns_to_summarize: List[Dict[str, Any]],
         reason: str | None = None,
+        *,
+        include_aux_digests: bool = True,
     ) -> str:
         """Build a deterministic handoff when the LLM summarizer is unavailable.
 
@@ -4458,7 +4467,11 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         # Re-inject AFTER the size cap: the markers live at the end of the
         # body, exactly where the truncation above cuts.
         summary = _reinject_pruned_skill_markers(summary, _pruned_names)
-        summary = self._augment_summary_lean(summary, turns_to_summarize)
+        summary = self._augment_summary_lean(
+            summary,
+            turns_to_summarize,
+            include_chunk_digests=include_aux_digests,
+        )
         return summary
 
     def _demote_stale_tail_tools(
@@ -4602,7 +4615,11 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         )
 
     def _augment_summary_lean(
-        self, summary: str, turns_to_summarize: List[Dict[str, Any]],
+        self,
+        summary: str,
+        turns_to_summarize: List[Dict[str, Any]],
+        *,
+        include_chunk_digests: bool = True,
     ) -> str:
         """Append the deterministic lean-mode sections to a generated summary.
 
@@ -4616,7 +4633,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             summary += _redact_compaction_text(
                 _build_anchor_index(turns_to_summarize)
             )
-        if _LEAN_DIGESTS_HEADING not in summary:
+        if include_chunk_digests and _LEAN_DIGESTS_HEADING not in summary:
             summary += _redact_compaction_text(
                 self._build_chunk_digests(turns_to_summarize)
             )
@@ -7646,7 +7663,37 @@ This compaction should PRIORITISE preserving all information related to the focu
         # Skipped when ``force=True`` (manual /compress) so auth/error
         # handling paths are always exercised on explicit user request.
         feasibility_skip = False
-        if not force and self._ineffective_compression_count >= 1:
+        oversized_local_fallback = bool(
+            not force
+            and display_tokens >= _OVERSIZED_LOCAL_FALLBACK_MIN_TOKENS
+            and display_tokens >= self.context_length
+        )
+        if oversized_local_fallback:
+            # Once the automatic path is already at/above the model window,
+            # auxiliary map/reduce is no longer allowed to own the turn's
+            # liveness budget. A million-token transcript previously launched
+            # dozens of serial digest calls and hit the host's 600s ceiling
+            # without a handoff. Build the bounded local handoff immediately;
+            # the archived parent remains searchable for omitted detail.
+            feasibility_skip = True
+            self._last_feasibility_skip = True
+            telemetry["failure_class"] = "oversized_local_fallback"
+            telemetry["chunking"] = False
+            telemetry["chunk_count"] = 0
+            telemetry["aux_time_budget_seconds"] = 0
+            telemetry["aux_token_budget"] = 0
+            if not self.quiet_mode:
+                logger.warning(
+                    "Compression input (%d tokens) is at/above the model window "
+                    "(%d); using deterministic local handoff without auxiliary calls.",
+                    display_tokens,
+                    self.context_length,
+                )
+        if (
+            not oversized_local_fallback
+            and not force
+            and self._ineffective_compression_count >= 1
+        ):
             # _record_compression_regions already estimated this exact window
             # into the telemetry dict above; reuse it so the log line and
             # telemetry can never disagree. The regions helper no-ops when the
@@ -7825,6 +7872,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 # A stale error from an earlier real failure must not be
                 # embedded into a deliberate feasibility skip's fallback.
                 reason=None if feasibility_skip else self._last_summary_error,
+                include_aux_digests=not oversized_local_fallback,
             )
 
         tail_messages: List[Dict[str, Any]] = []

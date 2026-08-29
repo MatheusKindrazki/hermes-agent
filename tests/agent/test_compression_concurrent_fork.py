@@ -194,6 +194,63 @@ def test_compression_activity_heartbeat_stops_on_compress_exception(tmp_path: Pa
     assert db.get_compression_lock_holder(session_id) is None
 
 
+def test_over_million_local_handoff_rotates_once_and_releases_lock(tmp_path: Path) -> None:
+    """The >window local fallback must commit one usable continuation SID."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    parent_sid = "MILLION_TOKEN_PARENT"
+    db.create_session(parent_sid, source="desktop")
+    agent = _build_agent_with_db(db, parent_sid, stub_compressor=False)
+    agent._compression_feasibility_checked = True
+    agent.compression_in_place = False
+    agent.context_compressor.update_model(
+        model=agent.model,
+        context_length=128_000,
+        base_url=agent.base_url,
+        api_key=agent.api_key,
+        provider=agent.provider,
+        api_mode=agent.api_mode,
+    )
+    checkpoint = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "desktop pending turn"},
+            {"type": "image_url", "image_url": {"url": "file:///tmp/desktop.png"}},
+        ],
+        "checkpoint": {"stream_id": "stream-2"},
+    }
+    messages = [
+        {"role": "user", "content": "initial request"},
+        {"role": "assistant", "content": "working"},
+    ]
+    for i in range(96):
+        messages.extend(
+            [
+                {"role": "user", "content": f"old-{i}:" + ("u" * 24_000)},
+                {"role": "assistant", "content": f"done-{i}:" + ("a" * 24_000)},
+            ]
+        )
+    messages.append(checkpoint)
+
+    with patch("agent.context_compressor.call_llm") as main_aux, patch(
+        "agent.auxiliary_client.call_llm"
+    ) as digest_aux:
+        compressed, _system_prompt = agent._compress_context(
+            messages,
+            "system",
+            approx_tokens=1_100_000,
+        )
+
+    main_aux.assert_not_called()
+    digest_aux.assert_not_called()
+    assert agent.session_id != parent_sid
+    assert _count_children(db, parent_sid) == 1
+    assert db.get_compression_lock_holder(parent_sid) is None
+    preserved = [m for m in compressed if m.get("checkpoint") == checkpoint["checkpoint"]]
+    assert len(preserved) == 1
+    assert preserved[0]["role"] == checkpoint["role"]
+    assert preserved[0]["content"] == checkpoint["content"]
+
+
 def test_compression_activity_heartbeat_ignores_touch_errors(tmp_path: Path) -> None:
     """Activity touch failures must not affect compression success semantics."""
     db = SessionDB(db_path=tmp_path / "state.db")
