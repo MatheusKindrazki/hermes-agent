@@ -80,8 +80,20 @@ class RunIdempotencyLedger:
                 "ALTER TABLE run_request_idempotency "
                 "ADD COLUMN receipt_json TEXT NOT NULL DEFAULT '{}'"
             )
-        os.chmod(self.db_path, 0o600)
+        self._ensure_owner_only_sqlite_modes()
         return connection
+
+    def _ensure_owner_only_sqlite_modes(self) -> None:
+        """Keep the ledger and live SQLite sidecars private to their owner."""
+        for path in (
+            self.db_path,
+            Path(f"{self.db_path}-wal"),
+            Path(f"{self.db_path}-shm"),
+        ):
+            try:
+                os.chmod(path, 0o600)
+            except FileNotFoundError:
+                continue
 
     @staticmethod
     def _validate_existing(
@@ -186,6 +198,7 @@ class RunIdempotencyLedger:
         now = time.time_ns() // 1_000_000
         with self._lock, closing(self._connect()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
+            self._ensure_owner_only_sqlite_modes()
             row = connection.execute(
                 "SELECT request_sha256,payload_sha256,run_id "
                 "FROM run_request_idempotency WHERE idempotency_key = ?",
