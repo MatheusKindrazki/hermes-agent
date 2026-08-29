@@ -84,6 +84,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
+from gateway.egress_policy import EgressPolicy
 from gateway.reliability_outbox import ReliabilityOutbox
 
 logger = logging.getLogger(__name__)
@@ -185,6 +186,7 @@ def register_from_config(cfg: Optional[Dict[str, Any]]) -> List[WebhookTarget]:
 
     manager = get_plugin_manager()
     reliability_outbox = ReliabilityOutbox.from_config(cfg)
+    egress_policy = EgressPolicy.from_config(cfg)
 
     registered: List[WebhookTarget] = []
     with _registered_lock:
@@ -199,6 +201,7 @@ def register_from_config(cfg: Optional[Dict[str, Any]]) -> List[WebhookTarget]:
                         event,
                         target,
                         reliability_outbox=reliability_outbox,
+                        egress_policy=egress_policy,
                     )
                 )
                 _registered.add(key)
@@ -389,6 +392,7 @@ def _make_callback(
     target: WebhookTarget,
     *,
     reliability_outbox: Optional[ReliabilityOutbox] = None,
+    egress_policy: Optional[EgressPolicy] = None,
 ):
     """Build the notify-only closure ``invoke_hook()`` calls per firing."""
 
@@ -405,6 +409,21 @@ def _make_callback(
                 "target=%s)", event, target.label, exc_info=True,
             )
             return None
+        if egress_policy is not None:
+            egress_decision = egress_policy.evaluate_delivery(
+                action="webhook",
+                destination=target.url,
+                content=body,
+                metadata=kwargs,
+            )
+            if not egress_decision.allowed:
+                logger.warning(
+                    "Egress policy rejected outbound webhook %s -> %s: %s",
+                    event,
+                    target.label,
+                    ",".join(egress_decision.reasons),
+                )
+                return None
         if reliability_outbox is not None and reliability_outbox.mode == "shadow":
             receipt = reliability_outbox.enqueue(
                 payload=body,

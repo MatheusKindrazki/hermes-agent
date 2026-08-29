@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Tuple
 
@@ -27,6 +28,10 @@ def _mapping(value: Any) -> Mapping[str, Any]:
 @dataclass(frozen=True)
 class EgressSettings:
     mode: str
+    profile: str = ""
+    tenant: str = ""
+    machine: str = ""
+    policy_version: str = "tone-v1"
 
 
 @dataclass(frozen=True)
@@ -88,7 +93,14 @@ def resolve_egress_settings(
             "Ignoring gateway.reliability.egress.mode=%r; expected off, shadow, or enforce",
             candidate,
         )
-    return EgressSettings(mode=mode)
+    return EgressSettings(
+        mode=mode,
+        profile=str(raw.get("profile") or "").strip(),
+        tenant=str(raw.get("tenant") or "").strip(),
+        machine=str(raw.get("machine") or "").strip(),
+        policy_version=str(raw.get("policy_version") or "tone-v1").strip()
+        or "tone-v1",
+    )
 
 
 class EgressPolicy:
@@ -104,6 +116,114 @@ class EgressPolicy:
     @property
     def mode(self) -> str:
         return self.settings.mode
+
+    def build_envelope(
+        self,
+        *,
+        action: str,
+        destination: str,
+        content: bytes,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> Mapping[str, Any]:
+        """Build v1 identity metadata without embedding message content."""
+        supplied = _mapping(metadata)
+        nested = _mapping(supplied.get("egress"))
+
+        def value(name: str, default: Any = "") -> Any:
+            if name in nested:
+                return nested.get(name)
+            if name in supplied:
+                return supplied.get(name)
+            return default
+
+        try:
+            from gateway.session_context import get_session_env
+
+            session_profile = get_session_env("HERMES_SESSION_PROFILE", "")
+            session_id = get_session_env("HERMES_SESSION_ID", "")
+        except Exception:
+            session_profile = ""
+            session_id = ""
+
+        digest = hashlib.sha256(content).hexdigest()
+        envelope = {
+            "schema": "kindra.egress/v1",
+            "profile": str(
+                value("profile", session_profile or self.settings.profile) or ""
+            ),
+            "tenant": str(value("tenant", self.settings.tenant) or ""),
+            "machine": str(value("machine", self.settings.machine) or ""),
+            "work_id": str(value("work_id", "") or ""),
+            "session_id": str(value("session_id", session_id) or ""),
+            "policy_version": str(
+                value("policy_version", self.settings.policy_version) or ""
+            ),
+            "action": str(value("action", action) or action),
+            "risk": str(value("risk", "normal") or "normal"),
+            "explicit_override": value("explicit_override", False) is True,
+            "idempotency_key": str(value("idempotency_key", digest) or digest),
+            "payload_ref": str(
+                value("payload_ref", f"owner-only://sha256/{digest}")
+                or f"owner-only://sha256/{digest}"
+            ),
+        }
+        for optional in ("approval_ref", "tone_repaired"):
+            optional_value = value(optional, None)
+            if optional_value is not None:
+                envelope[optional] = optional_value
+        return envelope
+
+    def evaluate_delivery(
+        self,
+        *,
+        action: str,
+        destination: str,
+        content: bytes,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> EgressDecision:
+        envelope = self.build_envelope(
+            action=action,
+            destination=destination,
+            content=content,
+            metadata=metadata,
+        )
+        try:
+            from gateway.session_context import get_session_env
+
+            session_profile = get_session_env("HERMES_SESSION_PROFILE", "")
+        except Exception:
+            session_profile = ""
+        supplied = _mapping(metadata)
+        expected_profile = session_profile or self.settings.profile or None
+        expected_tenant = (
+            self.settings.tenant
+            or str(supplied.get("expected_tenant") or "").strip()
+            or None
+        )
+        return self.evaluate(
+            envelope,
+            expected_profile=expected_profile,
+            expected_tenant=expected_tenant,
+        )
+
+    def prepare_metadata(
+        self,
+        *,
+        action: str,
+        destination: str,
+        content: bytes,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> tuple[dict[str, Any], EgressDecision]:
+        original = dict(metadata or {})
+        decision = self.evaluate_delivery(
+            action=action,
+            destination=destination,
+            content=content,
+            metadata=original,
+        )
+        if self.mode != "off":
+            original["egress_policy"] = decision.metadata()
+        return original, decision
 
     def evaluate(
         self,
