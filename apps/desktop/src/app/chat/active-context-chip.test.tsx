@@ -4,7 +4,6 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { $connectionsRegistry } from '@/store/connection-registry-state'
 
 import type { ActiveContext } from './active-context'
-
 import { ActiveContextChip } from './active-context-chip'
 
 const REGISTRY = {
@@ -57,14 +56,30 @@ describe('ActiveContextChip', () => {
   })
 
   it('states where a draft would land', () => {
-    render(
+    const { container } = render(
       <ActiveContextChip
-        context={{ connectionId: 'this-mac', profile: 'default', source: 'draft', storedSessionId: null }}
+        context={{
+          connectionId: 'this-mac',
+          machine: 'personal-mac-mini',
+          profile: 'default',
+          source: 'draft',
+          storedSessionId: null,
+          tenant: 'kindra'
+        }}
       />
     )
 
+    const chip = container.querySelector('[data-slot="active-context-chip"]')
+
+    expect(chip).toBeTruthy()
+    expect(screen.getByText(/New chat/)).toBeTruthy()
     expect(screen.getByText(/default/)).toBeTruthy()
+    expect(screen.getByText(/kindra/)).toBeTruthy()
     expect(screen.getByText(/This Mac/)).toBeTruthy()
+    expect(chip?.getAttribute('data-active-context-conversation')).toBe('draft')
+    expect(chip?.getAttribute('data-active-context-machine')).toBe('personal-mac-mini')
+    expect(chip?.getAttribute('data-active-context-profile')).toBe('default')
+    expect(chip?.getAttribute('data-active-context-tenant')).toBe('kindra')
   })
 
   it('distinguishes two chats that share the canonical Bot Chat title', () => {

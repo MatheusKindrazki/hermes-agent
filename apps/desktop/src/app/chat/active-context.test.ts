@@ -211,13 +211,31 @@ describe('shouldPreserveRouteAcrossGatewaySwitch', () => {
 })
 
 describe('activeContextLabels', () => {
+  it('renders conversation, profile, tenant and machine for a draft', () => {
+    const labels = activeContextLabels(
+      {
+        connectionId: 'local',
+        machine: 'personal-mac-mini',
+        profile: 'research',
+        source: 'draft',
+        storedSessionId: null,
+        tenant: 'kindra'
+      },
+      'This Mac'
+    )
+
+    expect(labels.text).toBe('New chat · research · kindra · This Mac')
+    expect(labels.detail).toContain('New chat')
+    expect(labels.detail).toContain('kindra')
+  })
+
   it('paints profile AND machine — identity must not be tooltip-only', () => {
     const labels = activeContextLabels(
       { connectionId: 'homelab', profile: 'research', source: 'session', storedSessionId: 'chat-a' },
       'Homelab'
     )
 
-    expect(labels.text).toBe('research · Homelab')
+    expect(labels.text).toBe('This chat · research · unknown tenant · Homelab')
     expect(labels.detail).toContain('research')
     expect(labels.detail).toContain('Homelab')
   })
@@ -228,7 +246,7 @@ describe('activeContextLabels', () => {
       null
     )
 
-    expect(labels.text).toBe('unknown profile · unknown device')
+    expect(labels.text).toBe('Chat · unknown profile · unknown tenant · unknown device')
     expect(labels.detail).toContain('owner unknown')
   })
 
@@ -238,7 +256,7 @@ describe('activeContextLabels', () => {
       'Work laptop'
     )
 
-    expect(labels.text).toBe('default · Work laptop')
+    expect(labels.text).toBe('New chat · default · unknown tenant · Work laptop')
     expect(labels.detail.startsWith('New chat:')).toBe(true)
   })
 
@@ -249,7 +267,7 @@ describe('activeContextLabels', () => {
       null
     )
 
-    expect(labels.text).toBe('p · conn-7')
+    expect(labels.text).toBe('This chat · p · unknown tenant · conn-7')
   })
 
   it('never produces empty visible text', () => {

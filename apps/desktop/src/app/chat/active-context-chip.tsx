@@ -6,7 +6,6 @@ import { cn } from '@/lib/utils'
 import { $connectionsRegistry } from '@/store/connection-registry-state'
 
 import { type ActiveContext, activeContextLabels } from './active-context'
-
 import { ConnectionGlyph } from './sidebar/connection-glyph'
 
 /**
@@ -29,17 +28,27 @@ import { ConnectionGlyph } from './sidebar/connection-glyph'
  */
 export function ActiveContextChip({ className, context }: { className?: string; context: ActiveContext }) {
   const registry = useStore($connectionsRegistry)
+
   const connection = context.connectionId
     ? registry?.connections.find(candidate => candidate.id === context.connectionId)
     : undefined
+
   const { detail, text } = activeContextLabels(context, connection?.label ?? null)
+  const conversation = context.storedSessionId?.trim() || (context.source === 'draft' ? 'draft' : 'unknown')
 
   return (
     <Tip label={detail}>
       <span
         aria-label={detail}
         className={cn('inline-flex min-w-0 items-center gap-1 text-xs text-(--ui-text-tertiary)', className)}
+        data-active-context-connection={context.connectionId?.trim() || 'unknown'}
+        data-active-context-conversation={conversation}
+        data-active-context-machine={
+          context.machine?.trim() || connection?.installId?.trim() || connection?.label || 'unknown'
+        }
+        data-active-context-profile={context.profile?.trim() || 'unknown'}
         data-active-context-source={context.source}
+        data-active-context-tenant={context.tenant?.trim() || 'unknown'}
         data-slot="active-context-chip"
       >
         {connection ? (

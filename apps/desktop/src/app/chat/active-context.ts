@@ -233,11 +233,12 @@ export function shouldPreserveRouteAcrossGatewaySwitch(routedSessionId: null | s
 export interface ActiveContextLabels {
   /** The full sentence, for the tooltip and the accessible name. */
   detail: string
-  /** Always-visible compact text, e.g. `research · Homelab`. Never empty. */
+  /** Four visible identity dimensions. Never empty. */
   text: string
 }
 
 const UNKNOWN_PROFILE = 'unknown profile'
+const UNKNOWN_TENANT = 'unknown tenant'
 const UNKNOWN_DEVICE = 'unknown device'
 
 /**
@@ -258,11 +259,12 @@ const UNKNOWN_DEVICE = 'unknown device'
  */
 export function activeContextLabels(context: ActiveContext, connectionLabel: null | string): ActiveContextLabels {
   const profile = context.profile ?? UNKNOWN_PROFILE
-  const device = connectionLabel?.trim() || context.connectionId?.trim() || UNKNOWN_DEVICE
+  const tenant = context.tenant?.trim() || UNKNOWN_TENANT
+  const device = connectionLabel?.trim() || context.machine?.trim() || context.connectionId?.trim() || UNKNOWN_DEVICE
 
   const what = context.source === 'draft' ? 'New chat' : context.source === 'unknown' ? 'Chat' : 'This chat'
 
   const owner = context.source === 'unknown' ? `owner unknown — ${profile} on ${device}` : `${profile} on ${device}`
 
-  return { detail: `${what}: ${owner}`, text: `${profile} · ${device}` }
+  return { detail: `${what}: ${owner}; tenant ${tenant}`, text: `${what} · ${profile} · ${tenant} · ${device}` }
 }

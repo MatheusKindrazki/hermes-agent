@@ -90,6 +90,12 @@ import {
 } from './transcript-backfill'
 import { advanceTranscriptWindow, type TranscriptWindowState } from './transcript-window'
 
+// The pane tree suppresses old titlebar bands by matching this legacy height
+// token literally. Active context is no longer decorative title chrome: it is
+// the fail-closed destination receipt for Enter, so give it an explicit pane
+// height and keep it rendered in the workspace zone.
+const activeContextHeaderBaseClass = titlebarHeaderBaseClass.replace('h-(--titlebar-height)', 'h-7')
+
 interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   gateway: HermesGateway | null
   modelMenuContent?: React.ReactNode
@@ -224,7 +230,12 @@ function ChatHeader({
   }
 
   return (
-    <header className={cn(titlebarHeaderBaseClass, isRoutedSessionView && titlebarHeaderShadowClass)}>
+    <header
+      className={cn(
+        showContext ? activeContextHeaderBaseClass : titlebarHeaderBaseClass,
+        isRoutedSessionView && titlebarHeaderShadowClass
+      )}
+    >
       <div
         className={cn(titlebarHeaderTitleClass, (showProfileTag || showContext) && 'flex items-center')}
         style={{
@@ -585,38 +596,47 @@ const ChatViewContent = memo(function ChatViewContent({
 
   const registryConnection = connectionsRegistry?.connections.find(connection => connection.id === ownerConnectionId)
 
-  const activeContext = useMemo(
-    () =>
-      resolveActiveContext({
-        activeRuntimeSessionId: activeSessionId,
-        correlation: {
-          connectionId: ownerConnectionId || null,
-          gatewayGeneration: targetSession?.gateway_generation ?? null,
-          machine: targetSession?.machine || registryConnection?.installId || registryConnection?.label || null,
-          profile: ownerProfile || null,
-          runtimeSessionId: targetSession?.runtime_session_id || activeSessionId || null,
-          storedSessionId: targetStoredSessionId,
-          tenant: targetSession?.tenant ?? null,
-          workId: targetSession?.work_id ?? null,
-          xirpSessionId: targetSession?.xirp_session_id ?? null
-        },
-        identityV2: identityV2Enabled,
-        newChatRoute: draftRoute,
-        owner,
-        targetStoredSessionId
-      }),
-    [
-      activeSessionId,
-      draftRoute,
-      identityV2Enabled,
+  const activeContext = useMemo(() => {
+    // The legacy local door intentionally returns no explicit draft route:
+    // its submit is ambient. The ambient destination is still exact at this
+    // render because these two atoms are the same active connection/profile
+    // the request dispatcher uses. Carry that pair for display only; never
+    // infer either field from a title, session id, or profile name.
+    const displayedDraftRoute =
+      draftRoute ??
+      (!targetStoredSessionId && ownerConnectionId && ownerProfile
+        ? { connectionId: ownerConnectionId, profile: ownerProfile }
+        : null)
+
+    return resolveActiveContext({
+      activeRuntimeSessionId: activeSessionId,
+      correlation: {
+        connectionId: ownerConnectionId || null,
+        gatewayGeneration: targetSession?.gateway_generation ?? null,
+        machine: targetSession?.machine || registryConnection?.installId || registryConnection?.label || null,
+        profile: ownerProfile || null,
+        runtimeSessionId: targetSession?.runtime_session_id || activeSessionId || null,
+        storedSessionId: targetStoredSessionId,
+        tenant: targetSession?.tenant ?? null,
+        workId: targetSession?.work_id ?? null,
+        xirpSessionId: targetSession?.xirp_session_id ?? null
+      },
+      identityV2: identityV2Enabled,
+      newChatRoute: displayedDraftRoute,
       owner,
-      ownerConnectionId,
-      ownerProfile,
-      registryConnection,
-      targetSession,
       targetStoredSessionId
-    ]
-  )
+    })
+  }, [
+    activeSessionId,
+    draftRoute,
+    identityV2Enabled,
+    owner,
+    ownerConnectionId,
+    ownerProfile,
+    registryConnection,
+    targetSession,
+    targetStoredSessionId
+  ])
 
   const contextAllowsSubmit = activeContextCanSubmit(activeContext, identityV2Enabled)
 
