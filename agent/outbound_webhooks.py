@@ -84,6 +84,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
+from gateway.reliability_outbox import ReliabilityOutbox
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT_SECONDS = 10
@@ -182,6 +184,7 @@ def register_from_config(cfg: Optional[Dict[str, Any]]) -> List[WebhookTarget]:
     from hermes_cli.plugins import get_plugin_manager
 
     manager = get_plugin_manager()
+    reliability_outbox = ReliabilityOutbox.from_config(cfg)
 
     registered: List[WebhookTarget] = []
     with _registered_lock:
@@ -192,7 +195,11 @@ def register_from_config(cfg: Optional[Dict[str, Any]]) -> List[WebhookTarget]:
                 if key in _registered:
                     continue
                 manager._hooks.setdefault(event, []).append(
-                    _make_callback(event, target)
+                    _make_callback(
+                        event,
+                        target,
+                        reliability_outbox=reliability_outbox,
+                    )
                 )
                 _registered.add(key)
                 wired_any = True
@@ -377,7 +384,12 @@ def _resolve_secret(index: int, raw: Dict[str, Any]) -> Optional[str]:
 # Callback + delivery
 # ---------------------------------------------------------------------------
 
-def _make_callback(event: str, target: WebhookTarget):
+def _make_callback(
+    event: str,
+    target: WebhookTarget,
+    *,
+    reliability_outbox: Optional[ReliabilityOutbox] = None,
+):
     """Build the notify-only closure ``invoke_hook()`` calls per firing."""
 
     def _callback(**kwargs: Any) -> None:
@@ -391,6 +403,23 @@ def _make_callback(event: str, target: WebhookTarget):
             logger.warning(
                 "outbound webhook payload serialization failed (event=%s "
                 "target=%s)", event, target.label, exc_info=True,
+            )
+            return None
+        if reliability_outbox is not None and reliability_outbox.mode == "shadow":
+            receipt = reliability_outbox.enqueue(
+                payload=body,
+                producer="hermes-agent.agent.outbound_webhooks",
+                work_id=str(kwargs.get("work_id") or ""),
+                event_type=event,
+                milestone=str(kwargs.get("milestone") or event),
+                version=str(kwargs.get("version") or delivery_id),
+                destination=target.url,
+            )
+            logger.debug(
+                "outbound webhook shadow-enqueued: %s -> %s (%s)",
+                event,
+                target.label,
+                receipt.event_id,
             )
             return None
         _enqueue(_build_delivery(event, target, body, delivery_id))

@@ -8,6 +8,7 @@ Routes messages to the appropriate destination based on:
 - Local (always saved to files)
 """
 
+import hashlib
 import logging
 import os
 import re
@@ -57,6 +58,7 @@ def _is_silence_narration(content: Optional[str]) -> bool:
 from .config import Platform, GatewayConfig, PlatformConfig
 from .session import SessionSource
 from .dead_targets import DeadTargetRegistry
+from .reliability_outbox import ReliabilityOutbox
 
 
 @dataclass(frozen=True)
@@ -300,7 +302,8 @@ class DeliveryRouter:
     """
     
     def __init__(self, config: GatewayConfig, adapters: Dict[Platform, Any] = None,
-                 dead_targets: Optional[DeadTargetRegistry] = None):
+                 dead_targets: Optional[DeadTargetRegistry] = None,
+                 reliability_outbox: Optional[ReliabilityOutbox] = None):
         """
         Initialize the delivery router.
         
@@ -314,6 +317,7 @@ class DeliveryRouter:
         self.adapters = adapters or {}
         self.output_dir = get_hermes_home() / "cron" / "output"
         self.dead_targets = dead_targets or DeadTargetRegistry()
+        self.reliability_outbox = reliability_outbox or ReliabilityOutbox.from_config()
     
     async def deliver(
         self,
@@ -603,6 +607,37 @@ class DeliveryRouter:
                 send_metadata["telegram_dm_topic_reply_fallback"] = True
             elif "thread_id" not in send_metadata and "message_thread_id" not in send_metadata and not has_explicit_direct_topic:
                 send_metadata["thread_id"] = target_thread_id
+        if self.reliability_outbox.mode == "shadow":
+            payload = {
+                "schema": "kindra.outbox-payload/v1",
+                "content": content,
+                "destination": target.to_string(),
+                "metadata": send_metadata,
+            }
+            work_id = str(send_metadata.get("work_id") or "")
+            milestone = str(send_metadata.get("milestone") or "delivery")
+            version = str(
+                send_metadata.get("version")
+                or send_metadata.get("delivery_id")
+                or send_metadata.get("client_turn_id")
+                or hashlib.sha256(content.encode("utf-8")).hexdigest()
+            )
+            receipt = self.reliability_outbox.enqueue_json(
+                payload,
+                producer="hermes-agent.gateway.delivery",
+                work_id=work_id,
+                event_type="gateway_delivery",
+                milestone=milestone,
+                version=version,
+                destination=target.to_string(),
+            )
+            return {
+                "success": True,
+                "shadow_enqueued": True,
+                "delivered": False,
+                "event_id": receipt.event_id,
+                "idempotency_key": receipt.idempotency_key,
+            }
         result = await transport.send(
             target.platform,
             target.chat_id,
@@ -640,7 +675,6 @@ class DeliveryRouter:
             if _send_result_failed(result):
                 raise RuntimeError(_send_result_error(result) or f"{target.platform.value} delivery failed")
         return result
-
 
 
 
