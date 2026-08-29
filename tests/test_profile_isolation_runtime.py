@@ -15,8 +15,10 @@ probes used to confirm the bug class.
 """
 
 import asyncio
+import concurrent.futures
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -34,6 +36,8 @@ from gateway.turn_context import (
     request_context_scope,
     request_context_v2_enabled,
 )
+from gateway.config import Platform
+from gateway.run import TurnRunner
 
 
 @pytest.fixture
@@ -332,3 +336,149 @@ class TestRequestContextV2Isolation:
                 assert current_request_context() is None
         finally:
             reset_hermes_home_override(home_token)
+
+    def test_real_turn_entrypoint_isolates_interleaved_request_authority(
+        self, two_profiles, tmp_path
+    ):
+        """The real TurnRunner seam must publish authority before agent setup."""
+        prof_a, prof_b = two_profiles
+        workspace_a = tmp_path / "runtime-workspace-a"
+        workspace_b = tmp_path / "runtime-workspace-b"
+        workspace_a.mkdir()
+        workspace_b.mkdir()
+        both_inside = threading.Barrier(2)
+
+        class ProbeComplete(Exception):
+            pass
+
+        class ProbeGateway:
+            def __init__(self, *, model: str, provider: str):
+                self.model = model
+                self.provider = provider
+                self._provider_routing = None
+
+            def _get_system_prompt_for_channel(self, *_args, **_kwargs):
+                return None
+
+            def _resolve_session_agent_runtime(self, **_kwargs):
+                return self.model, {"provider": self.provider}
+
+            def _resolve_session_reasoning_config(self, **_kwargs):
+                both_inside.wait(timeout=2)
+                self.seen = current_request_context()
+                raise ProbeComplete
+
+        def run_turn(
+            *,
+            home: Path,
+            workspace: Path,
+            profile: str,
+            tenant: str,
+            model: str,
+            provider: str,
+            approval: str,
+            session_id: str,
+        ):
+            home_token = set_hermes_home_override(home)
+            set_session_cwd(str(workspace))
+            try:
+                config = self._config(True)
+                config["gateway"]["reliability"]["request_context"].update(
+                    {
+                        "profile": profile,
+                        "tenant": tenant,
+                        "approval": approval,
+                    }
+                )
+                gateway = ProbeGateway(model=model, provider=provider)
+                source = SimpleNamespace(
+                    platform=Platform.LOCAL,
+                    chat_id=session_id,
+                    thread_id=None,
+                    parent_chat_id=None,
+                )
+                ctx = TurnContext(
+                    source=source,
+                    user_config=config,
+                    session_id=session_id,
+                    session_key=session_id,
+                    context_prompt=None,
+                    channel_prompt=None,
+                    resolve_display_setting=lambda *_args, **_kwargs: None,
+                )
+                try:
+                    TurnRunner(gateway, ctx).run_sync()
+                except ProbeComplete:
+                    pass
+                return gateway.seen, ctx.request_context
+            finally:
+                clear_session_cwd()
+                reset_hermes_home_override(home_token)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            first_future = pool.submit(
+                run_turn,
+                home=prof_a,
+                workspace=workspace_a,
+                profile="luguistaff",
+                tenant="lugui",
+                model="model-a",
+                provider="provider-a",
+                approval="manual-a",
+                session_id="session-a",
+            )
+            second_future = pool.submit(
+                run_turn,
+                home=prof_b,
+                workspace=workspace_b,
+                profile="applausestaff",
+                tenant="applause",
+                model="model-b",
+                provider="provider-b",
+                approval="manual-b",
+                session_id="session-b",
+            )
+            first = first_future.result(timeout=4)
+            second = second_future.result(timeout=4)
+
+        assert first[0] is first[1]
+        assert second[0] is second[1]
+        assert (
+            first[0].profile,
+            first[0].tenant,
+            first[0].model,
+            first[0].provider,
+            first[0].approval,
+            first[0].session_id,
+            first[0].hermes_home,
+            first[0].workspace,
+        ) == (
+            "luguistaff",
+            "lugui",
+            "model-a",
+            "provider-a",
+            "manual-a",
+            "session-a",
+            prof_a,
+            workspace_a,
+        )
+        assert (
+            second[0].profile,
+            second[0].tenant,
+            second[0].model,
+            second[0].provider,
+            second[0].approval,
+            second[0].session_id,
+            second[0].hermes_home,
+            second[0].workspace,
+        ) == (
+            "applausestaff",
+            "applause",
+            "model-b",
+            "provider-b",
+            "manual-b",
+            "session-b",
+            prof_b,
+            workspace_b,
+        )
+        assert current_request_context() is None

@@ -2683,7 +2683,12 @@ from gateway.session_state import (
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
-from gateway.turn_context import TurnContext
+from gateway.turn_context import (
+    TurnContext,
+    compose_request_context,
+    request_context_scope,
+    request_context_v2_enabled,
+)
 from gateway.platforms.base import (
     BasePlatformAdapter,
     EphemeralReply,
@@ -5357,6 +5362,57 @@ class TurnRunner:
             _fut.add_done_callback(_track_status_id)
 
     def run_sync(self):
+        """Execute one turn under its immutable request authority snapshot.
+
+        Runtime model/provider resolution happens exactly once when the v2
+        gate is enabled, before the snapshot is published.  The scoped body
+        is the same production turn body used when the gate is disabled, so
+        tool workers inherit the ContextVar through the gateway's
+        ``copy_context`` executor seam without falling back to process globals.
+        """
+        ctx = self._ctx
+        if not request_context_v2_enabled(ctx.user_config):
+            return self._run_sync_inner()
+
+        try:
+            model, runtime_kwargs = self._runner._resolve_session_agent_runtime(
+                source=ctx.source,
+                session_key=ctx.session_key,
+                user_config=ctx.user_config,
+            )
+            request_cfg = (
+                ((ctx.user_config or {}).get("gateway") or {})
+                .get("reliability", {})
+                .get("request_context", {})
+            )
+            source_profile = str(getattr(ctx.source, "profile", "") or "").strip()
+            profile = source_profile or str(request_cfg.get("profile") or "").strip()
+            tenant = str(request_cfg.get("tenant") or "").strip()
+            approval = str(request_cfg.get("approval") or "").strip()
+            provider = str(runtime_kwargs.get("provider") or "").strip()
+            request_context = compose_request_context(
+                profile=profile,
+                tenant=tenant,
+                model=str(model or ""),
+                provider=provider,
+                approval=approval,
+                session_id=str(ctx.session_id or ctx.session_key or ""),
+            )
+        except Exception as exc:
+            return {
+                "final_response": f"⚠️ Provider authentication failed: {exc}",
+                "messages": [],
+                "api_calls": 0,
+                "tools": [],
+            }
+
+        ctx.request_context = request_context
+        with request_context_scope(request_context, config=ctx.user_config):
+            return self._run_sync_inner(
+                resolved_runtime=(model, runtime_kwargs),
+            )
+
+    def _run_sync_inner(self, *, resolved_runtime=None):
         ctx = self._ctx
         # Historical note: as a nested closure this body declared
         # `nonlocal message` because the conditional re-assignments below
@@ -5405,11 +5461,14 @@ class TurnRunner:
         max_iterations = _current_max_iterations()
 
         try:
-            model, runtime_kwargs = self._runner._resolve_session_agent_runtime(
-                source=ctx.source,
-                session_key=ctx.session_key,
-                user_config=ctx.user_config,
-            )
+            if resolved_runtime is None:
+                model, runtime_kwargs = self._runner._resolve_session_agent_runtime(
+                    source=ctx.source,
+                    session_key=ctx.session_key,
+                    user_config=ctx.user_config,
+                )
+            else:
+                model, runtime_kwargs = resolved_runtime
             logger.debug(
                 "run_agent resolved: model=%s provider=%s session=%s",
                 model, runtime_kwargs.get("provider"), ctx.session_key or "",
