@@ -169,3 +169,32 @@ def test_outbound_webhook_shadow_enqueues_without_starting_network_worker(
     assert row["producer"] == "hermes-agent.agent.outbound_webhooks"
     assert row["destination"] == "https://example.invalid/hermes"
     assert row["work_id"] == WORK_ID
+
+
+def test_outbound_webhook_shadow_retry_is_one_byte_stable_event(tmp_path):
+    cfg = _config(tmp_path, "shadow")
+    target = outbound_webhooks.WebhookTarget(
+        url="https://example.invalid/hermes",
+        events=["on_session_end"],
+        name="receipt",
+    )
+    callback = outbound_webhooks._make_callback(
+        "on_session_end",
+        target,
+        reliability_outbox=ReliabilityOutbox.from_config(cfg, hermes_home=tmp_path),
+    )
+    event = {
+        "session_id": "session-1",
+        "work_id": WORK_ID,
+        "milestone": "turn-complete",
+        "version": "final-v1",
+    }
+
+    callback(**event)
+    first_row = _rows(tmp_path / "state" / "outbox.sqlite3")[0]
+    first_payload = Path(first_row["payload_ref"]).read_bytes()
+    callback(**event)
+
+    rows = _rows(tmp_path / "state" / "outbox.sqlite3")
+    assert len(rows) == 1
+    assert Path(rows[0]["payload_ref"]).read_bytes() == first_payload

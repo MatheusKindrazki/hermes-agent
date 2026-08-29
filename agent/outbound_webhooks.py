@@ -99,7 +99,16 @@ QUEUE_MAX_SIZE = 256
 _TOOL_SCOPED_EVENTS = {"pre_tool_call", "post_tool_call"}
 
 # kwargs promoted to top-level payload keys (mirrors shell hooks wire).
-_TOP_LEVEL_PAYLOAD_KEYS = {"tool_name", "args", "session_id", "parent_session_id"}
+_TOP_LEVEL_PAYLOAD_KEYS = {
+    "tool_name",
+    "args",
+    "session_id",
+    "parent_session_id",
+    "timestamp",
+}
+
+_SHADOW_UNKNOWN_TIMESTAMP = "1970-01-01T00:00:00Z"
+_OUTBOX_PRODUCER = "hermes-agent.agent.outbound_webhooks"
 
 # (event, url) pairs already wired to the plugin manager in this process.
 _registered: Set[Tuple[str, str]] = set()
@@ -400,9 +409,28 @@ def _make_callback(
         if event in _TOOL_SCOPED_EVENTS:
             if not target.matches_tool(kwargs.get("tool_name")):
                 return None
-        delivery_id = uuid.uuid4().hex
+        shadow_enabled = (
+            reliability_outbox is not None
+            and reliability_outbox.mode == "shadow"
+        )
+        outbox_version = _shadow_version(event, target, kwargs) if shadow_enabled else ""
+        delivery_id = (
+            _shadow_delivery_id(event, target, kwargs, outbox_version)
+            if shadow_enabled
+            else uuid.uuid4().hex
+        )
+        payload_timestamp = (
+            str(kwargs.get("timestamp") or _SHADOW_UNKNOWN_TIMESTAMP)
+            if shadow_enabled
+            else None
+        )
         try:
-            body = _serialize_payload(event, kwargs, delivery_id)
+            body = _serialize_payload(
+                event,
+                kwargs,
+                delivery_id,
+                timestamp=payload_timestamp,
+            )
         except Exception:  # defensive — a bad payload must not hurt the loop
             logger.warning(
                 "outbound webhook payload serialization failed (event=%s "
@@ -424,14 +452,14 @@ def _make_callback(
                     ",".join(egress_decision.reasons),
                 )
                 return None
-        if reliability_outbox is not None and reliability_outbox.mode == "shadow":
+        if shadow_enabled:
             receipt = reliability_outbox.enqueue(
                 payload=body,
-                producer="hermes-agent.agent.outbound_webhooks",
+                producer=_OUTBOX_PRODUCER,
                 work_id=str(kwargs.get("work_id") or ""),
                 event_type=event,
                 milestone=str(kwargs.get("milestone") or event),
-                version=str(kwargs.get("version") or delivery_id),
+                version=outbox_version,
                 destination=target.url,
             )
             logger.debug(
@@ -449,8 +477,58 @@ def _make_callback(
     return _callback
 
 
+def _shadow_version(
+    event: str,
+    target: WebhookTarget,
+    kwargs: Dict[str, Any],
+) -> str:
+    explicit = str(kwargs.get("version") or "").strip()
+    if explicit:
+        return explicit
+    stable_kwargs = {
+        key: value
+        for key, value in kwargs.items()
+        if key not in {"timestamp", "delivery_id"}
+    }
+    material = json.dumps(
+        {
+            "destination": target.url,
+            "event": event,
+            "payload": stable_kwargs,
+        },
+        ensure_ascii=False,
+        default=str,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(material).hexdigest()
+
+
+def _shadow_delivery_id(
+    event: str,
+    target: WebhookTarget,
+    kwargs: Dict[str, Any],
+    version: str,
+) -> str:
+    material = "\0".join(
+        (
+            _OUTBOX_PRODUCER,
+            str(kwargs.get("work_id") or ""),
+            event,
+            str(kwargs.get("milestone") or event),
+            version,
+            target.url,
+        )
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+
+
 def _serialize_payload(
-    event: str, kwargs: Dict[str, Any], delivery_id: str,
+    event: str,
+    kwargs: Dict[str, Any],
+    delivery_id: str,
+    *,
+    timestamp: Optional[str] = None,
 ) -> bytes:
     """Render the POST body.  Same top-level shape as shell hooks' stdin
     (documented in :mod:`agent.shell_hooks`), plus delivery metadata.
@@ -472,11 +550,16 @@ def _serialize_payload(
         "cwd": cwd,
         "extra": extras,
         "delivery_id": delivery_id,
-        "timestamp": datetime.now(tz=timezone.utc)
-        .isoformat()
-        .replace("+00:00", "Z"),
+        "timestamp": timestamp
+        or datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z"),
     }
-    return json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        default=str,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
 
 
 def _build_delivery(
