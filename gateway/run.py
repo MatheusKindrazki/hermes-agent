@@ -22852,13 +22852,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await play_voice(guild_id, actual_path)
                 elif callable(send_voice):
                     send_voice_call = cast(Callable[..., Awaitable[Any]], send_voice)
-                    send_kwargs: Dict[str, Any] = {
-                        "chat_id": event.source.chat_id,
+                    delivery = {
+                        "action": "send_voice",
                         "audio_path": actual_path,
                         "reply_to": reply_anchor,
-                        "metadata": thread_meta,
                     }
-                    await send_voice_call(**send_kwargs)
+
+                    async def _deliver_voice(prepared_metadata):
+                        return await send_voice_call(
+                            chat_id=event.source.chat_id,
+                            audio_path=actual_path,
+                            reply_to=reply_anchor,
+                            metadata=prepared_metadata,
+                        )
+
+                    await self._deliver_external_action(
+                        adapter=adapter,
+                        chat_id=event.source.chat_id,
+                        action="send_media",
+                        content=json.dumps(
+                            delivery, sort_keys=True, separators=(",", ":")
+                        ).encode("utf-8"),
+                        payload=delivery,
+                        metadata=thread_meta,
+                        event_type="gateway_runner_auto_tts",
+                        milestone="auto-tts",
+                        deliver=_deliver_voice,
+                    )
         except Exception as e:
             logger.warning("Auto voice reply failed: %s", e, exc_info=True)
         finally:
@@ -23036,51 +23056,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         version: Optional[str] = None,
     ):
         """Apply policy/outbox at the last seam before any native egress."""
-        from gateway.egress_policy import EgressPolicy
-        from gateway.platforms.base import SendResult
-        from gateway.reliability_outbox import ReliabilityOutbox
+        from gateway.external_egress import deliver_external_action
 
-        policy = getattr(self, "_egress_policy", None) or EgressPolicy.from_config()
-        outbox = getattr(self, "_reliability_outbox", None) or ReliabilityOutbox.from_config()
-        destination = f"{type(adapter).__name__}:{chat_id}"
-        prepared, decision = policy.prepare_metadata(
+        return await deliver_external_action(
+            owner=self,
+            adapter=adapter,
+            chat_id=chat_id,
             action=action,
-            destination=destination,
             content=content,
+            payload=payload,
             metadata=metadata,
+            event_type=event_type,
+            milestone=milestone,
+            deliver=deliver,
+            version=version,
         )
-        if not decision.allowed:
-            logger.warning(
-                "Egress policy rejected %s to %s: %s",
-                event_type,
-                destination,
-                ",".join(decision.reasons),
-            )
-            return SendResult(
-                success=False,
-                error="egress_policy_rejected",
-                error_kind="egress_policy_rejected",
-            )
-        if outbox.mode == "shadow":
-            digest = hashlib.sha256(content).hexdigest()
-            receipt = outbox.enqueue_json(
-                {
-                    "schema": "kindra.outbox-payload/v1",
-                    "delivery": payload,
-                    "destination": destination,
-                    "metadata": prepared,
-                },
-                producer="hermes-agent.gateway.run",
-                work_id=str(prepared.get("work_id") or ""),
-                event_type=event_type,
-                milestone=str(prepared.get("milestone") or milestone),
-                version=str(version or digest),
-                destination=destination,
-            )
-            return SendResult(success=True, message_id=receipt.event_id)
-        if policy.mode != "off":
-            prepared["_egress_policy_checked"] = decision.mode
-        return await deliver(prepared or None)
 
     async def _deliver_external_final(
         self,
@@ -23283,6 +23273,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
 
+        async def _background_action(
+            *,
+            delivery: Dict[str, Any],
+            deliver: Callable[[Optional[Dict[str, Any]]], Awaitable[Any]],
+            action: str = "send",
+        ):
+            return await self._deliver_external_action(
+                adapter=adapter,
+                chat_id=source.chat_id,
+                action=action,
+                content=json.dumps(
+                    delivery, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8"),
+                payload=delivery,
+                metadata=_thread_metadata,
+                event_type="gateway_background_result",
+                milestone="background-complete",
+                deliver=deliver,
+            )
+
+        async def _send_background_text(content: str):
+            async def _deliver(prepared_metadata):
+                return await adapter.send(
+                    chat_id=source.chat_id,
+                    content=content,
+                    metadata=prepared_metadata,
+                )
+
+            return await _background_action(
+                delivery={"action": "send", "content": content},
+                deliver=_deliver,
+            )
+
         try:
             user_config = _load_gateway_config()
             model, runtime_kwargs = self._resolve_session_agent_runtime(
@@ -23290,10 +23313,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_config=user_config,
             )
             if not runtime_kwargs.get("api_key"):
-                await adapter.send(
-                    source.chat_id,
-                    f"❌ Background task {task_id} failed: no provider credentials configured.",
-                    metadata=_thread_metadata,
+                await _send_background_text(
+                    f"❌ Background task {task_id} failed: no provider credentials configured."
                 )
                 return
 
@@ -23399,26 +23420,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
 
                 if text_content:
-                    await adapter.send(
-                        chat_id=source.chat_id,
-                        content=header + text_content,
-                        metadata=_thread_metadata,
-                    )
+                    await _send_background_text(header + text_content)
                 elif not images and not media_files:
-                    await adapter.send(
-                        chat_id=source.chat_id,
-                        content=header + "(No response generated)",
-                        metadata=_thread_metadata,
-                    )
+                    await _send_background_text(header + "(No response generated)")
 
                 # Send extracted images
                 for image_url, alt_text in (images or []):
                     try:
-                        await adapter.send_image(
-                            chat_id=source.chat_id,
-                            image_url=image_url,
-                            caption=alt_text,
-                            metadata=_thread_metadata,
+                        delivery = {
+                            "action": "send_image",
+                            "caption": alt_text,
+                            "image_url": image_url,
+                        }
+
+                        async def _deliver_image(prepared_metadata):
+                            return await adapter.send_image(
+                                chat_id=source.chat_id,
+                                image_url=image_url,
+                                caption=alt_text,
+                                metadata=prepared_metadata,
+                            )
+
+                        await _background_action(
+                            delivery=delivery,
+                            deliver=_deliver_image,
+                            action="send_media",
                         )
                     except Exception:
                         pass
@@ -23435,47 +23461,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _ext = os.path.splitext(media_path)[1].lower()
                     try:
                         if _should_send_media_as_audio(source.platform, _ext, _is_voice):
-                            await adapter.send_voice(
-                                chat_id=source.chat_id,
-                                audio_path=media_path,
-                                metadata=_thread_metadata,
-                            )
+                            method_name = "send_voice"
+                            path_key = "audio_path"
                         elif _ext in _VIDEO_EXTS:
-                            await adapter.send_video(
-                                chat_id=source.chat_id,
-                                video_path=media_path,
-                                metadata=_thread_metadata,
-                            )
+                            method_name = "send_video"
+                            path_key = "video_path"
                         elif _ext in _IMAGE_EXTS:
-                            await adapter.send_image_file(
-                                chat_id=source.chat_id,
-                                image_path=media_path,
-                                metadata=_thread_metadata,
-                            )
+                            method_name = "send_image_file"
+                            path_key = "image_path"
                         else:
-                            await adapter.send_document(
+                            method_name = "send_document"
+                            path_key = "file_path"
+                        delivery = {
+                            "action": method_name,
+                            path_key: media_path,
+                        }
+
+                        async def _deliver_media(prepared_metadata):
+                            method = getattr(adapter, method_name)
+                            return await method(
                                 chat_id=source.chat_id,
-                                file_path=media_path,
-                                metadata=_thread_metadata,
+                                **{path_key: media_path},
+                                metadata=prepared_metadata,
                             )
+
+                        await _background_action(
+                            delivery=delivery,
+                            deliver=_deliver_media,
+                            action="send_media",
+                        )
                     except Exception:
                         pass
             else:
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-                await adapter.send(
-                    chat_id=source.chat_id,
-                    content=f'✅ Background task complete\nPrompt: "{preview}"\n\n(No response generated)',
-                    metadata=_thread_metadata,
+                await _send_background_text(
+                    f'✅ Background task complete\nPrompt: "{preview}"\n\n(No response generated)'
                 )
 
         except Exception as e:
             logger.exception("Background task %s failed", task_id)
             try:
-                await adapter.send(
-                    chat_id=source.chat_id,
-                    content=f"❌ Background task {task_id} failed: {e}",
-                    metadata=_thread_metadata,
-                )
+                await _send_background_text(f"❌ Background task {task_id} failed: {e}")
             except Exception:
                 pass
 

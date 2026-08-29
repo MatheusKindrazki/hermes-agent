@@ -8,6 +8,7 @@ and implement the required methods.
 import asyncio
 import inspect
 import ipaddress
+import json
 import logging
 import os
 import random
@@ -6391,6 +6392,33 @@ class BasePlatformAdapter(ABC):
         # never spawned, so no "typing…" / "is thinking…" status is shown.
         # typing_task stays None; _stop_typing_refresh already no-ops on None.
         _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+
+        async def _external_delivery(
+            *,
+            adapter,
+            action: str,
+            delivery: Dict[str, Any],
+            metadata: Optional[Dict[str, Any]],
+            deliver,
+            event_type: str = "gateway_adapter_final",
+            milestone: str = "turn-complete",
+        ):
+            from gateway.external_egress import deliver_external_action
+
+            return await deliver_external_action(
+                owner=self,
+                adapter=adapter,
+                chat_id=event.source.chat_id,
+                action=action,
+                content=json.dumps(
+                    delivery, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8"),
+                payload=delivery,
+                metadata=metadata,
+                event_type=event_type,
+                milestone=milestone,
+                deliver=deliver,
+            )
         typing_task: Optional[asyncio.Task] = None
         if getattr(self.config, "typing_indicator", True):
             _keep_typing_kwargs: Dict[str, Any] = {"metadata": _thread_metadata}
@@ -6608,11 +6636,28 @@ class BasePlatformAdapter(ABC):
                             and text_content[:1024] == text_content
                         ):
                             telegram_tts_caption = text_content
-                        tts_result = await self.play_tts(
-                            chat_id=event.source.chat_id,
-                            audio_path=_tts_path,
-                            caption=telegram_tts_caption,
+                        delivery = {
+                            "action": "play_tts",
+                            "audio_path": _tts_path,
+                            "caption": telegram_tts_caption,
+                        }
+
+                        async def _deliver_tts(prepared_metadata):
+                            return await self.play_tts(
+                                chat_id=event.source.chat_id,
+                                audio_path=_tts_path,
+                                caption=telegram_tts_caption,
+                                metadata=prepared_metadata,
+                            )
+
+                        tts_result = await _external_delivery(
+                            adapter=self,
+                            action="send_media",
+                            delivery=delivery,
                             metadata=_final_thread_metadata,
+                            deliver=_deliver_tts,
+                            event_type="gateway_adapter_auto_tts",
+                            milestone="auto-tts",
                         )
                         _record_delivery(tts_result)
                         _tts_caption_delivered = bool(
@@ -6692,11 +6737,20 @@ class BasePlatformAdapter(ABC):
                         except Exception:
                             logger.debug("delivery ledger record failed", exc_info=True)
                             _obligation_id = None
-                    result = await delivery_adapter._send_with_retry(
-                        chat_id=event.source.chat_id,
-                        content=text_content,
-                        reply_to=_reply_anchor,
+                    async def _deliver_text(prepared_metadata):
+                        return await delivery_adapter._send_with_retry(
+                            chat_id=event.source.chat_id,
+                            content=text_content,
+                            reply_to=_reply_anchor,
+                            metadata=prepared_metadata,
+                        )
+
+                    result = await _external_delivery(
+                        adapter=delivery_adapter,
+                        action="send",
+                        delivery={"action": "send", "content": text_content},
                         metadata=_final_thread_metadata,
+                        deliver=_deliver_text,
                     )
                     _record_delivery(result)
                     if _obligation_id is not None:
@@ -6770,11 +6824,22 @@ class BasePlatformAdapter(ABC):
                 if images:
                     logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
                     try:
-                        await self.send_multiple_images(
-                            chat_id=event.source.chat_id,
-                            images=images,
+                        async def _deliver_images(prepared_metadata):
+                            return await self.send_multiple_images(
+                                chat_id=event.source.chat_id,
+                                images=images,
+                                metadata=prepared_metadata,
+                                human_delay=human_delay,
+                            )
+
+                        await _external_delivery(
+                            adapter=self,
+                            action="send_media",
+                            delivery={"action": "send_multiple_images", "images": images},
                             metadata=_final_thread_metadata,
-                            human_delay=human_delay,
+                            deliver=_deliver_images,
+                            event_type="gateway_adapter_media",
+                            milestone="media-delivery",
                         )
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
@@ -6812,11 +6877,23 @@ class BasePlatformAdapter(ABC):
                 if _image_paths:
                     try:
                         _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
-                        await self.send_multiple_images(
-                            chat_id=event.source.chat_id,
-                            images=_batch,
+
+                        async def _deliver_image_paths(prepared_metadata):
+                            return await self.send_multiple_images(
+                                chat_id=event.source.chat_id,
+                                images=_batch,
+                                metadata=prepared_metadata,
+                                human_delay=human_delay,
+                            )
+
+                        await _external_delivery(
+                            adapter=self,
+                            action="send_media",
+                            delivery={"action": "send_multiple_images", "images": _batch},
                             metadata=_final_thread_metadata,
-                            human_delay=human_delay,
+                            deliver=_deliver_image_paths,
+                            event_type="gateway_adapter_media",
+                            milestone="media-delivery",
                         )
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
@@ -6833,11 +6910,8 @@ class BasePlatformAdapter(ABC):
                     try:
                         ext = Path(media_path).suffix.lower()
                         if should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
-                            media_result = await self.send_voice(
-                                chat_id=event.source.chat_id,
-                                audio_path=media_path,
-                                metadata=_final_thread_metadata,
-                            )
+                            method_name = "send_voice"
+                            path_key = "audio_path"
                         elif ext in _VIDEO_EXTS:
                             logger.info(
                                 "[%s] Sending video attachment (%s) to %s",
@@ -6845,17 +6919,29 @@ class BasePlatformAdapter(ABC):
                                 ext,
                                 event.source.chat_id,
                             )
-                            media_result = await self.send_video(
-                                chat_id=event.source.chat_id,
-                                video_path=media_path,
-                                metadata=_final_thread_metadata,
-                            )
+                            method_name = "send_video"
+                            path_key = "video_path"
                         else:
-                            media_result = await self.send_document(
+                            method_name = "send_document"
+                            path_key = "file_path"
+
+                        async def _deliver_media(prepared_metadata):
+                            method = getattr(self, method_name)
+                            return await method(
                                 chat_id=event.source.chat_id,
-                                file_path=media_path,
-                                metadata=_final_thread_metadata,
+                                **{path_key: media_path},
+                                metadata=prepared_metadata,
                             )
+
+                        media_result = await _external_delivery(
+                            adapter=self,
+                            action="send_media",
+                            delivery={"action": method_name, path_key: media_path},
+                            metadata=_final_thread_metadata,
+                            deliver=_deliver_media,
+                            event_type="gateway_adapter_media",
+                            milestone="media-delivery",
+                        )
 
                         if not media_result.success:
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
@@ -6875,17 +6961,29 @@ class BasePlatformAdapter(ABC):
                     try:
                         ext = Path(file_path).suffix.lower()
                         if ext in _VIDEO_EXTS:
-                            file_result = await self.send_video(
-                                chat_id=event.source.chat_id,
-                                video_path=file_path,
-                                metadata=_final_thread_metadata,
-                            )
+                            method_name = "send_video"
+                            path_key = "video_path"
                         else:
-                            file_result = await self.send_document(
+                            method_name = "send_document"
+                            path_key = "file_path"
+
+                        async def _deliver_local(prepared_metadata):
+                            method = getattr(self, method_name)
+                            return await method(
                                 chat_id=event.source.chat_id,
-                                file_path=file_path,
-                                metadata=_final_thread_metadata,
+                                **{path_key: file_path},
+                                metadata=prepared_metadata,
                             )
+
+                        file_result = await _external_delivery(
+                            adapter=self,
+                            action="send_media",
+                            delivery={"action": method_name, path_key: file_path},
+                            metadata=_final_thread_metadata,
+                            deliver=_deliver_local,
+                            event_type="gateway_adapter_media",
+                            milestone="media-delivery",
+                        )
                         if not file_result.success:
                             logger.warning(
                                 "[%s] Failed to send local file (%s): %s",
