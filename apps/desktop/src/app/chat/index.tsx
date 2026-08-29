@@ -64,7 +64,7 @@ import type { ModelOptionsResponse } from '@/types/hermes'
 import { primaryRouteSelectedSessionId, routeSessionId } from '../routes'
 import { titlebarHeaderBaseClass, titlebarHeaderShadowClass, titlebarHeaderTitleClass } from '../shell/titlebar'
 
-import { resolveActiveContext } from './active-context'
+import { type ActiveContext, activeContextCanSubmit, resolveActiveContext } from './active-context'
 import { ActiveContextChip } from './active-context-chip'
 import { ChatDropOverlay } from './chat-drop-overlay'
 import { ChatSwapOverlay, ChatSyncBadge } from './chat-swap-overlay'
@@ -117,9 +117,12 @@ interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   onRetryResume: (sessionId: string) => void
   onTranscribeAudio?: (audio: Blob) => Promise<string>
   onDismissError?: (messageId: string) => void
+  /** Internal/default-off rollout gate for kindra.active-context/v1. */
+  identityV2Enabled?: boolean
 }
 
 interface ChatHeaderProps {
+  activeContext?: ActiveContext
   activeSessionId: null | string
   isRoutedSessionView: boolean
   onDeleteSelectedSession: () => void
@@ -131,6 +134,7 @@ interface ChatHeaderProps {
 }
 
 function ChatHeader({
+  activeContext: suppliedActiveContext,
   activeSessionId,
   isRoutedSessionView,
   onDeleteSelectedSession,
@@ -168,17 +172,27 @@ function ChatHeader({
   // resolve-target-session applies. Reading the selected id instead is exactly
   // how the visible identity and the real destination came apart.
   const targetStoredSessionId = routedSessionId ?? selectedSessionId
-  const activeContext = useMemo(
+
+  const newChatRoute = useMemo(() => {
+    // The resolver reads these atoms imperatively; touch the subscribed values
+    // so React recomputes in the same render that moves the send authority.
+    void activeConnectionId
+    void activeGatewayProfile
+
+    return resolveNewChatOwnerRoute()
+  }, [activeConnectionId, activeGatewayProfile])
+
+  const derivedActiveContext = useMemo(
     () =>
       resolveActiveContext({
-        newChatRoute: resolveNewChatOwnerRoute(),
+        newChatRoute,
         owner: knownSessionOwner(sessions, targetStoredSessionId),
         targetStoredSessionId
       }),
-    // activeGatewayProfile/activeConnectionId are inputs to
-    // resolveNewChatOwnerRoute(), not unused: they are what make this recompute.
-    [activeConnectionId, activeGatewayProfile, sessions, targetStoredSessionId]
+    [newChatRoute, sessions, targetStoredSessionId]
   )
+
+  const activeContext = suppliedActiveContext ?? derivedActiveContext
   const showProfileTag = profiles.length > 1 && Boolean(activeStoredSession)
   const showContext = profiles.length > 1 || (connectionsRegistry?.connections.length ?? 0) > 1
 
@@ -219,7 +233,9 @@ function ChatHeader({
         }}
       >
         {showProfileTag && <ProfileTag className="pointer-events-auto mr-1.5" profile={activeStoredSession?.profile} />}
-        {showContext && <ActiveContextChip className="pointer-events-auto mr-1.5 inline-flex items-center" context={activeContext} />}
+        {showContext && (
+          <ActiveContextChip className="pointer-events-auto mr-1.5 inline-flex items-center" context={activeContext} />
+        )}
         <SessionActionsMenu
           align="start"
           onDelete={selectedSessionId ? onDeleteSelectedSession : undefined}
@@ -438,7 +454,8 @@ const ChatViewContent = memo(function ChatViewContent({
   onRestoreToMessage,
   onRetryResume,
   onTranscribeAudio,
-  onDismissError
+  onDismissError,
+  identityV2Enabled = false
 }: ChatViewProps) {
   const location = useLocation()
   const { t } = useI18n()
@@ -463,6 +480,8 @@ const ChatViewContent = memo(function ChatViewContent({
   const awaitingResponse = useStore(view.$awaitingResponse)
   const busy = useStore(view.$busy)
   const activeGatewayProfile = useStore($activeGatewayProfile)
+  const activeConnectionId = useStore($activeConnectionId)
+  const connectionsRegistry = useStore($connectionsRegistry)
   const contextSuggestions = useStore($contextSuggestions)
   // Per-session (SessionView) reads — a tile IS its session, so these come
   // from the view slice, not the global atoms (which track the primary only).
@@ -537,6 +556,74 @@ const ChatViewContent = memo(function ChatViewContent({
   // A tile IS its session — no route involved, never "mismatched".
   const routedSessionId = isPrimary ? routeSessionId(location.pathname) : selectedSessionId
   const isRoutedSessionView = Boolean(routedSessionId)
+  const targetStoredSessionId = routedSessionId ?? selectedSessionId
+
+  const targetSession = targetStoredSessionId
+    ? (sessions.find(session => sessionMatchesStoredId(session, targetStoredSessionId)) ?? null)
+    : null
+
+  const owner = knownSessionOwner(sessions, targetStoredSessionId)
+
+  const draftRoute = useMemo(() => {
+    void activeConnectionId
+    void activeGatewayProfile
+
+    return resolveNewChatOwnerRoute()
+  }, [activeConnectionId, activeGatewayProfile])
+
+  const ownerConnectionId =
+    owner && typeof owner === 'object' && 'connectionId' in owner
+      ? owner.connectionId
+      : targetSession?.connection_id || draftRoute?.connectionId || activeConnectionId
+
+  const ownerProfile =
+    owner && typeof owner === 'object' && 'connectionId' in owner
+      ? owner.targetProfile || owner.profile
+      : typeof owner === 'string'
+        ? owner
+        : targetSession?.profile || draftRoute?.profile || activeGatewayProfile
+
+  const registryConnection = connectionsRegistry?.connections.find(connection => connection.id === ownerConnectionId)
+
+  const activeContext = useMemo(
+    () =>
+      resolveActiveContext({
+        activeRuntimeSessionId: activeSessionId,
+        correlation: {
+          connectionId: ownerConnectionId || null,
+          gatewayGeneration: targetSession?.gateway_generation ?? null,
+          machine: targetSession?.machine || registryConnection?.installId || registryConnection?.label || null,
+          profile: ownerProfile || null,
+          runtimeSessionId: targetSession?.runtime_session_id || activeSessionId || null,
+          storedSessionId: targetStoredSessionId,
+          tenant: targetSession?.tenant ?? null,
+          workId: targetSession?.work_id ?? null,
+          xirpSessionId: targetSession?.xirp_session_id ?? null
+        },
+        identityV2: identityV2Enabled,
+        newChatRoute: draftRoute,
+        owner,
+        targetStoredSessionId
+      }),
+    [
+      activeSessionId,
+      draftRoute,
+      identityV2Enabled,
+      owner,
+      ownerConnectionId,
+      ownerProfile,
+      registryConnection,
+      targetSession,
+      targetStoredSessionId
+    ]
+  )
+
+  const contextAllowsSubmit = activeContextCanSubmit(activeContext, identityV2Enabled)
+
+  const submitWithContextGuard = useCallback(
+    (text: string, options?: SubmitTextOptions) => (contextAllowsSubmit ? onSubmit(text, options) : false),
+    [contextAllowsSubmit, onSubmit]
+  )
 
   // The URL points at a session the store hasn't loaded yet (sidebar / cmd-K /
   // direct nav). Derived in render so the swap reads instantly: the same frame
@@ -672,6 +759,7 @@ const ChatViewContent = memo(function ChatViewContent({
           prompt overlays stay active-session-scoped in the primary surface. */}
       {isPrimary && (
         <ChatHeader
+          activeContext={activeContext}
           activeSessionId={activeSessionId}
           isRoutedSessionView={isRoutedSessionView}
           onDeleteSelectedSession={onDeleteSelectedSession}
@@ -761,7 +849,7 @@ const ChatViewContent = memo(function ChatViewContent({
             <ChatBar
               busy={busy}
               cwd={currentCwd}
-              disabled={!gatewayOpen}
+              disabled={!gatewayOpen || !contextAllowsSubmit}
               focusKey={activeSessionId}
               gateway={gateway}
               maxRecordingSeconds={maxVoiceRecordingSeconds}
@@ -777,7 +865,7 @@ const ChatViewContent = memo(function ChatViewContent({
               onPickImages={onPickImages}
               onRemoveAttachment={onRemoveAttachment}
               onSteer={onSteer}
-              onSubmit={onSubmit}
+              onSubmit={submitWithContextGuard}
               onTranscribeAudio={onTranscribeAudio}
               queueSessionKey={queueSessionKey}
               sessionId={activeSessionId}

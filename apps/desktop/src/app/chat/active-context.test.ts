@@ -3,13 +3,73 @@ import { describe, expect, it } from 'vitest'
 import { NEW_CHAT_ROUTE, routeSessionId, SETTINGS_ROUTE } from '../routes'
 
 import {
+  activeContextCanSubmit,
   activeContextLabels,
   resolveActiveContext,
   sameActiveContext,
   shouldPreserveRouteAcrossGatewaySwitch
 } from './active-context'
 
+const V2_CORRELATION = {
+  connectionId: 'homelab',
+  gatewayGeneration: 'gateway-sha',
+  machine: 'personal-mac-mini',
+  profile: 'research',
+  runtimeSessionId: 'runtime-a',
+  storedSessionId: 'chat-a',
+  tenant: 'research-team',
+  workId: 'work-1',
+  xirpSessionId: null
+}
+
 describe('resolveActiveContext', () => {
+  it('emits the complete v1 correlation contract when every authority agrees', () => {
+    const context = resolveActiveContext({
+      activeRuntimeSessionId: 'runtime-a',
+      correlation: V2_CORRELATION,
+      identityV2: true,
+      newChatRoute: null,
+      owner: { connectionId: 'homelab', profile: 'research' },
+      targetStoredSessionId: 'chat-a'
+    })
+
+    expect(context).toMatchObject({
+      schema: 'kindra.active-context/v1',
+      connectionId: 'homelab',
+      gatewayGeneration: 'gateway-sha',
+      machine: 'personal-mac-mini',
+      profile: 'research',
+      runtimeSessionId: 'runtime-a',
+      source: 'session',
+      storedSessionId: 'chat-a',
+      tenant: 'research-team',
+      workId: 'work-1',
+      xirpSessionId: null
+    })
+    expect(activeContextCanSubmit(context, true)).toBe(true)
+  })
+
+  it.each([
+    ['route connection', { connectionId: 'other' }],
+    ['profile', { profile: 'other' }],
+    ['gateway generation', { gatewayGeneration: null }],
+    ['runtime SID', { runtimeSessionId: 'runtime-b' }],
+    ['stored SID', { storedSessionId: 'chat-b' }]
+  ])('reports unknown and blocks v2 submit on %s divergence', (_label, patch) => {
+    const context = resolveActiveContext({
+      activeRuntimeSessionId: 'runtime-a',
+      correlation: { ...V2_CORRELATION, ...patch },
+      identityV2: true,
+      newChatRoute: null,
+      owner: { connectionId: 'homelab', profile: 'research' },
+      targetStoredSessionId: 'chat-a'
+    })
+
+    expect(context.source).toBe('unknown')
+    expect(context.reasonCodes?.length ?? 0).toBeGreaterThan(0)
+    expect(activeContextCanSubmit(context, true)).toBe(false)
+  })
+
   it('names the session own owner, not whatever backend the window is showing', () => {
     const context = resolveActiveContext({
       newChatRoute: { connectionId: 'ambient-conn', profile: 'ambient' },
@@ -17,7 +77,7 @@ describe('resolveActiveContext', () => {
       targetStoredSessionId: 'chat-a'
     })
 
-    expect(context).toEqual({
+    expect(context).toMatchObject({
       connectionId: 'homelab',
       profile: 'research',
       source: 'session',
@@ -34,7 +94,7 @@ describe('resolveActiveContext', () => {
       targetStoredSessionId: null
     })
 
-    expect(context).toEqual({
+    expect(context).toMatchObject({
       connectionId: 'work-laptop',
       profile: 'default',
       source: 'draft',
@@ -52,7 +112,7 @@ describe('resolveActiveContext', () => {
       targetStoredSessionId: 'chat-from-a-backend-we-left'
     })
 
-    expect(context).toEqual({
+    expect(context).toMatchObject({
       connectionId: null,
       profile: null,
       source: 'unknown',
@@ -91,7 +151,7 @@ describe('resolveActiveContext', () => {
       targetStoredSessionId: '   '
     })
 
-    expect(context).toEqual({
+    expect(context).toMatchObject({
       connectionId: null,
       profile: null,
       source: 'draft',
@@ -108,7 +168,7 @@ describe('resolveActiveContext', () => {
       targetStoredSessionId: null
     })
 
-    expect(context).toEqual({
+    expect(context).toMatchObject({
       connectionId: null,
       profile: null,
       source: 'draft',
@@ -194,10 +254,7 @@ describe('activeContextLabels', () => {
 
   it('never produces empty visible text', () => {
     for (const source of ['draft', 'session', 'unknown'] as const) {
-      const labels = activeContextLabels(
-        { connectionId: null, profile: null, source, storedSessionId: null },
-        null
-      )
+      const labels = activeContextLabels({ connectionId: null, profile: null, source, storedSessionId: null }, null)
 
       expect(labels.text.trim().length).toBeGreaterThan(0)
     }
