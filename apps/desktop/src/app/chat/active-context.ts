@@ -283,6 +283,7 @@ export function activeContextLabels(
 ): ActiveContextLabels {
   const profile = context.profile ?? copy.unknownProfile
   const tenant = context.tenant?.trim() || copy.unknownTenant
+
   const device =
     connectionLabel?.trim() || context.machine?.trim() || context.connectionId?.trim() || copy.unknownDevice
 

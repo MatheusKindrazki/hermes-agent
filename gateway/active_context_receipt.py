@@ -84,4 +84,3 @@ def load_profile_config(home: Path) -> Mapping[str, Any]:
         return load_config_readonly()
     finally:
         reset_hermes_home_override(token)
-
