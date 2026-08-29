@@ -22950,10 +22950,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if image_paths:
                 try:
                     images = [(f"file://{_quote(p)}", "") for p in image_paths]
-                    await adapter.send_multiple_images(
+                    delivery = {"action": "send_multiple_images", "images": images}
+
+                    async def _send_images(prepared_metadata):
+                        return await adapter.send_multiple_images(
+                            chat_id=event.source.chat_id,
+                            images=images,
+                            metadata=prepared_metadata,
+                        )
+
+                    await GatewayRunner._deliver_external_action(
+                        self,
+                        adapter=adapter,
                         chat_id=event.source.chat_id,
-                        images=images,
+                        action="send_media",
+                        content=json.dumps(
+                            delivery, sort_keys=True, separators=(",", ":")
+                        ).encode("utf-8"),
+                        payload=delivery,
                         metadata=_thread_meta,
+                        event_type="gateway_runner_media",
+                        milestone="media-delivery",
+                        deliver=_send_images,
                     )
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
@@ -22962,28 +22980,107 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 try:
                     ext = Path(media_path).suffix.lower()
                     if should_send_media_as_audio(event.source.platform, ext, is_voice=is_voice):
-                        await adapter.send_voice(
-                            chat_id=event.source.chat_id,
-                            audio_path=media_path,
-                            metadata=_thread_meta,
-                        )
+                        method_name = "send_voice"
+                        path_key = "audio_path"
                     elif ext in _VIDEO_EXTS:
-                        await adapter.send_video(
-                            chat_id=event.source.chat_id,
-                            video_path=media_path,
-                            metadata=_thread_meta,
-                        )
+                        method_name = "send_video"
+                        path_key = "video_path"
                     else:
-                        await adapter.send_document(
+                        method_name = "send_document"
+                        path_key = "file_path"
+                    delivery = {
+                        "action": method_name,
+                        path_key: str(media_path),
+                    }
+
+                    async def _send_media(prepared_metadata):
+                        method = getattr(adapter, method_name)
+                        return await method(
                             chat_id=event.source.chat_id,
-                            file_path=media_path,
-                            metadata=_thread_meta,
+                            **{path_key: media_path},
+                            metadata=prepared_metadata,
                         )
+
+                    await GatewayRunner._deliver_external_action(
+                        self,
+                        adapter=adapter,
+                        chat_id=event.source.chat_id,
+                        action="send_media",
+                        content=json.dumps(
+                            delivery, sort_keys=True, separators=(",", ":")
+                        ).encode("utf-8"),
+                        payload=delivery,
+                        metadata=_thread_meta,
+                        event_type="gateway_runner_media",
+                        milestone="media-delivery",
+                        deliver=_send_media,
+                    )
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
 
         except Exception as e:
             logger.warning("Post-stream media extraction failed: %s", e)
+
+    async def _deliver_external_action(
+        self,
+        *,
+        adapter,
+        chat_id: str,
+        action: str,
+        content: bytes,
+        payload: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]],
+        event_type: str,
+        milestone: str,
+        deliver: Callable[[Optional[Dict[str, Any]]], Awaitable[Any]],
+        version: Optional[str] = None,
+    ):
+        """Apply policy/outbox at the last seam before any native egress."""
+        from gateway.egress_policy import EgressPolicy
+        from gateway.platforms.base import SendResult
+        from gateway.reliability_outbox import ReliabilityOutbox
+
+        policy = getattr(self, "_egress_policy", None) or EgressPolicy.from_config()
+        outbox = getattr(self, "_reliability_outbox", None) or ReliabilityOutbox.from_config()
+        destination = f"{type(adapter).__name__}:{chat_id}"
+        prepared, decision = policy.prepare_metadata(
+            action=action,
+            destination=destination,
+            content=content,
+            metadata=metadata,
+        )
+        if not decision.allowed:
+            logger.warning(
+                "Egress policy rejected %s to %s: %s",
+                event_type,
+                destination,
+                ",".join(decision.reasons),
+            )
+            return SendResult(
+                success=False,
+                error="egress_policy_rejected",
+                error_kind="egress_policy_rejected",
+            )
+        if outbox.mode == "shadow":
+            digest = hashlib.sha256(content).hexdigest()
+            receipt = outbox.enqueue_json(
+                {
+                    "schema": "kindra.outbox-payload/v1",
+                    "delivery": payload,
+                    "destination": destination,
+                    "metadata": prepared,
+                },
+                producer="hermes-agent.gateway.run",
+                work_id=str(prepared.get("work_id") or ""),
+                event_type=event_type,
+                milestone=str(prepared.get("milestone") or milestone),
+                version=str(version or digest),
+                destination=destination,
+            )
+            return SendResult(success=True, message_id=receipt.event_id)
+        if policy.mode != "off":
+            prepared["_egress_policy_checked"] = decision.mode
+        return await deliver(prepared or None)
 
     async def _deliver_external_final(
         self,
@@ -22995,63 +23092,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         message_id: Optional[str] = None,
     ):
         """Gate the completed external text before send/edit reconciliation."""
-        from gateway.egress_policy import EgressPolicy
-        from gateway.platforms.base import SendResult
-        from gateway.reliability_outbox import ReliabilityOutbox
+        async def _deliver(prepared_metadata):
+            if message_id:
+                return await adapter.edit_message(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    content=content,
+                    finalize=True,
+                    metadata=prepared_metadata,
+                )
+            return await adapter.send(chat_id, content, metadata=prepared_metadata)
 
-        policy = getattr(self, "_egress_policy", None) or EgressPolicy.from_config()
-        outbox = getattr(self, "_reliability_outbox", None) or ReliabilityOutbox.from_config()
-        destination = f"{type(adapter).__name__}:{chat_id}"
-        prepared, decision = policy.prepare_metadata(
+        identity = dict(metadata or {})
+        return await self._deliver_external_action(
+            adapter=adapter,
+            chat_id=chat_id,
             action="edit" if message_id else "send",
-            destination=destination,
             content=content.encode("utf-8"),
-            metadata=metadata,
+            payload={"action": "edit" if message_id else "send", "content": content},
+            metadata=identity,
+            event_type="gateway_runner_final",
+            milestone="turn-complete",
+            version=str(
+                identity.get("version")
+                or identity.get("client_turn_id")
+                or identity.get("session_id")
+                or ""
+            )
+            or None,
+            deliver=_deliver,
         )
-        if not decision.allowed:
-            logger.warning(
-                "Egress policy rejected runner final to %s: %s",
-                destination,
-                ",".join(decision.reasons),
-            )
-            return SendResult(
-                success=False,
-                error="egress_policy_rejected",
-                error_kind="egress_policy_rejected",
-            )
-        if outbox.mode == "shadow":
-            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-            receipt = outbox.enqueue_json(
-                {
-                    "schema": "kindra.outbox-payload/v1",
-                    "content": content,
-                    "destination": destination,
-                    "metadata": prepared,
-                },
-                producer="hermes-agent.gateway.run",
-                work_id=str(prepared.get("work_id") or ""),
-                event_type="gateway_runner_final",
-                milestone=str(prepared.get("milestone") or "turn-complete"),
-                version=str(
-                    prepared.get("version")
-                    or prepared.get("client_turn_id")
-                    or prepared.get("session_id")
-                    or digest
-                ),
-                destination=destination,
-            )
-            return SendResult(success=True, message_id=receipt.event_id)
-        if policy.mode != "off":
-            prepared["_egress_policy_checked"] = decision.mode
-        if message_id:
-            return await adapter.edit_message(
-                chat_id=chat_id,
-                message_id=message_id,
-                content=content,
-                finalize=True,
-                metadata=prepared or None,
-            )
-        return await adapter.send(chat_id, content, metadata=prepared or None)
 
     async def _deliver_queued_first_response(
         self,
@@ -24638,6 +24708,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await self._send_update_notification()
             return
 
+        async def _send_update_text(
+            text: str,
+            *,
+            event_type: str = "gateway_update_notification",
+            milestone: str = "update-progress",
+        ):
+            send_metadata = _non_conversational_metadata(metadata, platform=platform)
+
+            async def _deliver(prepared_metadata):
+                return await adapter.send(
+                    chat_id,
+                    text,
+                    metadata=prepared_metadata,
+                )
+
+            return await GatewayRunner._deliver_external_action(
+                self,
+                adapter=adapter,
+                chat_id=chat_id,
+                action="send_notification",
+                content=text.encode("utf-8"),
+                payload={"action": "send", "content": text},
+                metadata=send_metadata,
+                event_type=event_type,
+                milestone=milestone,
+                deliver=_deliver,
+            )
+
         def _strip_ansi(text: str) -> str:
             from tools.ansi_strip import strip_ansi
             return strip_ansi(text)
@@ -24673,10 +24771,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             chunks = [clean[i:i + max_chunk] for i in range(0, len(clean), max_chunk)]
             for chunk in chunks:
                 try:
-                    await adapter.send(
-                        chat_id,
+                    await _send_update_text(
                         f"```\n{chunk}\n```",
-                        metadata=_non_conversational_metadata(metadata, platform=platform),
+                        event_type="gateway_update_progress",
+                        milestone="update-progress",
                     )
                 except Exception as e:
                     logger.debug("Update stream send failed: %s", e)
@@ -24699,16 +24797,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     exit_code_raw = exit_code_path.read_text(encoding="utf-8").strip() or "1"
                     exit_code = int(exit_code_raw)
                     if exit_code == 0:
-                        await adapter.send(
-                            chat_id,
+                        await _send_update_text(
                             "✅ Hermes update finished.",
-                            metadata=_non_conversational_metadata(metadata, platform=platform),
+                            milestone="update-complete",
                         )
                     else:
-                        await adapter.send(
-                            chat_id,
+                        await _send_update_text(
                             "❌ Hermes update failed (exit code {}).".format(exit_code),
-                            metadata=_non_conversational_metadata(metadata, platform=platform),
+                            milestone="update-complete",
                         )
                     logger.info("Update finished (exit=%s), notified %s", exit_code, session_key)
                 except Exception as e:
@@ -24761,26 +24857,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         sent_buttons = False
                         if getattr(type(adapter), "send_update_prompt", None) is not None:
                             try:
-                                await adapter.send_update_prompt(
-                                    chat_id=chat_id,
-                                    prompt=prompt_text,
-                                    default=default,
-                                    session_key=session_key,
-                                    metadata=_non_conversational_metadata(metadata, platform=platform),
+                                prompt_metadata = _non_conversational_metadata(
+                                    metadata, platform=platform
                                 )
-                                sent_buttons = True
+
+                                async def _deliver_prompt(prepared_metadata):
+                                    return await adapter.send_update_prompt(
+                                        chat_id=chat_id,
+                                        prompt=prompt_text,
+                                        default=default,
+                                        session_key=session_key,
+                                        metadata=prepared_metadata,
+                                    )
+
+                                prompt_result = await GatewayRunner._deliver_external_action(
+                                    self,
+                                    adapter=adapter,
+                                    chat_id=chat_id,
+                                    action="send_notification",
+                                    content=json.dumps(
+                                        {"default": default, "prompt": prompt_text},
+                                        sort_keys=True,
+                                        separators=(",", ":"),
+                                    ).encode("utf-8"),
+                                    payload={
+                                        "action": "send_update_prompt",
+                                        "default": default,
+                                        "prompt": prompt_text,
+                                    },
+                                    metadata=prompt_metadata,
+                                    event_type="gateway_update_prompt",
+                                    milestone="update-input-required",
+                                    deliver=_deliver_prompt,
+                                )
+                                sent_buttons = getattr(prompt_result, "success", True) is not False
                             except Exception as btn_err:
                                 logger.debug("Button-based update prompt failed: %s", btn_err)
                         if not sent_buttons:
                             default_hint = f" (default: {default})" if default else ""
                             _p = getattr(adapter, "typed_command_prefix", "/")
-                            await adapter.send(
-                                chat_id,
+                            await _send_update_text(
                                 f"⚕ **Update needs your input:**\n\n"
                                 f"{prompt_text}{default_hint}\n\n"
                                 f"Reply `{_p}approve` (yes) or `{_p}deny` (no), "
                                 f"or type your answer directly.",
-                                metadata=_non_conversational_metadata(metadata, platform=platform),
+                                event_type="gateway_update_prompt",
+                                milestone="update-input-required",
                             )
                         # Keep the prompt marker on disk until the user
                         # answers. If the gateway restarts mid-prompt, the
@@ -24803,10 +24925,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             exit_code_path.write_text("124", encoding="utf-8")
             await _flush_buffer()
             try:
-                await adapter.send(
-                    chat_id,
+                await _send_update_text(
                     "❌ Hermes update timed out after 30 minutes.",
-                    metadata=_non_conversational_metadata(metadata, platform=platform),
+                    milestone="update-timeout",
                 )
             except Exception:
                 pass
@@ -24915,10 +25036,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     msg = "✅ Hermes update finished successfully."
                 else:
                     msg = "❌ Hermes update failed. Check the gateway logs or run `hermes update` manually for details."
-                await adapter.send(
-                    chat_id,
-                    msg,
-                    metadata=_non_conversational_metadata(metadata, platform=platform),
+
+                send_metadata = _non_conversational_metadata(
+                    metadata, platform=platform
+                )
+
+                async def _deliver(prepared_metadata):
+                    return await adapter.send(
+                        chat_id,
+                        msg,
+                        metadata=prepared_metadata,
+                    )
+
+                await GatewayRunner._deliver_external_action(
+                    self,
+                    adapter=adapter,
+                    chat_id=chat_id,
+                    action="send_notification",
+                    content=msg.encode("utf-8"),
+                    payload={"action": "send", "content": msg},
+                    metadata=send_metadata,
+                    event_type="gateway_update_notification",
+                    milestone="update-complete",
+                    deliver=_deliver,
                 )
                 logger.info(
                     "Sent post-update notification to %s:%s (exit=%s)",
