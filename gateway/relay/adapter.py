@@ -26,6 +26,7 @@ from collections import OrderedDict
 from typing import Any, Callable, Dict, Optional, Tuple, cast
 
 from gateway.config import Platform, PlatformConfig
+from gateway.egress_policy import EgressPolicy
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 from gateway.relay.descriptor import CapabilityDescriptor
 from gateway.relay.media import RelayMediaClient
@@ -76,6 +77,7 @@ class RelayAdapter(BasePlatformAdapter):
         super().__init__(config, Platform.RELAY)
         self.descriptor = descriptor
         self._transport = transport
+        self._egress_policy = EgressPolicy.from_config()
         # Capability surface read by stream_consumer (getattr(..., 4096)).
         self.MAX_MESSAGE_LENGTH = descriptor.max_message_length
         # chat_id -> scope_id (server/workspace scope), learned from inbound
@@ -1672,6 +1674,41 @@ class RelayAdapter(BasePlatformAdapter):
             logger.debug("relay go_dormant failed", exc_info=True)
             return False
 
+    def _prepare_egress(
+        self,
+        *,
+        action: str,
+        destination: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> tuple[Dict[str, Any], Optional[SendResult]]:
+        prepared = dict(metadata or {})
+        checked_mode = prepared.pop("_egress_policy_checked", None)
+        if (
+            self._egress_policy.mode != "off"
+            and checked_mode == self._egress_policy.mode
+        ):
+            return prepared, None
+        prepared, decision = self._egress_policy.prepare_metadata(
+            action=action,
+            destination=destination,
+            content=content.encode("utf-8"),
+            metadata=prepared,
+        )
+        if decision.allowed:
+            return prepared, None
+        logger.warning(
+            "Egress policy rejected relay %s to %s: %s",
+            action,
+            destination,
+            ",".join(decision.reasons),
+        )
+        return prepared, SendResult(
+            success=False,
+            error="egress_policy_rejected",
+            error_kind="egress_policy_rejected",
+        )
+
     async def send_for_platform(
         self,
         logical_platform: Any,
@@ -1697,6 +1734,14 @@ class RelayAdapter(BasePlatformAdapter):
         # Gateway-internal interim marker (see send()): strip before the
         # wire; an interim send through this door also skips interception.
         _interim = bool(_sfp_metadata.pop("_interim_send", False))
+        _sfp_metadata, _egress_block = self._prepare_egress(
+            action="send",
+            destination=f"{platform_value}:{chat_id}",
+            content=content,
+            metadata=_sfp_metadata,
+        )
+        if _egress_block is not None:
+            return _egress_block
         # Finding #7 (live canary): the delivery resolver calls THIS method
         # directly (gateway/delivery.py), bypassing send() — an open native
         # stream must absorb the turn-final here too, or the stream is left
@@ -1857,6 +1902,17 @@ class RelayAdapter(BasePlatformAdapter):
         # plain-send duplicate (live finding, 2026-08-16 canary). The
         # marker is gateway-internal; strip before the wire.
         _interim = bool(send_metadata.pop("_interim_send", False))
+        destination_platform = explicit_platform or self._platform_by_chat.get(
+            str(chat_id)
+        ) or self.descriptor.platform
+        send_metadata, _egress_block = self._prepare_egress(
+            action="send",
+            destination=f"{destination_platform}:{chat_id}",
+            content=content,
+            metadata=send_metadata,
+        )
+        if _egress_block is not None:
+            return _egress_block
         # NS-658 seal-interception — checked BEFORE the explicit-platform
         # branch (finding #7, live canary): the delivery-resolver lane
         # (follow-up queue, media-accompanied finals, scheduled sends) routes
@@ -1887,6 +1943,8 @@ class RelayAdapter(BasePlatformAdapter):
                 seal.error,
             )
         if explicit_platform:
+            if self._egress_policy.mode != "off":
+                send_metadata["_egress_policy_checked"] = self._egress_policy.mode
             return await self.send_for_platform(
                 explicit_platform,
                 chat_id,
@@ -2141,6 +2199,14 @@ class RelayAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Edit a relayed message through the connector-owned platform API."""
+        edit_metadata, _egress_block = self._prepare_egress(
+            action="edit",
+            destination=f"{self._platform_by_chat.get(str(chat_id)) or self.descriptor.platform}:{chat_id}",
+            content=content,
+            metadata=metadata,
+        )
+        if _egress_block is not None:
+            return _egress_block
         if self._transport is None:
             return SendResult(success=False, error="no transport")
         result = await self._transport.send_outbound(
@@ -2154,7 +2220,8 @@ class RelayAdapter(BasePlatformAdapter):
                 # lane must signal block rendering too or streams would seal
                 # as plain text (boundary rule: every text egress lane).
                 "metadata": self._with_scope(
-                    chat_id, self._with_format_hints_for_chat(chat_id, metadata)
+                    chat_id,
+                    self._with_format_hints_for_chat(chat_id, edit_metadata),
                 ),
             },
             platform=self._platform_by_chat.get(str(chat_id)),

@@ -852,6 +852,29 @@ class TestModelsEndpoint:
 
 class TestCapabilitiesEndpoint:
     @pytest.mark.asyncio
+    async def test_capabilities_advertises_active_context_canary_separately_from_receipts(
+        self, adapter
+    ):
+        app = _create_app(adapter)
+        config = {
+            "gateway": {
+                "reliability": {
+                    "active_context": {"enabled": True},
+                }
+            }
+        }
+        with patch("hermes_cli.config.load_config", return_value=config):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/v1/capabilities")
+                data = await resp.json()
+
+        assert resp.status == 200
+        assert data["features"]["active_context_v2"] == {
+            "enabled": True,
+            "receipt_schema": "kindra.active-context/v1",
+        }
+
+    @pytest.mark.asyncio
     async def test_capabilities_advertises_plugin_safe_contract(self, adapter):
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:

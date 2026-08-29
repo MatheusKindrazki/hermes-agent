@@ -25,8 +25,118 @@ Field notes:
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, List, Optional
+
+
+@dataclass(frozen=True)
+class RequestContext:
+    """Immutable authority snapshot for one request/turn."""
+
+    profile: str
+    tenant: str
+    hermes_home: Path
+    workspace: Path
+    model: str
+    provider: str
+    approval: str
+    session_id: str
+    secret_scope_bound: bool
+
+
+_REQUEST_CONTEXT: ContextVar[Optional[RequestContext]] = ContextVar(
+    "HERMES_REQUEST_CONTEXT_V2", default=None
+)
+
+
+def _mapping(value: Any) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def request_context_v2_enabled(config: Optional[dict] = None) -> bool:
+    """Read the config.yaml gate; absent or malformed remains default-off."""
+    if config is None:
+        try:
+            from hermes_cli.config import load_config
+
+            config = load_config()
+        except Exception:
+            config = {}
+    gateway = _mapping(_mapping(config).get("gateway"))
+    reliability = _mapping(gateway.get("reliability"))
+    request_context = _mapping(reliability.get("request_context"))
+    value = request_context.get("enabled", False)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return value is True
+
+
+def compose_request_context(
+    *,
+    profile: str,
+    tenant: str,
+    model: str,
+    provider: str,
+    approval: str,
+    session_id: str,
+) -> RequestContext:
+    """Compose one request from existing home/cwd/secret authority seams."""
+    from agent.runtime_cwd import resolve_agent_cwd
+    from agent.secret_scope import current_secret_scope
+    from hermes_constants import get_hermes_home
+
+    identity = {
+        "profile": profile,
+        "tenant": tenant,
+        "model": model,
+        "provider": provider,
+        "approval": approval,
+        "session_id": session_id,
+    }
+    missing = [
+        key
+        for key, value in identity.items()
+        if not isinstance(value, str) or not value.strip()
+    ]
+    if missing:
+        raise ValueError(
+            "request context requires non-empty " + ", ".join(sorted(missing))
+        )
+    return RequestContext(
+        profile=profile.strip(),
+        tenant=tenant.strip(),
+        hermes_home=get_hermes_home(),
+        workspace=resolve_agent_cwd(),
+        model=model.strip(),
+        provider=provider.strip(),
+        approval=approval.strip(),
+        session_id=session_id.strip(),
+        secret_scope_bound=current_secret_scope() is not None,
+    )
+
+
+def current_request_context() -> Optional[RequestContext]:
+    return _REQUEST_CONTEXT.get()
+
+
+@contextmanager
+def request_context_scope(
+    request_context: RequestContext,
+    *,
+    config: Optional[dict] = None,
+):
+    """Publish the v2 context only when the config.yaml gate is enabled."""
+    if not request_context_v2_enabled(config):
+        yield None
+        return
+    token = _REQUEST_CONTEXT.set(request_context)
+    try:
+        yield request_context
+    finally:
+        _REQUEST_CONTEXT.reset(token)
 
 
 @dataclass
@@ -35,6 +145,7 @@ class TurnContext:
 
     # --- read-only turn identity / wiring -------------------------------
     source: Any = None
+    request_context: Optional[RequestContext] = None
     _run_still_current: Callable[[], bool] = None  # type: ignore[assignment]
     _live_status_adapter: Any = None
     _live_status_mode: str = "off"

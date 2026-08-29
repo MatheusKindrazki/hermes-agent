@@ -6,6 +6,7 @@ import type * as React from 'react'
 import { memo, Suspense, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useLocation } from 'react-router'
 
+import { getApiCapabilities } from '@/api/capabilities'
 import type { SubmitTextOptions } from '@/app/session/hooks/use-prompt-actions/utils'
 import { Thread } from '@/components/assistant-ui/thread'
 import { TranscriptWindowProvider } from '@/components/assistant-ui/thread/transcript-window'
@@ -64,7 +65,13 @@ import type { ModelOptionsResponse } from '@/types/hermes'
 import { primaryRouteSelectedSessionId, routeSessionId } from '../routes'
 import { titlebarHeaderBaseClass, titlebarHeaderShadowClass, titlebarHeaderTitleClass } from '../shell/titlebar'
 
-import { resolveActiveContext } from './active-context'
+import {
+  type ActiveContext,
+  activeContextCanSubmit,
+  activeContextCapabilityDecision,
+  activeContextCorrelationFromReceipt,
+  resolveActiveContext
+} from './active-context'
 import { ActiveContextChip } from './active-context-chip'
 import { ChatDropOverlay } from './chat-drop-overlay'
 import { ChatSwapOverlay, ChatSyncBadge } from './chat-swap-overlay'
@@ -89,6 +96,12 @@ import {
   transcriptBackfillAvailable
 } from './transcript-backfill'
 import { advanceTranscriptWindow, type TranscriptWindowState } from './transcript-window'
+
+// The pane tree suppresses old titlebar bands by matching this legacy height
+// token literally. Active context is no longer decorative title chrome: it is
+// the fail-closed destination receipt for Enter, so give it an explicit pane
+// height and keep it rendered in the workspace zone.
+const activeContextHeaderBaseClass = titlebarHeaderBaseClass.replace('h-(--titlebar-height)', 'h-7')
 
 interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   gateway: HermesGateway | null
@@ -117,9 +130,12 @@ interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   onRetryResume: (sessionId: string) => void
   onTranscribeAudio?: (audio: Blob) => Promise<string>
   onDismissError?: (messageId: string) => void
+  /** Internal/default-off rollout gate for kindra.active-context/v1. */
+  identityV2Enabled?: boolean
 }
 
 interface ChatHeaderProps {
+  activeContext?: ActiveContext
   activeSessionId: null | string
   isRoutedSessionView: boolean
   onDeleteSelectedSession: () => void
@@ -131,6 +147,7 @@ interface ChatHeaderProps {
 }
 
 function ChatHeader({
+  activeContext: suppliedActiveContext,
   activeSessionId,
   isRoutedSessionView,
   onDeleteSelectedSession,
@@ -168,17 +185,27 @@ function ChatHeader({
   // resolve-target-session applies. Reading the selected id instead is exactly
   // how the visible identity and the real destination came apart.
   const targetStoredSessionId = routedSessionId ?? selectedSessionId
-  const activeContext = useMemo(
+
+  const newChatRoute = useMemo(() => {
+    // The resolver reads these atoms imperatively; touch the subscribed values
+    // so React recomputes in the same render that moves the send authority.
+    void activeConnectionId
+    void activeGatewayProfile
+
+    return resolveNewChatOwnerRoute()
+  }, [activeConnectionId, activeGatewayProfile])
+
+  const derivedActiveContext = useMemo(
     () =>
       resolveActiveContext({
-        newChatRoute: resolveNewChatOwnerRoute(),
+        newChatRoute,
         owner: knownSessionOwner(sessions, targetStoredSessionId),
         targetStoredSessionId
       }),
-    // activeGatewayProfile/activeConnectionId are inputs to
-    // resolveNewChatOwnerRoute(), not unused: they are what make this recompute.
-    [activeConnectionId, activeGatewayProfile, sessions, targetStoredSessionId]
+    [newChatRoute, sessions, targetStoredSessionId]
   )
+
+  const activeContext = suppliedActiveContext ?? derivedActiveContext
   const showProfileTag = profiles.length > 1 && Boolean(activeStoredSession)
   const showContext = profiles.length > 1 || (connectionsRegistry?.connections.length ?? 0) > 1
 
@@ -210,7 +237,12 @@ function ChatHeader({
   }
 
   return (
-    <header className={cn(titlebarHeaderBaseClass, isRoutedSessionView && titlebarHeaderShadowClass)}>
+    <header
+      className={cn(
+        showContext ? activeContextHeaderBaseClass : titlebarHeaderBaseClass,
+        isRoutedSessionView && titlebarHeaderShadowClass
+      )}
+    >
       <div
         className={cn(titlebarHeaderTitleClass, (showProfileTag || showContext) && 'flex items-center')}
         style={{
@@ -219,7 +251,9 @@ function ChatHeader({
         }}
       >
         {showProfileTag && <ProfileTag className="pointer-events-auto mr-1.5" profile={activeStoredSession?.profile} />}
-        {showContext && <ActiveContextChip className="pointer-events-auto mr-1.5 inline-flex items-center" context={activeContext} />}
+        {showContext && (
+          <ActiveContextChip className="pointer-events-auto mr-1.5 inline-flex items-center" context={activeContext} />
+        )}
         <SessionActionsMenu
           align="start"
           onDelete={selectedSessionId ? onDeleteSelectedSession : undefined}
@@ -438,7 +472,8 @@ const ChatViewContent = memo(function ChatViewContent({
   onRestoreToMessage,
   onRetryResume,
   onTranscribeAudio,
-  onDismissError
+  onDismissError,
+  identityV2Enabled: identityV2Override
 }: ChatViewProps) {
   const location = useLocation()
   const { t } = useI18n()
@@ -463,6 +498,7 @@ const ChatViewContent = memo(function ChatViewContent({
   const awaitingResponse = useStore(view.$awaitingResponse)
   const busy = useStore(view.$busy)
   const activeGatewayProfile = useStore($activeGatewayProfile)
+  const activeConnectionId = useStore($activeConnectionId)
   const contextSuggestions = useStore($contextSuggestions)
   // Per-session (SessionView) reads — a tile IS its session, so these come
   // from the view slice, not the global atoms (which track the primary only).
@@ -537,6 +573,97 @@ const ChatViewContent = memo(function ChatViewContent({
   // A tile IS its session — no route involved, never "mismatched".
   const routedSessionId = isPrimary ? routeSessionId(location.pathname) : selectedSessionId
   const isRoutedSessionView = Boolean(routedSessionId)
+  const targetStoredSessionId = routedSessionId ?? selectedSessionId
+
+  const targetSession = targetStoredSessionId
+    ? (sessions.find(session => sessionMatchesStoredId(session, targetStoredSessionId)) ?? null)
+    : null
+
+  const owner = knownSessionOwner(sessions, targetStoredSessionId)
+
+  const draftRoute = useMemo(() => {
+    void activeConnectionId
+    void activeGatewayProfile
+
+    return resolveNewChatOwnerRoute()
+  }, [activeConnectionId, activeGatewayProfile])
+
+  const ownerConnectionId =
+    owner && typeof owner === 'object' && 'connectionId' in owner
+      ? owner.connectionId
+      : targetSession?.connection_id || draftRoute?.connectionId || activeConnectionId
+
+  const ownerProfile =
+    owner && typeof owner === 'object' && 'connectionId' in owner
+      ? owner.targetProfile || owner.profile
+      : typeof owner === 'string'
+        ? owner
+        : targetSession?.profile || draftRoute?.profile || activeGatewayProfile
+
+  const activeContextCapabilityQuery = useQuery({
+    queryKey: ['active-context-capability', ownerConnectionId ?? 'local', ownerProfile ?? 'default'],
+    queryFn: () =>
+      getApiCapabilities({
+        connectionId: ownerConnectionId,
+        profile: ownerProfile
+      }),
+    enabled: gatewayOpen && identityV2Override === undefined,
+    retry: false,
+    staleTime: 30_000
+  })
+
+  const activeContextCapability = activeContextCapabilityQuery.data?.features?.active_context_v2
+
+  // Capability and receipt are separate authority signals. A canary-enabled
+  // backend can legitimately have no receipt (missing identity config, draft,
+  // malformed row); that absence must block rather than silently falling back
+  // to legacy routing. Tests may force the gate through the internal prop.
+  const activeContextCapabilityDecisionResult = activeContextCapabilityDecision({
+    feature: activeContextCapability,
+    override: identityV2Override,
+    status: activeContextCapabilityQuery.status
+  })
+
+  const identityV2Enabled = activeContextCapabilityDecisionResult.v2
+
+  const activeContext = useMemo(() => {
+    // The legacy local door intentionally returns no explicit draft route:
+    // its submit is ambient. The ambient destination is still exact at this
+    // render because these two atoms are the same active connection/profile
+    // the request dispatcher uses. Carry that pair for display only; never
+    // infer either field from a title, session id, or profile name.
+    const displayedDraftRoute =
+      draftRoute ??
+      (!targetStoredSessionId && ownerConnectionId && ownerProfile
+        ? { connectionId: ownerConnectionId, profile: ownerProfile }
+        : null)
+
+    return resolveActiveContext({
+      activeRuntimeSessionId: activeSessionId,
+      correlation: activeContextCorrelationFromReceipt(targetSession?.active_context),
+      identityV2: identityV2Enabled,
+      newChatRoute: displayedDraftRoute,
+      owner,
+      targetStoredSessionId
+    })
+  }, [
+    activeSessionId,
+    draftRoute,
+    identityV2Enabled,
+    owner,
+    ownerConnectionId,
+    ownerProfile,
+    targetSession,
+    targetStoredSessionId
+  ])
+
+  const contextAllowsSubmit =
+    activeContextCapabilityDecisionResult.known && activeContextCanSubmit(activeContext, identityV2Enabled)
+
+  const submitWithContextGuard = useCallback(
+    (text: string, options?: SubmitTextOptions) => (contextAllowsSubmit ? onSubmit(text, options) : false),
+    [contextAllowsSubmit, onSubmit]
+  )
 
   // The URL points at a session the store hasn't loaded yet (sidebar / cmd-K /
   // direct nav). Derived in render so the swap reads instantly: the same frame
@@ -661,6 +788,15 @@ const ChatViewContent = memo(function ChatViewContent({
         'relative isolate flex h-full min-w-0 flex-col overflow-hidden bg-(--ui-chat-surface-background)',
         className
       )}
+      data-active-context-capability={
+        activeContextCapabilityDecisionResult.known
+          ? identityV2Enabled
+            ? 'enabled'
+            : 'disabled'
+          : activeContextCapabilityQuery.status
+      }
+      data-active-context-submit={contextAllowsSubmit ? 'allowed' : 'blocked'}
+      data-active-context-v2={identityV2Enabled ? 'enabled' : 'legacy'}
       data-chat-surface=""
       data-chat-unfocused={surfaceFocused ? undefined : ''}
       data-composer-surface-id={composerSurfaceId}
@@ -672,6 +808,7 @@ const ChatViewContent = memo(function ChatViewContent({
           prompt overlays stay active-session-scoped in the primary surface. */}
       {isPrimary && (
         <ChatHeader
+          activeContext={activeContext}
           activeSessionId={activeSessionId}
           isRoutedSessionView={isRoutedSessionView}
           onDeleteSelectedSession={onDeleteSelectedSession}
@@ -761,7 +898,7 @@ const ChatViewContent = memo(function ChatViewContent({
             <ChatBar
               busy={busy}
               cwd={currentCwd}
-              disabled={!gatewayOpen}
+              disabled={!gatewayOpen || !contextAllowsSubmit}
               focusKey={activeSessionId}
               gateway={gateway}
               maxRecordingSeconds={maxVoiceRecordingSeconds}
@@ -777,7 +914,7 @@ const ChatViewContent = memo(function ChatViewContent({
               onPickImages={onPickImages}
               onRemoveAttachment={onRemoveAttachment}
               onSteer={onSteer}
-              onSubmit={onSubmit}
+              onSubmit={submitWithContextGuard}
               onTranscribeAudio={onTranscribeAudio}
               queueSessionKey={queueSessionKey}
               sessionId={activeSessionId}

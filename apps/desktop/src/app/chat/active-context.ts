@@ -1,4 +1,6 @@
+import type { Translations } from '@/i18n'
 import type { SessionOwnerScope } from '@/store/session-request-router'
+import type { ActiveContextReceipt } from '@/types/hermes'
 
 /**
  * Who owns the destination of the next message: profile, connection, session.
@@ -10,6 +12,8 @@ import type { SessionOwnerScope } from '@/store/session-request-router'
  * introduced, and a value recomputed each render cannot reproduce it.
  */
 export interface ActiveContext {
+  /** Correlation contract version. Present on resolver-produced contexts. */
+  schema?: 'kindra.active-context/v1'
   /** The owning connection, or null when it cannot be derived — never guessed. */
   connectionId: null | string
   /** The owning profile, or null when it cannot be derived. */
@@ -22,9 +26,90 @@ export interface ActiveContext {
   source: 'draft' | 'session' | 'unknown'
   /** null on a draft. */
   storedSessionId: null | string
+  /** Backend tenant, never inferred from the profile name. */
+  tenant?: null | string
+  /** Stable machine identity/label for the owning connection. */
+  machine?: null | string
+  /** Runtime generation that minted the route/session. */
+  gatewayGeneration?: null | string
+  /** Live streaming identity; distinct from the durable stored id. */
+  runtimeSessionId?: null | string
+  xirpSessionId?: null | string
+  workId?: null | string
+  /** Stable machine-readable reasons for an unknown v2 context. */
+  reasonCodes?: readonly string[]
+}
+
+export interface ActiveContextCorrelation {
+  connectionId: null | string
+  profile: null | string
+  tenant: null | string
+  machine: null | string
+  gatewayGeneration: null | string
+  runtimeSessionId: null | string
+  storedSessionId: null | string
+  xirpSessionId: null | string
+  workId: null | string
+}
+
+export interface ActiveContextCapabilityFeature {
+  enabled?: boolean
+  receipt_schema?: string
+}
+
+/** Resolve the rollout gate without collapsing pending/error/malformed to off. */
+export function activeContextCapabilityDecision({
+  feature,
+  override,
+  status
+}: {
+  feature: ActiveContextCapabilityFeature | undefined
+  override: boolean | undefined
+  status: 'error' | 'pending' | 'success'
+}): { known: boolean; v2: boolean } {
+  if (override !== undefined) {
+    return { known: true, v2: override }
+  }
+
+  if (
+    status !== 'success' ||
+    typeof feature?.enabled !== 'boolean' ||
+    feature.receipt_schema !== 'kindra.active-context/v1'
+  ) {
+    return { known: false, v2: false }
+  }
+
+  return { known: true, v2: feature.enabled }
+}
+
+/** Translate the backend receipt without filling any identity field locally. */
+export function activeContextCorrelationFromReceipt(
+  receipt: ActiveContextReceipt | null | undefined
+): ActiveContextCorrelation | null {
+  if (receipt?.schema !== 'kindra.active-context/v1') {
+    return null
+  }
+
+  return {
+    connectionId: trimmed(receipt.connection_id),
+    profile: trimmed(receipt.profile),
+    tenant: trimmed(receipt.tenant),
+    machine: trimmed(receipt.machine),
+    gatewayGeneration: trimmed(receipt.gateway_generation),
+    runtimeSessionId: trimmed(receipt.runtime_session_id),
+    storedSessionId: trimmed(receipt.stored_session_id),
+    xirpSessionId: trimmed(receipt.xirp_session_id),
+    workId: trimmed(receipt.work_id)
+  }
 }
 
 export interface ActiveContextDeps {
+  /** The runtime currently mounted by this chat surface. */
+  activeRuntimeSessionId?: null | string
+  /** Backend/route correlation receipt. Required only while v2 is enabled. */
+  correlation?: null | ActiveContextCorrelation
+  /** Internal/default-off rollout gate. */
+  identityV2?: boolean
   /** `resolveNewChatOwnerRoute()` — where a draft would be created. */
   newChatRoute: null | { connectionId: string; profile: string }
   /** `knownSessionOwner($sessions, targetStoredSessionId)`. */
@@ -52,41 +137,109 @@ const trimmed = (value: null | string | undefined): null | string => value?.trim
  * name the wrong machine's conversation.
  */
 export function resolveActiveContext({
+  activeRuntimeSessionId,
+  correlation,
+  identityV2 = false,
   newChatRoute,
   owner,
   targetStoredSessionId
 }: ActiveContextDeps): ActiveContext {
   const storedSessionId = trimmed(targetStoredSessionId)
+  let base: ActiveContext
 
   if (!storedSessionId) {
-    return {
+    base = {
       connectionId: trimmed(newChatRoute?.connectionId),
       profile: trimmed(newChatRoute?.profile),
       source: 'draft',
       storedSessionId: null
     }
-  }
-
-  // An exact owner: the row (or hint) carried its connection.
-  if (owner && typeof owner === 'object' && 'connectionId' in owner) {
-    return {
+  } else if (owner && typeof owner === 'object' && 'connectionId' in owner) {
+    // An exact owner: the row (or hint) carried its connection.
+    base = {
       connectionId: trimmed(owner.connectionId),
       profile: trimmed(owner.targetProfile) ?? trimmed(owner.profile),
       source: 'session',
       storedSessionId
     }
+  } else {
+    // A bare profile name. Known, but NOT an identity on its own: two sources
+    // commonly both expose a `default` profile, so the connection stays null
+    // instead of borrowing the ambient one.
+    const bareProfile = typeof owner === 'string' ? trimmed(owner) : null
+
+    base = bareProfile
+      ? { connectionId: null, profile: bareProfile, source: 'session', storedSessionId }
+      : { connectionId: null, profile: null, source: 'unknown', storedSessionId }
   }
 
-  // A bare profile name. Known, but NOT an identity on its own: two sources
-  // commonly both expose a `default` profile, so the connection stays null
-  // instead of borrowing the ambient one.
-  const bareProfile = typeof owner === 'string' ? trimmed(owner) : null
+  const observed = correlation ?? null
 
-  if (bareProfile) {
-    return { connectionId: null, profile: bareProfile, source: 'session', storedSessionId }
+  const result: ActiveContext = {
+    ...base,
+    schema: 'kindra.active-context/v1',
+    tenant: trimmed(observed?.tenant),
+    machine: trimmed(observed?.machine),
+    gatewayGeneration: trimmed(observed?.gatewayGeneration),
+    runtimeSessionId: trimmed(observed?.runtimeSessionId) ?? trimmed(activeRuntimeSessionId),
+    xirpSessionId: trimmed(observed?.xirpSessionId),
+    workId: trimmed(observed?.workId),
+    reasonCodes: []
   }
 
-  return { connectionId: null, profile: null, source: 'unknown', storedSessionId }
+  if (!identityV2) {
+    return result
+  }
+
+  const reasons: string[] = []
+  const observedConnection = trimmed(observed?.connectionId)
+  const observedProfile = trimmed(observed?.profile)
+  const observedStored = trimmed(observed?.storedSessionId)
+  const observedRuntime = trimmed(observed?.runtimeSessionId)
+  const activeRuntime = trimmed(activeRuntimeSessionId)
+
+  if (!observed) {
+    reasons.push('correlation_missing')
+  }
+
+  if (!base.connectionId || observedConnection !== base.connectionId) {
+    reasons.push('connection_mismatch')
+  }
+
+  if (!base.profile || observedProfile !== base.profile) {
+    reasons.push('profile_mismatch')
+  }
+
+  if (!result.tenant) {
+    reasons.push('tenant_missing')
+  }
+
+  if (!result.machine) {
+    reasons.push('machine_missing')
+  }
+
+  if (!result.gatewayGeneration) {
+    reasons.push('gateway_generation_missing')
+  }
+
+  if (storedSessionId) {
+    if (observedStored !== storedSessionId) {
+      reasons.push('stored_session_mismatch')
+    }
+
+    if (!activeRuntime || observedRuntime !== activeRuntime) {
+      reasons.push('runtime_session_mismatch')
+    }
+  } else if (observedStored || observedRuntime || activeRuntime) {
+    reasons.push('draft_session_mismatch')
+  }
+
+  return reasons.length ? { ...result, source: 'unknown', reasonCodes: reasons } : { ...result, reasonCodes: [] }
+}
+
+/** Default-off submit gate: legacy mode never blocks; v2 fails closed. */
+export function activeContextCanSubmit(context: ActiveContext, identityV2: boolean): boolean {
+  return !identityV2 || (context.source !== 'unknown' && (context.reasonCodes?.length ?? 0) === 0)
 }
 
 /** Whether two contexts name the same destination (for change detection). */
@@ -95,7 +248,14 @@ export function sameActiveContext(a: ActiveContext, b: ActiveContext): boolean {
     a.connectionId === b.connectionId &&
     a.profile === b.profile &&
     a.source === b.source &&
-    a.storedSessionId === b.storedSessionId
+    a.storedSessionId === b.storedSessionId &&
+    (a.tenant ?? null) === (b.tenant ?? null) &&
+    (a.machine ?? null) === (b.machine ?? null) &&
+    (a.gatewayGeneration ?? null) === (b.gatewayGeneration ?? null) &&
+    (a.runtimeSessionId ?? null) === (b.runtimeSessionId ?? null) &&
+    (a.xirpSessionId ?? null) === (b.xirpSessionId ?? null) &&
+    (a.workId ?? null) === (b.workId ?? null) &&
+    (a.reasonCodes ?? []).join('\0') === (b.reasonCodes ?? []).join('\0')
   )
 }
 
@@ -126,12 +286,9 @@ export function shouldPreserveRouteAcrossGatewaySwitch(routedSessionId: null | s
 export interface ActiveContextLabels {
   /** The full sentence, for the tooltip and the accessible name. */
   detail: string
-  /** Always-visible compact text, e.g. `research · Homelab`. Never empty. */
+  /** Four visible identity dimensions. Never empty. */
   text: string
 }
-
-const UNKNOWN_PROFILE = 'unknown profile'
-const UNKNOWN_DEVICE = 'unknown device'
 
 /**
  * Compose what the chip SHOWS and what it says in full.
@@ -151,13 +308,19 @@ const UNKNOWN_DEVICE = 'unknown device'
  */
 export function activeContextLabels(
   context: ActiveContext,
-  connectionLabel: null | string
+  connectionLabel: null | string,
+  copy: Translations['activeContext']
 ): ActiveContextLabels {
-  const profile = context.profile ?? UNKNOWN_PROFILE
-  const device = connectionLabel?.trim() || context.connectionId?.trim() || UNKNOWN_DEVICE
-  const what =
-    context.source === 'draft' ? 'New chat' : context.source === 'unknown' ? 'Chat' : 'This chat'
-  const owner = context.source === 'unknown' ? `owner unknown — ${profile} on ${device}` : `${profile} on ${device}`
+  const profile = context.profile ?? copy.unknownProfile
+  const tenant = context.tenant?.trim() || copy.unknownTenant
 
-  return { detail: `${what}: ${owner}`, text: `${profile} · ${device}` }
+  const device =
+    connectionLabel?.trim() || context.machine?.trim() || context.connectionId?.trim() || copy.unknownDevice
+
+  const what = context.source === 'draft' ? copy.newChat : context.source === 'unknown' ? copy.chat : copy.thisChat
+
+  const owner =
+    context.source === 'unknown' ? copy.ownerUnknown(profile, device) : copy.ownerKnown(profile, device)
+
+  return { detail: copy.detail(what, owner, tenant), text: copy.text(what, profile, tenant, device) }
 }

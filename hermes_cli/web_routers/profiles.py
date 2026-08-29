@@ -42,6 +42,10 @@ from hermes_cli.web_models import (
     ProfileDescribeAuto,
     SessionPrScanBody,
 )
+from gateway.active_context_receipt import (
+    build_active_context_receipt,
+    load_profile_config,
+)
 
 # Same logger the handlers used before extraction (identical logger object).
 _log = logging.getLogger("hermes_cli.web_server")
@@ -306,6 +310,7 @@ def get_profiles_sessions(
             errors.append({"profile": name, "error": str(exc)})
             continue
         try:
+            receipt_config = load_profile_config(home)
             rows = db.list_sessions_rich(
                 source=source_filter,
                 sources=source_list or None,
@@ -340,6 +345,13 @@ def get_profiles_sessions(
                 )
                 s["archived"] = bool(s.get("archived"))
                 s["pinned"] = bool(s.get("pinned"))
+                receipt = build_active_context_receipt(
+                    config=receipt_config,
+                    profile=name,
+                    session=s,
+                )
+                if receipt is not None:
+                    s["active_context"] = receipt
                 merged.append(s)
         except Exception as exc:
             _warn_profile_read_error(name, exc)
@@ -427,7 +439,11 @@ def get_profiles_sessions_sidebar(
     errors: List[Dict[str, str]] = []
     now = time.time()
 
-    def _tag(rows: List[Dict[str, Any]], name: str) -> List[Dict[str, Any]]:
+    def _tag(
+        rows: List[Dict[str, Any]],
+        name: str,
+        receipt_config: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
         for s in rows:
             s["profile"] = name
             s["is_default_profile"] = name == "default"
@@ -439,6 +455,13 @@ def get_profiles_sessions_sidebar(
             # SQLite stores the pin as 0/1; the sidebar needs a real boolean to
             # render the Pinned section from server state.
             s["pinned"] = bool(s.get("pinned"))
+            receipt = build_active_context_receipt(
+                config=receipt_config,
+                profile=name,
+                session=s,
+            )
+            if receipt is not None:
+                s["active_context"] = receipt
         return rows
 
     def _slice(db, *, source=None, exclude=None, cap):
@@ -506,6 +529,7 @@ def get_profiles_sessions_sidebar(
             finally:
                 db.close()
 
+        receipt_config = dict(load_profile_config(home))
         profile_rows = slices["recents"]
         # A full window means more rows remain on disk. That is all the
         # sidebar's "load more" needs, and unlike an exact COUNT(*) per
@@ -514,10 +538,10 @@ def get_profiles_sessions_sidebar(
         # and would otherwise fake a full page on a short list.
         unpinned_count = sum(1 for s in profile_rows if not s.get("pinned"))
         recents_truncated[name] = unpinned_count >= recents_cap
-        recents_rows.extend(_tag(profile_rows, name))
+        recents_rows.extend(_tag(profile_rows, name, receipt_config))
         profile_totals[name] = slices["usage"]
-        cron_rows.extend(_tag(slices["cron"], name))
-        messaging_rows.extend(_tag(slices["messaging"], name))
+        cron_rows.extend(_tag(slices["cron"], name, receipt_config))
+        messaging_rows.extend(_tag(slices["messaging"], name, receipt_config))
 
     def _window(rows: List[Dict[str, Any]], cap: int) -> List[Dict[str, Any]]:
         rows.sort(key=lambda s: s.get("last_active") or s.get("started_at") or 0, reverse=True)

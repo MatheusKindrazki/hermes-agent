@@ -2683,7 +2683,12 @@ from gateway.session_state import (
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
-from gateway.turn_context import TurnContext
+from gateway.turn_context import (
+    TurnContext,
+    compose_request_context,
+    request_context_scope,
+    request_context_v2_enabled,
+)
 from gateway.platforms.base import (
     BasePlatformAdapter,
     EphemeralReply,
@@ -5357,6 +5362,57 @@ class TurnRunner:
             _fut.add_done_callback(_track_status_id)
 
     def run_sync(self):
+        """Execute one turn under its immutable request authority snapshot.
+
+        Runtime model/provider resolution happens exactly once when the v2
+        gate is enabled, before the snapshot is published.  The scoped body
+        is the same production turn body used when the gate is disabled, so
+        tool workers inherit the ContextVar through the gateway's
+        ``copy_context`` executor seam without falling back to process globals.
+        """
+        ctx = self._ctx
+        if not request_context_v2_enabled(ctx.user_config):
+            return self._run_sync_inner()
+
+        try:
+            model, runtime_kwargs = self._runner._resolve_session_agent_runtime(
+                source=ctx.source,
+                session_key=ctx.session_key,
+                user_config=ctx.user_config,
+            )
+            request_cfg = (
+                ((ctx.user_config or {}).get("gateway") or {})
+                .get("reliability", {})
+                .get("request_context", {})
+            )
+            source_profile = str(getattr(ctx.source, "profile", "") or "").strip()
+            profile = source_profile or str(request_cfg.get("profile") or "").strip()
+            tenant = str(request_cfg.get("tenant") or "").strip()
+            approval = str(request_cfg.get("approval") or "").strip()
+            provider = str(runtime_kwargs.get("provider") or "").strip()
+            request_context = compose_request_context(
+                profile=profile,
+                tenant=tenant,
+                model=str(model or ""),
+                provider=provider,
+                approval=approval,
+                session_id=str(ctx.session_id or ctx.session_key or ""),
+            )
+        except Exception as exc:
+            return {
+                "final_response": f"⚠️ Provider authentication failed: {exc}",
+                "messages": [],
+                "api_calls": 0,
+                "tools": [],
+            }
+
+        ctx.request_context = request_context
+        with request_context_scope(request_context, config=ctx.user_config):
+            return self._run_sync_inner(
+                resolved_runtime=(model, runtime_kwargs),
+            )
+
+    def _run_sync_inner(self, *, resolved_runtime=None):
         ctx = self._ctx
         # Historical note: as a nested closure this body declared
         # `nonlocal message` because the conditional re-assignments below
@@ -5405,11 +5461,14 @@ class TurnRunner:
         max_iterations = _current_max_iterations()
 
         try:
-            model, runtime_kwargs = self._runner._resolve_session_agent_runtime(
-                source=ctx.source,
-                session_key=ctx.session_key,
-                user_config=ctx.user_config,
-            )
+            if resolved_runtime is None:
+                model, runtime_kwargs = self._runner._resolve_session_agent_runtime(
+                    source=ctx.source,
+                    session_key=ctx.session_key,
+                    user_config=ctx.user_config,
+                )
+            else:
+                model, runtime_kwargs = resolved_runtime
             logger.debug(
                 "run_agent resolved: model=%s provider=%s session=%s",
                 model, runtime_kwargs.get("provider"), ctx.session_key or "",
@@ -22790,16 +22849,57 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             for actual_path in actual_paths:
                 if in_voice_channel:
                     play_voice = cast(Callable[..., Awaitable[Any]], play_in_voice_channel)
-                    await play_voice(guild_id, actual_path)
+                    delivery = {
+                        "action": "play_in_voice_channel",
+                        "audio_path": actual_path,
+                        "guild_id": guild_id,
+                    }
+
+                    async def _deliver_voice_channel(_prepared_metadata):
+                        return await play_voice(guild_id, actual_path)
+
+                    await self._deliver_external_action(
+                        adapter=adapter,
+                        chat_id=event.source.chat_id,
+                        action="send_media",
+                        content=json.dumps(
+                            delivery, sort_keys=True, separators=(",", ":")
+                        ).encode("utf-8"),
+                        payload=delivery,
+                        metadata=thread_meta,
+                        event_type="gateway_runner_auto_tts",
+                        milestone="auto-tts",
+                        deliver=_deliver_voice_channel,
+                    )
                 elif callable(send_voice):
                     send_voice_call = cast(Callable[..., Awaitable[Any]], send_voice)
-                    send_kwargs: Dict[str, Any] = {
-                        "chat_id": event.source.chat_id,
+                    delivery = {
+                        "action": "send_voice",
                         "audio_path": actual_path,
                         "reply_to": reply_anchor,
-                        "metadata": thread_meta,
                     }
-                    await send_voice_call(**send_kwargs)
+
+                    async def _deliver_voice(prepared_metadata):
+                        return await send_voice_call(
+                            chat_id=event.source.chat_id,
+                            audio_path=actual_path,
+                            reply_to=reply_anchor,
+                            metadata=prepared_metadata,
+                        )
+
+                    await self._deliver_external_action(
+                        adapter=adapter,
+                        chat_id=event.source.chat_id,
+                        action="send_media",
+                        content=json.dumps(
+                            delivery, sort_keys=True, separators=(",", ":")
+                        ).encode("utf-8"),
+                        payload=delivery,
+                        metadata=thread_meta,
+                        event_type="gateway_runner_auto_tts",
+                        milestone="auto-tts",
+                        deliver=_deliver_voice,
+                    )
         except Exception as e:
             logger.warning("Auto voice reply failed: %s", e, exc_info=True)
         finally:
@@ -22891,10 +22991,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if image_paths:
                 try:
                     images = [(f"file://{_quote(p)}", "") for p in image_paths]
-                    await adapter.send_multiple_images(
+                    delivery = {"action": "send_multiple_images", "images": images}
+
+                    async def _send_images(prepared_metadata):
+                        return await adapter.send_multiple_images(
+                            chat_id=event.source.chat_id,
+                            images=images,
+                            metadata=prepared_metadata,
+                        )
+
+                    await GatewayRunner._deliver_external_action(
+                        self,
+                        adapter=adapter,
                         chat_id=event.source.chat_id,
-                        images=images,
+                        action="send_media",
+                        content=json.dumps(
+                            delivery, sort_keys=True, separators=(",", ":")
+                        ).encode("utf-8"),
+                        payload=delivery,
                         metadata=_thread_meta,
+                        event_type="gateway_runner_media",
+                        milestone="media-delivery",
+                        deliver=_send_images,
                     )
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
@@ -22903,28 +23021,118 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 try:
                     ext = Path(media_path).suffix.lower()
                     if should_send_media_as_audio(event.source.platform, ext, is_voice=is_voice):
-                        await adapter.send_voice(
-                            chat_id=event.source.chat_id,
-                            audio_path=media_path,
-                            metadata=_thread_meta,
-                        )
+                        method_name = "send_voice"
+                        path_key = "audio_path"
                     elif ext in _VIDEO_EXTS:
-                        await adapter.send_video(
-                            chat_id=event.source.chat_id,
-                            video_path=media_path,
-                            metadata=_thread_meta,
-                        )
+                        method_name = "send_video"
+                        path_key = "video_path"
                     else:
-                        await adapter.send_document(
+                        method_name = "send_document"
+                        path_key = "file_path"
+                    delivery = {
+                        "action": method_name,
+                        path_key: str(media_path),
+                    }
+
+                    async def _send_media(prepared_metadata):
+                        method = getattr(adapter, method_name)
+                        return await method(
                             chat_id=event.source.chat_id,
-                            file_path=media_path,
-                            metadata=_thread_meta,
+                            **{path_key: media_path},
+                            metadata=prepared_metadata,
                         )
+
+                    await GatewayRunner._deliver_external_action(
+                        self,
+                        adapter=adapter,
+                        chat_id=event.source.chat_id,
+                        action="send_media",
+                        content=json.dumps(
+                            delivery, sort_keys=True, separators=(",", ":")
+                        ).encode("utf-8"),
+                        payload=delivery,
+                        metadata=_thread_meta,
+                        event_type="gateway_runner_media",
+                        milestone="media-delivery",
+                        deliver=_send_media,
+                    )
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
 
         except Exception as e:
             logger.warning("Post-stream media extraction failed: %s", e)
+
+    async def _deliver_external_action(
+        self,
+        *,
+        adapter,
+        chat_id: str,
+        action: str,
+        content: bytes,
+        payload: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]],
+        event_type: str,
+        milestone: str,
+        deliver: Callable[[Optional[Dict[str, Any]]], Awaitable[Any]],
+        version: Optional[str] = None,
+    ):
+        """Apply policy/outbox at the last seam before any native egress."""
+        from gateway.external_egress import deliver_external_action
+
+        return await deliver_external_action(
+            owner=self,
+            adapter=adapter,
+            chat_id=chat_id,
+            action=action,
+            content=content,
+            payload=payload,
+            metadata=metadata,
+            event_type=event_type,
+            milestone=milestone,
+            deliver=deliver,
+            version=version,
+        )
+
+    async def _deliver_external_final(
+        self,
+        *,
+        adapter,
+        chat_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        message_id: Optional[str] = None,
+    ):
+        """Gate the completed external text before send/edit reconciliation."""
+        async def _deliver(prepared_metadata):
+            if message_id:
+                return await adapter.edit_message(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    content=content,
+                    finalize=True,
+                    metadata=prepared_metadata,
+                )
+            return await adapter.send(chat_id, content, metadata=prepared_metadata)
+
+        identity = dict(metadata or {})
+        return await self._deliver_external_action(
+            adapter=adapter,
+            chat_id=chat_id,
+            action="edit" if message_id else "send",
+            content=content.encode("utf-8"),
+            payload={"action": "edit" if message_id else "send", "content": content},
+            metadata=identity,
+            event_type="gateway_runner_final",
+            milestone="turn-complete",
+            version=str(
+                identity.get("version")
+                or identity.get("client_turn_id")
+                or identity.get("session_id")
+                or ""
+            )
+            or None,
+            deliver=_deliver,
+        )
 
     async def _deliver_queued_first_response(
         self,
@@ -22957,11 +23165,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     and not getattr(stream_consumer, "_turn_split_delivery", False)
                 ):
                     try:
-                        _edit_res = await adapter.edit_message(
+                        _edit_res = await self._deliver_external_final(
+                            adapter=adapter,
                             chat_id=source.chat_id,
                             message_id=_sc_msg_id,
                             content=text_content,
-                            finalize=True,
+                            metadata=metadata,
                         )
                         if getattr(_edit_res, "success", False):
                             _reconciled = True
@@ -22975,9 +23184,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _qe,
                         )
                 if not _reconciled:
-                    await adapter.send(
-                        source.chat_id,
-                        text_content,
+                    await self._deliver_external_final(
+                        adapter=adapter,
+                        chat_id=source.chat_id,
+                        content=text_content,
                         metadata=metadata,
                     )
 
@@ -23084,6 +23294,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
 
+        async def _background_action(
+            *,
+            delivery: Dict[str, Any],
+            deliver: Callable[[Optional[Dict[str, Any]]], Awaitable[Any]],
+            action: str = "send",
+        ):
+            return await self._deliver_external_action(
+                adapter=adapter,
+                chat_id=source.chat_id,
+                action=action,
+                content=json.dumps(
+                    delivery, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8"),
+                payload=delivery,
+                metadata=_thread_metadata,
+                event_type="gateway_background_result",
+                milestone="background-complete",
+                deliver=deliver,
+            )
+
+        async def _send_background_text(content: str):
+            async def _deliver(prepared_metadata):
+                return await adapter.send(
+                    chat_id=source.chat_id,
+                    content=content,
+                    metadata=prepared_metadata,
+                )
+
+            return await _background_action(
+                delivery={"action": "send", "content": content},
+                deliver=_deliver,
+            )
+
         try:
             user_config = _load_gateway_config()
             model, runtime_kwargs = self._resolve_session_agent_runtime(
@@ -23091,10 +23334,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_config=user_config,
             )
             if not runtime_kwargs.get("api_key"):
-                await adapter.send(
-                    source.chat_id,
-                    f"❌ Background task {task_id} failed: no provider credentials configured.",
-                    metadata=_thread_metadata,
+                await _send_background_text(
+                    f"❌ Background task {task_id} failed: no provider credentials configured."
                 )
                 return
 
@@ -23200,26 +23441,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
 
                 if text_content:
-                    await adapter.send(
-                        chat_id=source.chat_id,
-                        content=header + text_content,
-                        metadata=_thread_metadata,
-                    )
+                    await _send_background_text(header + text_content)
                 elif not images and not media_files:
-                    await adapter.send(
-                        chat_id=source.chat_id,
-                        content=header + "(No response generated)",
-                        metadata=_thread_metadata,
-                    )
+                    await _send_background_text(header + "(No response generated)")
 
                 # Send extracted images
                 for image_url, alt_text in (images or []):
                     try:
-                        await adapter.send_image(
-                            chat_id=source.chat_id,
-                            image_url=image_url,
-                            caption=alt_text,
-                            metadata=_thread_metadata,
+                        delivery = {
+                            "action": "send_image",
+                            "caption": alt_text,
+                            "image_url": image_url,
+                        }
+
+                        async def _deliver_image(prepared_metadata):
+                            return await adapter.send_image(
+                                chat_id=source.chat_id,
+                                image_url=image_url,
+                                caption=alt_text,
+                                metadata=prepared_metadata,
+                            )
+
+                        await _background_action(
+                            delivery=delivery,
+                            deliver=_deliver_image,
+                            action="send_media",
                         )
                     except Exception:
                         pass
@@ -23236,47 +23482,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _ext = os.path.splitext(media_path)[1].lower()
                     try:
                         if _should_send_media_as_audio(source.platform, _ext, _is_voice):
-                            await adapter.send_voice(
-                                chat_id=source.chat_id,
-                                audio_path=media_path,
-                                metadata=_thread_metadata,
-                            )
+                            method_name = "send_voice"
+                            path_key = "audio_path"
                         elif _ext in _VIDEO_EXTS:
-                            await adapter.send_video(
-                                chat_id=source.chat_id,
-                                video_path=media_path,
-                                metadata=_thread_metadata,
-                            )
+                            method_name = "send_video"
+                            path_key = "video_path"
                         elif _ext in _IMAGE_EXTS:
-                            await adapter.send_image_file(
-                                chat_id=source.chat_id,
-                                image_path=media_path,
-                                metadata=_thread_metadata,
-                            )
+                            method_name = "send_image_file"
+                            path_key = "image_path"
                         else:
-                            await adapter.send_document(
+                            method_name = "send_document"
+                            path_key = "file_path"
+                        delivery = {
+                            "action": method_name,
+                            path_key: media_path,
+                        }
+
+                        async def _deliver_media(prepared_metadata):
+                            method = getattr(adapter, method_name)
+                            return await method(
                                 chat_id=source.chat_id,
-                                file_path=media_path,
-                                metadata=_thread_metadata,
+                                **{path_key: media_path},
+                                metadata=prepared_metadata,
                             )
+
+                        await _background_action(
+                            delivery=delivery,
+                            deliver=_deliver_media,
+                            action="send_media",
+                        )
                     except Exception:
                         pass
             else:
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-                await adapter.send(
-                    chat_id=source.chat_id,
-                    content=f'✅ Background task complete\nPrompt: "{preview}"\n\n(No response generated)',
-                    metadata=_thread_metadata,
+                await _send_background_text(
+                    f'✅ Background task complete\nPrompt: "{preview}"\n\n(No response generated)'
                 )
 
         except Exception as e:
             logger.exception("Background task %s failed", task_id)
             try:
-                await adapter.send(
-                    chat_id=source.chat_id,
-                    content=f"❌ Background task {task_id} failed: {e}",
-                    metadata=_thread_metadata,
-                )
+                await _send_background_text(f"❌ Background task {task_id} failed: {e}")
             except Exception:
                 pass
 
@@ -24509,6 +24755,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await self._send_update_notification()
             return
 
+        async def _send_update_text(
+            text: str,
+            *,
+            event_type: str = "gateway_update_notification",
+            milestone: str = "update-progress",
+        ):
+            send_metadata = _non_conversational_metadata(metadata, platform=platform)
+
+            async def _deliver(prepared_metadata):
+                return await adapter.send(
+                    chat_id,
+                    text,
+                    metadata=prepared_metadata,
+                )
+
+            return await GatewayRunner._deliver_external_action(
+                self,
+                adapter=adapter,
+                chat_id=chat_id,
+                action="send_notification",
+                content=text.encode("utf-8"),
+                payload={"action": "send", "content": text},
+                metadata=send_metadata,
+                event_type=event_type,
+                milestone=milestone,
+                deliver=_deliver,
+            )
+
         def _strip_ansi(text: str) -> str:
             from tools.ansi_strip import strip_ansi
             return strip_ansi(text)
@@ -24544,10 +24818,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             chunks = [clean[i:i + max_chunk] for i in range(0, len(clean), max_chunk)]
             for chunk in chunks:
                 try:
-                    await adapter.send(
-                        chat_id,
+                    await _send_update_text(
                         f"```\n{chunk}\n```",
-                        metadata=_non_conversational_metadata(metadata, platform=platform),
+                        event_type="gateway_update_progress",
+                        milestone="update-progress",
                     )
                 except Exception as e:
                     logger.debug("Update stream send failed: %s", e)
@@ -24570,16 +24844,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     exit_code_raw = exit_code_path.read_text(encoding="utf-8").strip() or "1"
                     exit_code = int(exit_code_raw)
                     if exit_code == 0:
-                        await adapter.send(
-                            chat_id,
+                        await _send_update_text(
                             "✅ Hermes update finished.",
-                            metadata=_non_conversational_metadata(metadata, platform=platform),
+                            milestone="update-complete",
                         )
                     else:
-                        await adapter.send(
-                            chat_id,
+                        await _send_update_text(
                             "❌ Hermes update failed (exit code {}).".format(exit_code),
-                            metadata=_non_conversational_metadata(metadata, platform=platform),
+                            milestone="update-complete",
                         )
                     logger.info("Update finished (exit=%s), notified %s", exit_code, session_key)
                 except Exception as e:
@@ -24632,26 +24904,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         sent_buttons = False
                         if getattr(type(adapter), "send_update_prompt", None) is not None:
                             try:
-                                await adapter.send_update_prompt(
-                                    chat_id=chat_id,
-                                    prompt=prompt_text,
-                                    default=default,
-                                    session_key=session_key,
-                                    metadata=_non_conversational_metadata(metadata, platform=platform),
+                                prompt_metadata = _non_conversational_metadata(
+                                    metadata, platform=platform
                                 )
-                                sent_buttons = True
+
+                                async def _deliver_prompt(prepared_metadata):
+                                    return await adapter.send_update_prompt(
+                                        chat_id=chat_id,
+                                        prompt=prompt_text,
+                                        default=default,
+                                        session_key=session_key,
+                                        metadata=prepared_metadata,
+                                    )
+
+                                prompt_result = await GatewayRunner._deliver_external_action(
+                                    self,
+                                    adapter=adapter,
+                                    chat_id=chat_id,
+                                    action="send_notification",
+                                    content=json.dumps(
+                                        {"default": default, "prompt": prompt_text},
+                                        sort_keys=True,
+                                        separators=(",", ":"),
+                                    ).encode("utf-8"),
+                                    payload={
+                                        "action": "send_update_prompt",
+                                        "default": default,
+                                        "prompt": prompt_text,
+                                    },
+                                    metadata=prompt_metadata,
+                                    event_type="gateway_update_prompt",
+                                    milestone="update-input-required",
+                                    deliver=_deliver_prompt,
+                                )
+                                sent_buttons = getattr(prompt_result, "success", True) is not False
                             except Exception as btn_err:
                                 logger.debug("Button-based update prompt failed: %s", btn_err)
                         if not sent_buttons:
                             default_hint = f" (default: {default})" if default else ""
                             _p = getattr(adapter, "typed_command_prefix", "/")
-                            await adapter.send(
-                                chat_id,
+                            await _send_update_text(
                                 f"⚕ **Update needs your input:**\n\n"
                                 f"{prompt_text}{default_hint}\n\n"
                                 f"Reply `{_p}approve` (yes) or `{_p}deny` (no), "
                                 f"or type your answer directly.",
-                                metadata=_non_conversational_metadata(metadata, platform=platform),
+                                event_type="gateway_update_prompt",
+                                milestone="update-input-required",
                             )
                         # Keep the prompt marker on disk until the user
                         # answers. If the gateway restarts mid-prompt, the
@@ -24674,10 +24972,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             exit_code_path.write_text("124", encoding="utf-8")
             await _flush_buffer()
             try:
-                await adapter.send(
-                    chat_id,
+                await _send_update_text(
                     "❌ Hermes update timed out after 30 minutes.",
-                    metadata=_non_conversational_metadata(metadata, platform=platform),
+                    milestone="update-timeout",
                 )
             except Exception:
                 pass
@@ -24786,10 +25083,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     msg = "✅ Hermes update finished successfully."
                 else:
                     msg = "❌ Hermes update failed. Check the gateway logs or run `hermes update` manually for details."
-                await adapter.send(
-                    chat_id,
-                    msg,
-                    metadata=_non_conversational_metadata(metadata, platform=platform),
+
+                send_metadata = _non_conversational_metadata(
+                    metadata, platform=platform
+                )
+
+                async def _deliver(prepared_metadata):
+                    return await adapter.send(
+                        chat_id,
+                        msg,
+                        metadata=prepared_metadata,
+                    )
+
+                await GatewayRunner._deliver_external_action(
+                    self,
+                    adapter=adapter,
+                    chat_id=chat_id,
+                    action="send_notification",
+                    content=msg.encode("utf-8"),
+                    payload={"action": "send", "content": msg},
+                    metadata=send_metadata,
+                    event_type="gateway_update_notification",
+                    milestone="update-complete",
+                    deliver=_deliver,
                 )
                 logger.info(
                     "Sent post-update notification to %s:%s (exit=%s)",
@@ -30702,11 +31018,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 elif _sc_msg_id and _sc_msg_id != "__no_edit__" and _sc_adapter is not None:
                     try:
-                        _reconcile_res = await _sc_adapter.edit_message(
+                        _reconcile_res = await self._deliver_external_final(
+                            adapter=_sc_adapter,
                             chat_id=source.chat_id,
                             message_id=_sc_msg_id,
                             content=_final,
-                            finalize=True,
+                            metadata=_status_thread_metadata,
                         )
                         if getattr(_reconcile_res, "success", True):
                             response["already_sent"] = True
@@ -30736,11 +31053,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _sc_msg_id = _sc.message_id
                 if _sc_msg_id:
                     try:
-                        await _sc.adapter.edit_message(
+                        await self._deliver_external_final(
+                            adapter=_sc.adapter,
                             chat_id=source.chat_id,
                             message_id=_sc_msg_id,
                             content=response["final_response"],
-                            finalize=True,
+                            metadata=_status_thread_metadata,
                         )
                         response["already_sent"] = True
                         logger.info(

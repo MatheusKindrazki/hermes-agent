@@ -1,10 +1,10 @@
 import { cleanup, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
+import { I18nProvider, type Locale } from '@/i18n'
 import { $connectionsRegistry } from '@/store/connection-registry-state'
 
 import type { ActiveContext } from './active-context'
-
 import { ActiveContextChip } from './active-context-chip'
 
 const REGISTRY = {
@@ -57,14 +57,30 @@ describe('ActiveContextChip', () => {
   })
 
   it('states where a draft would land', () => {
-    render(
+    const { container } = render(
       <ActiveContextChip
-        context={{ connectionId: 'this-mac', profile: 'default', source: 'draft', storedSessionId: null }}
+        context={{
+          connectionId: 'this-mac',
+          machine: 'personal-mac-mini',
+          profile: 'default',
+          source: 'draft',
+          storedSessionId: null,
+          tenant: 'kindra'
+        }}
       />
     )
 
+    const chip = container.querySelector('[data-slot="active-context-chip"]')
+
+    expect(chip).toBeTruthy()
+    expect(screen.getByText(/New chat/)).toBeTruthy()
     expect(screen.getByText(/default/)).toBeTruthy()
+    expect(screen.getByText(/kindra/)).toBeTruthy()
     expect(screen.getByText(/This Mac/)).toBeTruthy()
+    expect(chip?.getAttribute('data-active-context-conversation')).toBe('draft')
+    expect(chip?.getAttribute('data-active-context-machine')).toBe('personal-mac-mini')
+    expect(chip?.getAttribute('data-active-context-profile')).toBe('default')
+    expect(chip?.getAttribute('data-active-context-tenant')).toBe('kindra')
   })
 
   it('distinguishes two chats that share the canonical Bot Chat title', () => {
@@ -87,5 +103,23 @@ describe('ActiveContextChip', () => {
     )
 
     expect(screen.getByText(/This Mac/)).toBeTruthy()
+  })
+
+  it.each<readonly [Locale, string]>([
+    ['en', 'Chat · unknown profile · unknown tenant · unknown device'],
+    ['ja', 'チャット · 不明なプロファイル · 不明なテナント · 不明なデバイス'],
+    ['zh', '对话 · 未知配置档案 · 未知租户 · 未知设备'],
+    ['zh-hant', '對話 · 未知設定檔 · 未知租戶 · 未知裝置'],
+    ['ar', 'محادثة · ملف شخصي غير معروف · مستأجر غير معروف · جهاز غير معروف']
+  ])('renders active-context copy through the %s locale catalog', (locale, expected) => {
+    render(
+      <I18nProvider configClient={null} initialLocale={locale}>
+        <ActiveContextChip
+          context={{ connectionId: null, profile: null, source: 'unknown', storedSessionId: 'chat-a' }}
+        />
+      </I18nProvider>
+    )
+
+    expect(screen.getByText(expected)).toBeTruthy()
   })
 })
