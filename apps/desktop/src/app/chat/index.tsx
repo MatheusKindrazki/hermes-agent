@@ -623,6 +623,7 @@ const ChatViewContent = memo(function ChatViewContent({
     override: identityV2Override,
     status: activeContextCapabilityQuery.status
   })
+
   const identityV2Enabled = activeContextCapabilityDecisionResult.v2
 
   const activeContext = useMemo(() => {

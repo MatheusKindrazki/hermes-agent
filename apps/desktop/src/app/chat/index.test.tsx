@@ -329,6 +329,7 @@ describe('ChatView render isolation', () => {
     $selectedStoredSessionId.set(null)
     $sessions.set([])
     const onSubmit = vi.fn()
+
     const props = {
       gateway: null,
       onAddContextRef: vi.fn(),
@@ -350,6 +351,7 @@ describe('ChatView render isolation', () => {
       onThreadMessagesChange: vi.fn(),
       onToggleSelectedPin: vi.fn()
     }
+
     const queryClient = new QueryClient({
       defaultOptions: { queries: { retry: false } }
     })
