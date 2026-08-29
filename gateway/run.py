@@ -22926,6 +22926,74 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as e:
             logger.warning("Post-stream media extraction failed: %s", e)
 
+    async def _deliver_external_final(
+        self,
+        *,
+        adapter,
+        chat_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        message_id: Optional[str] = None,
+    ):
+        """Gate the completed external text before send/edit reconciliation."""
+        from gateway.egress_policy import EgressPolicy
+        from gateway.platforms.base import SendResult
+        from gateway.reliability_outbox import ReliabilityOutbox
+
+        policy = getattr(self, "_egress_policy", None) or EgressPolicy.from_config()
+        outbox = getattr(self, "_reliability_outbox", None) or ReliabilityOutbox.from_config()
+        destination = f"{type(adapter).__name__}:{chat_id}"
+        prepared, decision = policy.prepare_metadata(
+            action="edit" if message_id else "send",
+            destination=destination,
+            content=content.encode("utf-8"),
+            metadata=metadata,
+        )
+        if not decision.allowed:
+            logger.warning(
+                "Egress policy rejected runner final to %s: %s",
+                destination,
+                ",".join(decision.reasons),
+            )
+            return SendResult(
+                success=False,
+                error="egress_policy_rejected",
+                error_kind="egress_policy_rejected",
+            )
+        if outbox.mode == "shadow":
+            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            receipt = outbox.enqueue_json(
+                {
+                    "schema": "kindra.outbox-payload/v1",
+                    "content": content,
+                    "destination": destination,
+                    "metadata": prepared,
+                },
+                producer="hermes-agent.gateway.run",
+                work_id=str(prepared.get("work_id") or ""),
+                event_type="gateway_runner_final",
+                milestone=str(prepared.get("milestone") or "turn-complete"),
+                version=str(
+                    prepared.get("version")
+                    or prepared.get("client_turn_id")
+                    or prepared.get("session_id")
+                    or digest
+                ),
+                destination=destination,
+            )
+            return SendResult(success=True, message_id=receipt.event_id)
+        if policy.mode != "off":
+            prepared["_egress_policy_checked"] = decision.mode
+        if message_id:
+            return await adapter.edit_message(
+                chat_id=chat_id,
+                message_id=message_id,
+                content=content,
+                finalize=True,
+                metadata=prepared or None,
+            )
+        return await adapter.send(chat_id, content, metadata=prepared or None)
+
     async def _deliver_queued_first_response(
         self,
         response: str,
@@ -22957,11 +23025,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     and not getattr(stream_consumer, "_turn_split_delivery", False)
                 ):
                     try:
-                        _edit_res = await adapter.edit_message(
+                        _edit_res = await self._deliver_external_final(
+                            adapter=adapter,
                             chat_id=source.chat_id,
                             message_id=_sc_msg_id,
                             content=text_content,
-                            finalize=True,
+                            metadata=metadata,
                         )
                         if getattr(_edit_res, "success", False):
                             _reconciled = True
@@ -22975,9 +23044,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _qe,
                         )
                 if not _reconciled:
-                    await adapter.send(
-                        source.chat_id,
-                        text_content,
+                    await self._deliver_external_final(
+                        adapter=adapter,
+                        chat_id=source.chat_id,
+                        content=text_content,
                         metadata=metadata,
                     )
 
@@ -30702,11 +30772,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 elif _sc_msg_id and _sc_msg_id != "__no_edit__" and _sc_adapter is not None:
                     try:
-                        _reconcile_res = await _sc_adapter.edit_message(
+                        _reconcile_res = await self._deliver_external_final(
+                            adapter=_sc_adapter,
                             chat_id=source.chat_id,
                             message_id=_sc_msg_id,
                             content=_final,
-                            finalize=True,
+                            metadata=_status_thread_metadata,
                         )
                         if getattr(_reconcile_res, "success", True):
                             response["already_sent"] = True
@@ -30736,11 +30807,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _sc_msg_id = _sc.message_id
                 if _sc_msg_id:
                     try:
-                        await _sc.adapter.edit_message(
+                        await self._deliver_external_final(
+                            adapter=_sc.adapter,
                             chat_id=source.chat_id,
                             message_id=_sc_msg_id,
                             content=response["final_response"],
-                            finalize=True,
+                            metadata=_status_thread_metadata,
                         )
                         response["already_sent"] = True
                         logger.info(
