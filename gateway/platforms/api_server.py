@@ -148,6 +148,10 @@ from gateway.platforms.base import (
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
+from gateway.run_idempotency import (
+    RunIdempotencyConflict,
+    RunIdempotencyLedger,
+)
 from gateway.browser_control_artifacts import (
     ArtifactError,
     ArtifactRateLimiter,
@@ -1564,6 +1568,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
+        self._run_idempotency = RunIdempotencyLedger()
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
         self._session_dbs: Dict[str, Any] = {}
         self._session_db_cache_lock = threading.Lock()
@@ -7576,20 +7581,16 @@ class APIServerAdapter(BasePlatformAdapter):
         if key_err is not None:
             return key_err
 
-        # Enforce concurrency limit (shared across all agent-serving
-        # endpoints; configurable via gateway.api_server.max_concurrent_runs).
-        limited = self._concurrency_limited_response()
-        if limited is not None:
-            return limited
-
         try:
             body = await request.json()
         except Exception:
             return web.json_response(_openai_error("Invalid JSON"), status=400)
 
-        raw_input = body.get("input")
+        raw_input = body.get("input") or body.get("message")
         if not raw_input:
-            return web.json_response(_openai_error("Missing 'input' field"), status=400)
+            return web.json_response(
+                _openai_error("Missing 'input' or 'message' field"), status=400
+            )
 
         user_message = raw_input if isinstance(raw_input, str) else (raw_input[-1].get("content", "") if isinstance(raw_input, list) else "")
         if not user_message:
@@ -7655,7 +7656,114 @@ class APIServerAdapter(BasePlatformAdapter):
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
 
+        idempotency_key = str(
+            request.headers.get("Idempotency-Key") or ""
+        ).strip()
+        request_sha256 = ""
+        payload_sha256 = ""
+
+        def _deduplicated_response(existing_run_id: str) -> "web.Response":
+            response_headers = (
+                {"X-Hermes-Session-Key": gateway_session_key}
+                if gateway_session_key
+                else {}
+            )
+            return web.json_response(
+                {
+                    "run_id": existing_run_id,
+                    "status": "started",
+                    "deduplicated": True,
+                },
+                status=202,
+                headers=response_headers,
+            )
+
+        if idempotency_key:
+            if len(idempotency_key) > 200 or not all(
+                character.isalnum() or character in {":", ".", "_", "-"}
+                for character in idempotency_key
+            ):
+                return web.json_response(
+                    _openai_error(
+                        "Invalid Idempotency-Key header",
+                        code="invalid_idempotency_key",
+                    ),
+                    status=400,
+                )
+            metadata = body.get("metadata")
+            metadata = metadata if isinstance(metadata, dict) else {}
+            request_sha256 = str(
+                metadata.get("request_sha256")
+                or body.get("request_sha256")
+                or ""
+            ).strip().lower()
+            if (
+                len(request_sha256) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in request_sha256
+                )
+            ):
+                return web.json_response(
+                    _openai_error(
+                        "Idempotency-Key requires a 64-character request_sha256",
+                        code="invalid_request_sha256",
+                    ),
+                    status=400,
+                )
+            payload_sha256 = hashlib.sha256(
+                json.dumps(
+                    body,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            try:
+                existing_run_id = self._run_idempotency.lookup(
+                    idempotency_key=idempotency_key,
+                    request_sha256=request_sha256,
+                    payload_sha256=payload_sha256,
+                )
+            except RunIdempotencyConflict:
+                return web.json_response(
+                    _openai_error(
+                        "Idempotency-Key was reused for a different payload",
+                        code="idempotency_payload_mismatch",
+                    ),
+                    status=409,
+                )
+            if existing_run_id is not None:
+                return _deduplicated_response(existing_run_id)
+
+        # Let durable retries return the original receipt before applying the
+        # shared concurrency limit. A retry must not become 429 merely because
+        # the worker it already started occupies the final slot.
+        limited = self._concurrency_limited_response()
+        if limited is not None:
+            return limited
+
         run_id = f"run_{uuid.uuid4().hex}"
+        if idempotency_key:
+            try:
+                claim = self._run_idempotency.claim(
+                    idempotency_key=idempotency_key,
+                    request_sha256=request_sha256,
+                    payload_sha256=payload_sha256,
+                    proposed_run_id=run_id,
+                )
+            except RunIdempotencyConflict:
+                return web.json_response(
+                    _openai_error(
+                        "Idempotency-Key was reused for a different payload",
+                        code="idempotency_payload_mismatch",
+                    ),
+                    status=409,
+                )
+            run_id = claim.run_id
+            if not claim.inserted:
+                return _deduplicated_response(run_id)
+
         session_id = session_id or run_id
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are

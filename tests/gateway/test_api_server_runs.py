@@ -154,6 +154,75 @@ class TestStartRun:
                 assert status["object"] == "hermes.run"
 
     @pytest.mark.asyncio
+    async def test_idempotency_key_durably_starts_one_worker_and_conflicts_on_divergence(
+        self, adapter
+    ):
+        app = _create_runs_app(adapter)
+        body = {
+            "session_id": "webui-session",
+            "message": "ship the reliability fix",
+            "metadata": {"request_sha256": "a" * 64},
+        }
+        headers = {"Idempotency-Key": "turn:webui-session:7"}
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {
+                    "final_response": "done"
+                }
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                first_response, retry_response = await asyncio.gather(
+                    cli.post("/v1/runs", json=body, headers=headers),
+                    cli.post("/v1/runs", json=body, headers=headers),
+                )
+                first = await first_response.json()
+                retry = await retry_response.json()
+
+                assert first_response.status == 202
+                assert retry_response.status == 202
+                assert first["run_id"] == retry["run_id"]
+
+                for _ in range(40):
+                    if mock_create.call_count:
+                        break
+                    await asyncio.sleep(0.01)
+
+                conflict_response = await cli.post(
+                    "/v1/runs",
+                    json={
+                        **body,
+                        "message": "different payload",
+                        "metadata": {"request_sha256": "b" * 64},
+                    },
+                    headers=headers,
+                )
+                conflict = await conflict_response.json()
+
+        assert conflict_response.status == 409
+        assert conflict["error"]["code"] == "idempotency_payload_mismatch"
+        assert mock_create.call_count == 1
+
+        replacement = _make_adapter()
+        replacement_app = _create_runs_app(replacement)
+        async with TestClient(TestServer(replacement_app)) as replacement_cli:
+            with patch.object(replacement, "_create_agent") as replacement_create:
+                durable_retry_response = await replacement_cli.post(
+                    "/v1/runs",
+                    json=body,
+                    headers=headers,
+                )
+                durable_retry = await durable_retry_response.json()
+
+        assert durable_retry_response.status == 202
+        assert durable_retry["run_id"] == first["run_id"]
+        replacement_create.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_start_binds_chat_id_for_delegation_wake_target(self, adapter):
         """/v1/runs must bind the raw session id as the api_server chat_id
         (like every other agent-entry route does via _run_agent): the async
