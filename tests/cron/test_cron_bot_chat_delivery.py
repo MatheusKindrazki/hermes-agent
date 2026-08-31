@@ -13,13 +13,89 @@ import pytest
 
 from cron import scheduler as sched
 from cron.scheduler import (
+    BOT_CHAT_NOTIFY_PLATFORM,
     BOT_CHAT_PLATFORM,
     _deliver_to_bot_chat,
     _preflight_check_delivery,
     _resolve_bot_chat_target,
     _resolve_delivery_targets,
     parse_bot_chat_deliver_token,
+    parse_bot_chat_notify_deliver_token,
 )
+
+
+def test_notify_delivery_persists_in_canonical_chat_without_agent_turn(
+    tmp_path, monkeypatch
+):
+    """bot-chat-notify is a durable, passive inbox write, not a model turn."""
+    from hermes_cli import profiles
+    from hermes_state import SessionDB
+
+    root = tmp_path / ".hermes"
+    profile_home = root / "profiles" / "applauseinbox"
+    profile_home.mkdir(parents=True)
+    db = SessionDB(db_path=profile_home / "state.db")
+    db.create_session("canonical", "cli")
+    assert db.set_session_title("canonical", "Bot Chat")
+    db.close()
+
+    monkeypatch.setattr(profiles, "_get_default_hermes_home", lambda: root)
+
+    def model_turn_forbidden(*_args, **_kwargs):
+        raise AssertionError("passive delivery must not spawn a Hermes agent turn")
+
+    monkeypatch.setattr(sched.subprocess, "run", model_turn_forbidden)
+
+    def gateway_config_forbidden():
+        raise AssertionError("machine-local passive delivery needs no gateway")
+
+    monkeypatch.setattr(
+        "gateway.config.load_gateway_config", gateway_config_forbidden
+    )
+    job = {
+        "id": "slack-watch",
+        "name": "Slack Watch — Applause",
+        "deliver": "bot-chat-notify:applauseinbox",
+        "fire_claim": {"at": "2026-08-31T19:15:55-03:00", "by": "mini"},
+    }
+    error = sched._deliver_result(job, "Uma atualização material no Slack.")
+    replay_error = sched._deliver_result(
+        job, "Uma atualização material no Slack."
+    )
+
+    assert error is None
+    assert replay_error is None
+    db = SessionDB(db_path=profile_home / "state.db")
+    messages = db.get_messages_as_conversation("canonical")
+    db.close()
+    assert len(messages) == 1
+    assert messages[0]["role"] == "user"
+    assert messages[0]["display_kind"] == "internal_notification"
+    assert "[Cron delivery: Slack Watch — Applause]" in messages[0]["content"]
+    assert "Uma atualização material no Slack." in messages[0]["content"]
+
+
+def test_notify_target_is_validated_and_needs_no_gateway_credentials():
+    """The passive token is a machine-local target on create and fire."""
+    from tools.cronjob_tools import _validate_bot_chat_deliver
+
+    assert parse_bot_chat_notify_deliver_token("bot-chat-notify") == ""
+    assert (
+        parse_bot_chat_notify_deliver_token("BOT-CHAT-NOTIFY:ApplauseInbox")
+        == "ApplauseInbox"
+    )
+    with mock.patch("hermes_cli.profiles.profile_exists", return_value=True):
+        assert (
+            _validate_bot_chat_deliver("bot-chat-notify:applauseinbox") is None
+        )
+    with mock.patch("hermes_cli.profiles.profile_exists", return_value=False):
+        assert _validate_bot_chat_deliver("bot-chat-notify:ghost") is not None
+    assert (
+        _preflight_check_delivery(
+            {"id": "j1", "deliver": "bot-chat-notify:applauseinbox"}
+        )
+        is None
+    )
 
 
 # ── token parsing ────────────────────────────────────────────────────────────
@@ -211,6 +287,8 @@ def test_delivery_targets_include_local_profiles():
     ids = [t["id"] for t in targets]
     assert f"{BOT_CHAT_PLATFORM}:default" in ids
     assert f"{BOT_CHAT_PLATFORM}:research" in ids
+    assert f"{BOT_CHAT_NOTIFY_PLATFORM}:default" in ids
+    assert f"{BOT_CHAT_NOTIFY_PLATFORM}:research" in ids
     bot_chat_entries = [t for t in targets if t["id"].startswith(BOT_CHAT_PLATFORM)]
     # No gateway home channel needed for bot-chat targets.
     assert all(t["home_target_set"] for t in bot_chat_entries)

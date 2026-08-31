@@ -442,6 +442,11 @@ def _mode_guidance_notes(job: Dict[str, Any], user_deliver: Optional[str]) -> Li
                 "Targeting another profile's Bot Chat costs that bot an agent "
                 "turn per run."
             )
+        if _deliver.startswith("bot-chat-notify:"):
+            notes.append(
+                "bot-chat-notify appends a passive, durable Bot Chat notice; "
+                "it does not run the target bot."
+            )
         # platform:chat_id with no thread segment loses topic targeting —
         # warn once here instead of carrying the warning in the schema.
         for target in _deliver.split(","):
@@ -561,12 +566,18 @@ def _validate_bot_chat_deliver(deliver: Optional[str]) -> Optional[str]:
     if not deliver:
         return None
     try:
-        from cron.scheduler import parse_bot_chat_deliver_token
+        from cron.scheduler import (
+            parse_bot_chat_deliver_token,
+            parse_bot_chat_notify_deliver_token,
+        )
         from hermes_cli.profiles import normalize_profile_name, profile_exists
     except Exception:
         return None  # validation is best-effort; resolution re-checks at fire time
     for part in str(deliver).split(","):
-        profile_arg = parse_bot_chat_deliver_token(part.strip())
+        token = part.strip()
+        profile_arg = parse_bot_chat_deliver_token(token)
+        if profile_arg is None:
+            profile_arg = parse_bot_chat_notify_deliver_token(token)
         if profile_arg is None or not profile_arg:
             continue  # not a bot-chat token, or bare token (own profile)
         try:
@@ -1982,7 +1993,7 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
             },
             "deliver": {
                 "type": "string",
-                "description": "Where the job's output is POSTED as a one-way message (the job itself always runs in a fresh session with no chat context). Omit to address the chat/topic this job was created from. Otherwise: 'local' (save only, no delivery), 'all' (every connected home channel, resolved at fire time), 'bot-chat' or 'bot-chat:<profile>' (inject into a Bot Chat as a real message), or platform:chat_id:thread_id (e.g. 'telegram:-1001234567890:17585'). Comma-combine like 'origin,all'."
+                "description": "Where the job's output is POSTED as a one-way message (the job itself always runs in a fresh session with no chat context). Omit to address the chat/topic this job was created from. Otherwise: 'local' (save only, no delivery), 'all' (every connected home channel, resolved at fire time), 'bot-chat' or 'bot-chat:<profile>' (run the target bot), 'bot-chat-notify' or 'bot-chat-notify:<profile>' (passive durable notice, no target agent turn), or platform:chat_id:thread_id (e.g. 'telegram:-1001234567890:17585'). Comma-combine like 'origin,all'."
             },
             "skills": {
                 "type": "array",
