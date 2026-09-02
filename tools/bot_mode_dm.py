@@ -348,26 +348,58 @@ def message_agent_tool(
             return relayed
         return _err("You can't message yourself. Pick a teammate from the roster.")
 
+    exact_session, route_reason = _resolve_target_bot_session(
+        resolved, origin_session_id
+    )
+    if origin_session_id and not exact_session:
+        return _err(
+            f"Delivery origin session {origin_session_id!r} is not an eligible Bot Chat "
+            f"for profile '{resolved}' ({route_reason}); refusing title fallback."
+        )
+    route_argv = ["hermes", "-p", resolved]
+    if exact_session:
+        # Top-level --resume reaches the exact session (or its compression
+        # continuation), before the chat subcommand can inspect a title.
+        route_argv += ["--resume", exact_session]
+    route_argv += [
+        "chat", "--in", "~", "-c", "Bot Chat", "--create-if-missing", "-Q"
+    ]
+
     return _start_delivery(
-        [
-            "hermes",
-            "-p",
-            resolved,
-            "chat",
-            "--in",
-            "~",
-            "-c",
-            "Bot Chat",
-            "--create-if-missing",
-            "-Q",
-        ],
+        route_argv,
         prefix + body,
         f"@{_handle(resolved)}",
         stdin_file=False,
         task_id=task_id,
         agent=agent,
         origin_session_id=origin_session_id,
+        route_reason=route_reason,
     )
+
+
+def _resolve_target_bot_session(
+    profile: str, origin_session_id: Optional[str]
+) -> tuple[Optional[str], str]:
+    """Resolve an explicit destination session; title is only a labeled fallback."""
+    if not origin_session_id:
+        return None, "canonical_title_fallback"
+    try:
+        from hermes_cli.profiles import get_profile_dir
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=get_profile_dir(profile) / "state.db")
+        try:
+            row = db.get_session(str(origin_session_id))
+            if not row:
+                return None, "origin_session_not_found"
+            if str(row.get("title") or "") != "Bot Chat":
+                return None, "origin_session_not_bot_chat"
+            return db.get_compression_tip(str(origin_session_id)) or str(origin_session_id), "origin_exact"
+        finally:
+            db.close()
+    except Exception:
+        logger.debug("exact Bot Chat session resolution failed", exc_info=True)
+        return None, "origin_session_unavailable"
 
 
 def _try_relay_delivery(
@@ -543,7 +575,7 @@ def _delivery_ledger_lock(idempotency_key: str):
 
 
 def _write_delivery_receipt(
-    dm_file: str, *, origin_session_id: str, origin_reason: str, label: str, idempotency_key: str
+    dm_file: str, *, origin_session_id: str, origin_reason: str, route_reason: str, label: str, idempotency_key: str
 ) -> dict[str, str]:
     """Persist the accepted-state receipt before spawning a child process.
 
@@ -568,7 +600,7 @@ def _write_delivery_receipt(
         record = {
             "schema": "hermes.delivery/v1", "delivery_id": delivery_id,
             "origin_session_id": str(origin_session_id or ""),
-            "origin_reason": origin_reason, "target": label,
+            "origin_reason": origin_reason, "route_reason": route_reason, "target": label,
             "idempotency_key": idempotency_key, "state": "accepted",
             "accepted_at": str(int(time.time())),
         }
@@ -608,6 +640,21 @@ def _update_delivery_receipt(dm_file: str, state: str) -> None:
             os.replace(ledger_tmp, ledger)
     except (OSError, ValueError, TypeError):
         logger.debug("delivery receipt update failed", exc_info=True)
+
+
+def _release_unspawned_delivery(dm_file: Optional[str]) -> None:
+    """Remove a pre-spawn claim so the same idempotency key may retry."""
+    if not dm_file:
+        return
+    path = Path(dm_file + ".receipt.json")
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+        key = str(record.get("idempotency_key") or "")
+        if key:
+            _unlink_dm_file(str(_delivery_ledger_path(key)))
+    except (OSError, ValueError, TypeError):
+        pass
+    _unlink_dm_file(str(path))
 
 
 def _unlink_dm_file(path: str) -> None:
@@ -734,6 +781,7 @@ def _start_delivery(
     task_id: Optional[str],
     agent: Any,
     origin_session_id: Optional[str] = None,
+    route_reason: str = "canonical_title_fallback",
 ) -> str:
     """Create a DM file and transfer its cleanup ownership to the runner."""
     dm_file = _write_dm_file(content)
@@ -743,13 +791,18 @@ def _start_delivery(
         if not origin:
             _unlink_dm_file(dm_file)
             return _err("Delivery requires origin_session_id; no fallback session is available.")
+        # The durable ledger is shared by all profile processes on one Hermes
+        # install.  Scope idempotency to that install so unrelated test or
+        # tenant homes that happen to reuse a session id never suppress a send.
+        ledger_scope = str(_hermes_root(Path(_agent_home(agent))))
         idempotency_key = hashlib.sha256(
-            (origin + "\0" + label + "\0" + content).encode("utf-8")
+            (ledger_scope + "\0" + origin + "\0" + label + "\0" + content).encode("utf-8")
         ).hexdigest()
         receipt = _write_delivery_receipt(
             dm_file,
             origin_session_id=origin,
             origin_reason=origin_reason,
+            route_reason=route_reason,
             label=label,
             idempotency_key=idempotency_key,
         )
@@ -806,8 +859,10 @@ def _spawn_delivery(
             parsed = {}
         proc_id = parsed.get("session_id") or ""
         if parsed.get("error"):
+            _release_unspawned_delivery(dm_file)
             return _err(f"Delivery to {label} failed to start: {parsed['error']}")
         if not proc_id:
+            _release_unspawned_delivery(dm_file)
             return _err(f"Delivery to {label} failed to start: no process id returned")
         # From this point the background runner owns the file and removes it
         # only after the local query-file or peer stdin consumer has finished.
@@ -828,6 +883,7 @@ def _spawn_delivery(
             }
         )
     except Exception as exc:
+        _release_unspawned_delivery(dm_file)
         logger.error("message_agent delivery spawn failed: %s", exc, exc_info=True)
         return _err(f"Delivery to {label} could not be started: {exc}")
     finally:
