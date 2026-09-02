@@ -312,3 +312,51 @@ def test_typed_turn_metadata_reaches_pre_persistence_context(monkeypatch) -> Non
         )
     assert captured["task_count"] == 2
     assert captured["_compression_turn_id"].startswith("compression-turn:")
+
+
+@pytest.mark.parametrize("in_place", [True, False])
+def test_unknown_self_identity_defers_then_recovers_and_drains_once(
+    tmp_path: Path, monkeypatch, in_place: bool
+) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = f"unknown-self-{in_place}"
+    db.create_session(session_id, source="test")
+    agent = _build_agent_with_db(db, session_id)
+    agent.compression_in_place = in_place
+    spool = DurableCompressionTurnSpool(tmp_path / "compression_turn_spool")
+    spool.enqueue(
+        session_id,
+        {"role": "user", "content": "accepted while owner unavailable"},
+        token_count=1_000_001,
+        client_turn_id="accepted-turn",
+    )
+    original_liveness = DurableCompressionTurnSpool._process_liveness
+    monkeypatch.setattr(
+        DurableCompressionTurnSpool,
+        "_process_liveness",
+        staticmethod(lambda _pid: ("unknown", None)),
+    )
+
+    deferred, _ = agent._compress_context(
+        list(_MESSAGES), "sys", approx_tokens=1_000_001
+    )
+    assert deferred == _MESSAGES
+    agent.context_compressor.compress.assert_not_called()
+    assert [row["client_turn_id"] for row in spool.pending(session_id)] == [
+        "accepted-turn"
+    ]
+    assert db.get_compression_lock_holder(session_id) is None
+
+    monkeypatch.setattr(
+        DurableCompressionTurnSpool,
+        "_process_liveness",
+        staticmethod(original_liveness),
+    )
+    recovered, _ = agent._compress_context(
+        list(_MESSAGES), "sys", approx_tokens=1_000_001
+    )
+    assert len(recovered) < len(_MESSAGES)
+    assert spool.pending(session_id) == []
+    assert [row["status"] for row in spool.records(session_id)] == ["drained"]
+    assert db.get_compression_lock_holder(session_id) is None

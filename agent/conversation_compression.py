@@ -634,6 +634,11 @@ class DurableCompressionTurnSpool:
     ) -> dict[str, Any]:
         turn_id = str(client_turn_id or uuid.uuid4().hex)
         with self._locked("global") as root_fd:
+            # A durable ACK promises that this session's lineage can later be
+            # resolved and drained. Validate its state before touching global
+            # sequence metadata or creating/revalidating a record. State for
+            # unrelated sessions is intentionally not consulted.
+            self._state(str(session_id), root_fd=root_fd)
             for path, payload in self._record_rows(root_fd=root_fd):
                 if (
                     payload.get("origin_session") == session_id
@@ -4024,6 +4029,26 @@ def compress_context(
                 exc_info=True,
             )
             _turn_spool_epoch = None
+
+        if _turn_spool_epoch is None:
+            # The DB compression lease alone cannot make an accepted spool
+            # turn drainable: publication must also own a fenced spool epoch.
+            # Unknown self identity and a live spool owner are retryable, but
+            # continuing here would commit rotation/in-place state with no
+            # legal publisher and strand already-ACKed turns indefinitely.
+            agent._compression_skipped_due_to_lock = "spool_owner_unavailable"
+            _existing_sp = getattr(agent, "_cached_system_prompt", None)
+            if not _existing_sp:
+                _existing_sp = agent._build_system_prompt(system_message)
+            _emit_compression_attempt_telemetry(
+                agent,
+                started_at=_attempt_started_at,
+                commit_status="aborted",
+                split_status="aborted",
+                failure_class="spool_owner_unavailable",
+            )
+            _release_lock()
+            return messages, _existing_sp
 
     # A delayed contender can acquire the parent lock after the winning path
     # has released it and completed rotation. The lock serializes work but does

@@ -348,6 +348,34 @@ def test_structurally_invalid_json_is_explicit_and_preserved(tmp_path):
     assert global_state.read_bytes() == b"{}"
 
 
+def test_same_session_invalid_state_blocks_ack_without_cross_session_poison(tmp_path):
+    root = tmp_path / "spool"
+    spool = DurableCompressionTurnSpool(root)
+    assert spool.enqueue(
+        "healthy", _turn("first"), token_count=1, client_turn_id="healthy-1"
+    )["durable"]
+    invalid_state = spool._state_path("broken")
+    invalid_state.write_bytes(b"{}")
+    before = {path.name: path.read_bytes() for path in root.iterdir()}
+
+    with pytest.raises(RuntimeError, match="state schema"):
+        spool.enqueue(
+            "broken", _turn("must not ack"), token_count=1,
+            client_turn_id="broken-1",
+        )
+    assert invalid_state.read_bytes() == b"{}"
+    assert {path.name: path.read_bytes() for path in root.iterdir()} == before
+
+    receipt = spool.enqueue(
+        "healthy", _turn("isolated"), token_count=1,
+        client_turn_id="healthy-2",
+    )
+    assert receipt["durable"] is True
+    assert [row["client_turn_id"] for row in spool.pending("healthy")] == [
+        "healthy-1", "healthy-2"
+    ]
+
+
 def test_root_swap_after_open_refuses_noncanonical_durable_ack(tmp_path, monkeypatch):
     root = tmp_path / "spool"
     external = tmp_path / "external"
