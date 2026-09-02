@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 
 
@@ -123,15 +124,39 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
     kb._default_spawn(task, str(workspace))
 
     parser, _subparsers, _chat_parser = build_top_level_parser()
+    # The signed launcher is intentionally visible: validate its fixed shell
+    # wrapper, then unwrap only the positional Hermes payload and exercise the
+    # real shared parser. This catches regressions in both layers.
+    wrapped = captured["cmd"]
+    assert wrapped[:2] == ["/bin/bash", "-c"]
+    assert 'source "$1"' in wrapped[2]
+    assert 'exec "$@"' in wrapped[2]
+    assert wrapped[3] == "hermes-worker-path"
+    assert wrapped[4].startswith("/dev/fd/")
+    worker_argv = wrapped[5:]
+    assert worker_argv[0] == "hermes"
+
     # Profile selection is attached by the outer CLI bootstrap rather than
     # build_top_level_parser(); remove that already-validated prefix and parse
     # the worker flags/subcommand through the real shared parser.
-    assert captured["cmd"][1:3] == ["-p", "elias"]
-    args = parser.parse_args(captured["cmd"][3:])
+    assert worker_argv[1:3] == ["-p", "elias"]
+    args = parser.parse_args(worker_argv[3:])
 
     assert args.command == "chat"
     assert args.model == "gpt-5.6-sol"
     assert args.query == "work kanban task t_spawn_tools"
+
+
+def test_signed_worker_path_fixture_preserves_explicit_inputs(
+    _signed_worker_path_env,
+):
+    """Caller-provided K5 path/hash always win over pytest's fallback."""
+    explicit_path = _signed_worker_path_env["explicit_path"]
+    explicit_hash = _signed_worker_path_env["explicit_hash"]
+    if explicit_path is not None:
+        assert os.environ["HERMES_WORKER_PATH_LIB"] == explicit_path
+    if explicit_hash is not None:
+        assert os.environ["K5_WORKER_PATH_SHA256"] == explicit_hash
 
 
 def test_resolve_worker_cli_toolsets_uses_profile_home_not_parent_config(monkeypatch, tmp_path):
