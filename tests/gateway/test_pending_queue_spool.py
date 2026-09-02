@@ -8,6 +8,8 @@ successful transcript flush — not silently discarded (#78182, #82616).
 """
 import json
 import logging
+import os
+import builtins
 import threading
 
 import pytest
@@ -236,3 +238,45 @@ class TestSpoolPrimitives:
         assert receipt["path"].exists()
         payload = json.loads(receipt["path"].read_text(encoding="utf-8"))
         assert payload["client_turn_id"] == "turn-durable"
+
+    def test_flock_failure_prevents_ack(self, spool_home, monkeypatch):
+        import fcntl
+
+        monkeypatch.setattr(
+            fcntl, "flock", lambda *_a, **_k: (_ for _ in ()).throw(OSError("flock"))
+        )
+        spool = DurableCompressionTurnSpool(spool_home / "compression_turn_spool")
+        with pytest.raises(OSError, match="flock"):
+            spool.enqueue("s", {"role": "user", "content": "x"}, token_count=1)
+
+    def test_fcntl_unavailable_prevents_ack(self, spool_home, monkeypatch):
+        real_import = builtins.__import__
+
+        def import_without_fcntl(name, *args, **kwargs):
+            if name == "fcntl":
+                raise ImportError("fcntl unavailable")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", import_without_fcntl)
+        spool = DurableCompressionTurnSpool(spool_home / "compression_turn_spool")
+        with pytest.raises(RuntimeError, match="requires fcntl"):
+            spool.enqueue("s", {"role": "user", "content": "x"}, token_count=1)
+
+    @pytest.mark.parametrize("fail_call", [1, 2])
+    def test_file_or_directory_fsync_failure_prevents_ack(
+        self, spool_home, monkeypatch, fail_call
+    ):
+        real_fsync = os.fsync
+        calls = 0
+
+        def fail_selected(fd):
+            nonlocal calls
+            calls += 1
+            if calls == fail_call:
+                raise OSError("fsync failed")
+            return real_fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", fail_selected)
+        spool = DurableCompressionTurnSpool(spool_home / "compression_turn_spool")
+        with pytest.raises(OSError, match="fsync failed"):
+            spool.enqueue("s", {"role": "user", "content": "x"}, token_count=1)

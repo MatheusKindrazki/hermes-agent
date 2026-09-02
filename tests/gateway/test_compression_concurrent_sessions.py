@@ -18,6 +18,7 @@ stress test rather than a timing accident.
 from __future__ import annotations
 
 import os
+import multiprocessing
 import threading
 import time
 from pathlib import Path
@@ -199,3 +200,43 @@ def test_compression_attempt_epoch_refuses_stale_owner_commit(tmp_path: Path) ->
     assert spool.commit_attempt("shared", "winner", epoch, live_tip="child") is True
     assert spool.commit_attempt("shared", "winner", epoch, live_tip="stale") is False
     assert spool.resolve_live_tip("shared") == "child"
+
+
+def _hold_spool_owner(root: str, ready, release) -> None:
+    spool = DurableCompressionTurnSpool(root)
+    epoch = spool.begin_attempt("shared", "child-owner", lease_seconds=0.1)
+    ready.put(epoch)
+    release.get(timeout=10)
+
+
+def test_live_process_owner_cannot_be_taken_over(tmp_path: Path) -> None:
+    root = str(tmp_path / "compression-spool")
+    ctx = multiprocessing.get_context("spawn")
+    ready = ctx.Queue()
+    release = ctx.Queue()
+    process = ctx.Process(target=_hold_spool_owner, args=(root, ready, release))
+    process.start()
+    assert ready.get(timeout=10) == 1
+    time.sleep(0.2)  # durable lease expired, but owner process is still alive
+    spool = DurableCompressionTurnSpool(root)
+    assert spool.begin_attempt(
+        "shared", "contender", allow_stale_owner_takeover=True
+    ) is None
+    release.put(True)
+    process.join(timeout=10)
+    assert process.exitcode == 0
+    epoch = spool.begin_attempt(
+        "shared", "contender", allow_stale_owner_takeover=True
+    )
+    assert epoch == 2
+    assert spool.commit_attempt("shared", "child-owner", 1, live_tip="bad") is False
+    assert spool.commit_attempt("shared", "contender", 2, live_tip="good") is True
+    assert spool.resolve_live_tip("shared") == "good"
+
+
+def test_expired_owner_cannot_publish_live_tip(tmp_path: Path) -> None:
+    spool = DurableCompressionTurnSpool(tmp_path / "compression-spool")
+    epoch = spool.begin_attempt("shared", "owner", lease_seconds=0.01)
+    time.sleep(0.02)
+    assert spool.commit_attempt("shared", "owner", epoch, live_tip="bad") is False
+    assert spool.resolve_live_tip("shared") == "shared"
