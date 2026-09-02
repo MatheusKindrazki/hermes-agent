@@ -214,6 +214,20 @@ class TurnContext:
     interim_assistant_messages_enabled: bool = False
     needs_progress_queue: bool = False
 
+    # --- durable admission (K8) -------------------------------------------
+    # The ONE-SHOT carrier for the admission the gateway ingress recorded for
+    # this request, captured in the async parent and transported explicitly to
+    # the single run_conversation it belongs to.
+    #
+    # It is carried here, as an object, rather than read from a ContextVar in
+    # the worker: ``_run_in_executor_with_context`` runs turn work under
+    # ``copy_context()``, so a ContextVar cleared inside that copy does not
+    # clear the parent's, and a second executor call in the same request would
+    # re-read an admission that was already spent. The box is shared by
+    # reference, so taking it is visible to the parent that owns the lifecycle
+    # and retires it.
+    k8_pre_admission: Any = None
+
     # --- lazy-imported callables captured from the outer body -------------
     AIAgent: Any = None
     resolve_display_setting: Any = None

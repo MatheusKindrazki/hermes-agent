@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -376,3 +377,212 @@ def test_background_lane_unarmed_is_unchanged(monkeypatch, tmp_path):
     )
 
     assert reached, "the unarmed background lane did not run as before"
+
+
+# --------------------------------------------------------------------------- #
+# The executor boundary — a ContextVar cleared in a copy cannot un-publish
+# --------------------------------------------------------------------------- #
+
+
+def _outcome(tag: str):
+    return durable_admission.AdmissionOutcome(
+        state="no_work_required",
+        reason_code="inline_answer_no_execution",
+        seam="none",
+        idempotency_key=tag,
+        content_sha256=durable_admission.content_sha256(tag),
+        request_key="k8-%s" % tag,
+        event_id="evt.probe.%s" % tag,
+        session_id="sess-%s" % tag,
+        model_may_run=True,
+        signal_persisted=True,
+    )
+
+
+def test_red_carrier_survives_the_executor_boundary(monkeypatch):
+    """The carrier must be ONE-SHOT across the real executor boundary.
+
+    ``_run_in_executor_with_context`` runs the worker under ``copy_context()``.
+    A ContextVar cleared inside that copy does NOT clear the async parent's, so
+    a second executor call in the SAME request re-reads the same outcome and a
+    second model invocation rides an admission that was already spent.
+
+    RED on unfixed code: the second call sees the outcome again.
+    """
+    runner = _runner()
+    published = _outcome("A")
+
+    async def _probe():
+        durable_admission.publish_pre_admission(published)
+        first = await runner._run_in_executor_with_context(
+            durable_admission.consume_pre_admission
+        )
+        second = await runner._run_in_executor_with_context(
+            durable_admission.consume_pre_admission
+        )
+        return first, second
+
+    first, second = asyncio.run(_probe())
+
+    assert first is not None and first.idempotency_key == "A"
+    assert second is None, (
+        "the pre-admission survived the executor boundary and was consumed "
+        "twice in one request"
+    )
+
+
+def test_concurrent_requests_never_cross_and_consume_exactly_once():
+    """Two concurrent requests, several executor hops each.
+
+    Each task must see ITS own admission exactly once and never the sibling's.
+    ``asyncio.Task`` copies the context at creation, so each task owns its own
+    carrier; the box makes the take one-shot within a task.
+    """
+    runner = _runner()
+
+    async def _request(tag: str, hops: int):
+        durable_admission.publish_pre_admission(_outcome(tag))
+        seen = []
+        for _ in range(hops):
+            seen.append(
+                await runner._run_in_executor_with_context(
+                    durable_admission.consume_pre_admission
+                )
+            )
+        return seen
+
+    async def _both():
+        return await asyncio.gather(
+            asyncio.create_task(_request("A", 3)),
+            asyncio.create_task(_request("B", 3)),
+        )
+
+    seen_a, seen_b = asyncio.run(_both())
+
+    keys_a = [o.idempotency_key for o in seen_a if o is not None]
+    keys_b = [o.idempotency_key for o in seen_b if o is not None]
+    assert keys_a == ["A"], "request A did not consume its admission exactly once"
+    assert keys_b == ["B"], "request B did not consume its admission exactly once"
+    assert seen_a[1:] == [None, None] and seen_b[1:] == [None, None]
+
+
+def test_parent_invalidation_retires_a_carrier_the_worker_never_took():
+    """Every parent-owned exit — refusal, exception, cancellation, proxy,
+    background, retry — retires the carrier, so nothing can ride it later."""
+    carrier = durable_admission.publish_pre_admission(_outcome("A"))
+    assert carrier.peek() is not None
+
+    durable_admission.clear_pre_admission()
+
+    assert carrier.spent is True
+    assert carrier.take() is None
+    assert durable_admission.consume_pre_admission() is None
+
+
+def test_a_taken_carrier_cannot_be_taken_again_from_any_thread():
+    carrier = durable_admission.publish_pre_admission(_outcome("A"))
+    results: list = []
+    barrier = threading.Barrier(4)
+
+    def _take():
+        barrier.wait(timeout=5)
+        results.append(carrier.take())
+
+    threads = [threading.Thread(target=_take) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert len([r for r in results if r is not None]) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Ingress -> preprocessing -> executor -> run_conversation, end to end
+# --------------------------------------------------------------------------- #
+
+
+@requires_k7
+def test_carrier_survives_preprocessing_and_is_spent_by_the_matching_turn(
+    monkeypatch, tmp_path
+):
+    """The whole journey, with the real pieces at every hop.
+
+    Ingress admits the RAW text and publishes a one-shot carrier; preprocessing
+    rewrites the text (vision/STT); the parent picks the carrier up and puts it
+    on a real ``TurnContext``; the turn crosses the REAL executor; the worker
+    installs it on the agent and the real ``run_conversation`` takes it. The
+    enriched text is never admitted, and a second model invocation in the same
+    request finds nothing left to ride.
+    """
+    import types
+
+    from agent import conversation_loop
+    from gateway.turn_context import TurnContext
+
+    _arm(monkeypatch, tmp_path)
+    runner = _runner()
+
+    admissions: list = []
+    real_run = durable_admission.subprocess.run
+    monkeypatch.setattr(
+        durable_admission.subprocess,
+        "run",
+        lambda argv, **kw: admissions.append(json.loads(kw["input"])) or real_run(argv, **kw),
+    )
+    reached: list = []
+    monkeypatch.setattr(
+        conversation_loop,
+        "build_turn_context",
+        lambda agent, user_message, *a, **kw: reached.append(user_message)
+        or (_ for _ in ()).throw(RuntimeError("turn reached the model path")),
+    )
+
+    raw = "what is in this picture"
+    enriched = raw + "\n\n[Image: a red bicycle]"
+    agent = types.SimpleNamespace(
+        session_id="agent:main:telegram:4242",
+        platform="telegram",
+        api_mode="chat_completions",
+        _delegate_depth=0,
+    )
+
+    def _turn(ctx: TurnContext, text: str):
+        """What _run_sync_inner does: install, call, detach + retire."""
+        carrier = getattr(ctx, "k8_pre_admission", None)
+        if carrier is not None:
+            agent._k8_pre_admission = carrier
+        try:
+            try:
+                conversation_loop.run_conversation(agent, text)
+            except RuntimeError:
+                pass
+            return "allowed"
+        finally:
+            if carrier is not None:
+                carrier.invalidate()
+                agent._k8_pre_admission = None
+
+    async def _request():
+        # 1. Ingress admits the RAW text, before any enrichment.
+        assert runner._k8_admit_inbound(*_event(text=raw, message_id="4242")) is None
+        # 2. Parent picks the carrier up in its OWN context (as _run_agent_inner does).
+        ctx = TurnContext(k8_pre_admission=durable_admission.current_pre_admission())
+        # 3. First model invocation, across the real executor, on ENRICHED text.
+        first = await runner._run_in_executor_with_context(_turn, ctx, enriched)
+        # 4. Second invocation in the SAME request, no fresh carrier.
+        second_carrier = getattr(agent, "_k8_pre_admission", None)
+        second_take = durable_admission.consume_pre_admission(ctx.k8_pre_admission)
+        return first, second_carrier, second_take
+
+    first, second_carrier, second_take = asyncio.run(_request())
+
+    assert first == "allowed"
+    assert reached == [enriched], "the turn did not reach the model path once"
+    # Exactly one admission, and it hashed the RAW text — never the enriched one.
+    assert len(admissions) == 1
+    assert admissions[0]["content_sha256"] == durable_admission.content_sha256(raw)
+    assert admissions[0]["content_sha256"] != durable_admission.content_sha256(enriched)
+    # Nothing is left for a second model invocation to ride.
+    assert second_carrier is None
+    assert second_take is None

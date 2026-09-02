@@ -281,11 +281,42 @@ def test_explicit_off_wins_over_a_full_pin_set(monkeypatch, mode):
     assert durable_admission.admission_enabled() is False
 
 
-def test_unrecognised_mode_is_treated_as_off(monkeypatch):
-    """A typo is not an invitation to guess which way the operator meant it."""
+def test_unrecognised_mode_fails_closed_before_any_side_effect(monkeypatch, tmp_path):
+    """A typo must not read as "off".
+
+    An operator who wrote ``enfroce`` asked for enforcement; silently giving
+    them none is a fail-open. The refusal is stable and lands before any config
+    read, subprocess or model call.
+    """
+    _pin_env(monkeypatch, mode="enfroce")
+    import hermes_cli.config as config_mod
+
+    def _no_config(*a, **kw):
+        raise AssertionError("a bad mode must not reach config.yaml")
+
+    def _no_subprocess(*a, **kw):
+        raise AssertionError("a bad mode must not spawn the admitter")
+
+    monkeypatch.setattr(config_mod, "load_config_readonly", _no_config)
+    monkeypatch.setattr(durable_admission.subprocess, "run", _no_subprocess)
+
+    with pytest.raises(durable_admission.ModeError):
+        durable_admission.resolve_mode()
+
+    outcome = _admit()
+    assert outcome.reason_code == "kernel_mode_invalid"
+    assert outcome.model_may_run is False
+    assert outcome.effects_allowed is False
+
+
+def test_unrecognised_mode_blocks_the_turn(monkeypatch, tmp_path, turn_probe):
     _pin_env(monkeypatch, mode="enfroce")
 
-    assert durable_admission.admission_enabled() is False
+    result = conversation_loop.run_conversation(_agent(), "anything")
+
+    assert turn_probe == []
+    assert result["admission_blocked"] is True
+    assert result["admission_reason_code"] == "kernel_mode_invalid"
 
 
 def test_fully_pinned_but_off_touches_nothing(monkeypatch, tmp_path, turn_probe):
@@ -521,6 +552,7 @@ def test_fixture_authority_never_authorizes_an_effect(monkeypatch, tmp_path):
 
     assert outcome.state == "admitted"
     assert outcome.receipt["authority_source"] == "test_fixture"
+    assert outcome.authority_pin_matched is False
     assert outcome.authority_verified is False
     assert outcome.effects_allowed is False
     assert outcome.has_work_receipt is False
@@ -535,6 +567,7 @@ def test_no_pin_configured_means_no_effect_is_ever_authorized(monkeypatch, tmp_p
     outcome = _admit()
 
     assert outcome.kernel_effects_allowed is True
+    assert outcome.authority_pin_matched is False
     assert outcome.authority_verified is False
     assert outcome.effects_allowed is False
 
@@ -561,7 +594,7 @@ def test_receipts_that_do_not_match_the_pin_are_refused(
 
     outcome = _admit()
 
-    assert outcome.authority_verified is False, label
+    assert outcome.authority_pin_matched is False, label
     assert outcome.effects_allowed is False
 
 
@@ -910,15 +943,19 @@ def test_a_handbuilt_receipt_object_has_no_valid_seal():
         content_sha256="b" * 64,
         request_key="k8-forged",
         admitted_at=0,
-        authority_verified=True,
+        authority_pin_matched=True,
         seal="d" * 64,
     )
 
     assert durable_admission.verify_work_receipt(forged) is None
 
 
-def test_a_receipt_cannot_be_reused_after_mutation():
-    """Frozen plus sealed: the seal covers the fields, so an edited copy fails."""
+def test_k8_never_releases_a_work_receipt_capability():
+    """Even the kernel's own ``effects_allowed`` does not buy one.
+
+    A capability needs an AUTHENTICATED authority, and K8 only compares public
+    pin fields. So the strongest outcome K8 can hold still yields no receipt.
+    """
     outcome = durable_admission.AdmissionOutcome(
         state="admitted",
         reason_code="execution_seam_requested",
@@ -929,12 +966,43 @@ def test_a_receipt_cannot_be_reused_after_mutation():
         request_key="k8-real",
         model_may_run=True,
         kernel_effects_allowed=True,
-        authority_verified=True,
+        authority_pin_matched=True,
     )
-    real = outcome.work_receipt()
-    assert durable_admission.verify_work_receipt(real) is real
 
+    assert outcome.authority_pin_matched is True
+    assert outcome.authority_verified is False
+    assert outcome.effects_allowed is False
+    assert outcome.has_work_receipt is False
+    assert outcome.work_receipt() is None
+
+
+def test_authority_verified_is_read_only_and_always_false():
+    """It is a property, so no construction path can assert verification."""
+    outcome = durable_admission.AdmissionOutcome(
+        state="admitted", reason_code="x", authority_pin_matched=True
+    )
+
+    assert outcome.authority_verified is False
+    with pytest.raises((AttributeError, TypeError)):
+        outcome.authority_verified = True  # type: ignore[misc]
+
+
+def test_a_sealed_receipt_still_cannot_be_tampered_with():
+    """The seal covers the fields, so an edited copy fails — proved on a
+    receipt minted directly, since no admission path releases one."""
     import dataclasses
+
+    real = durable_admission._mint_receipt(
+        durable_admission._MINT,
+        work_id="01a061a7-cea0-7503-b308-1f4029d450c8",
+        idempotency_key="a" * 64,
+        seam="execution",
+        content_sha256="b" * 64,
+        request_key="k8-real",
+        admitted_at=0,
+        authority_pin_matched=False,
+    )
+    assert durable_admission.verify_work_receipt(real) is real
 
     tampered = dataclasses.replace(real, work_id="somebody-elses-work")
     assert durable_admission.verify_work_receipt(tampered) is None

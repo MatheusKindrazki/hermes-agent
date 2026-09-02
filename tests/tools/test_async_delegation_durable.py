@@ -143,20 +143,23 @@ def _dispatch_batch(**kw):
 
 def _sealed_receipt():
     """A genuinely minted, genuinely sealed receipt — the strongest input the
-    registry could be handed. It must still not buy a dispatch."""
-    outcome = durable_admission.AdmissionOutcome(
-        state="admitted",
-        reason_code="execution_seam_requested",
-        seam="execution",
+    registry could ever be handed. It must still not buy a dispatch.
+
+    Minted directly because no admission path releases one: K8 compares public
+    AuthorityPin fields only, so it never authenticates an authority and never
+    hands out a capability. This is therefore strictly stronger than anything
+    production can produce.
+    """
+    return durable_admission._mint_receipt(
+        durable_admission._MINT,
         work_id="01a061a7-cea0-7503-b308-1f4029d450c8",
         idempotency_key="a" * 64,
+        seam="execution",
         content_sha256="b" * 64,
         request_key="k8-real",
-        model_may_run=True,
-        kernel_effects_allowed=True,
-        authority_verified=True,
+        admitted_at=0,
+        authority_pin_matched=True,
     )
-    return outcome.work_receipt()
 
 
 # --------------------------------------------------------------------------- #
@@ -537,3 +540,54 @@ def test_delegate_task_mode_off_is_unchanged(monkeypatch, tmp_path):
         delegate_tool.delegate_task(
             goal="g", background=True, parent_agent=_ParentAgent()
         )
+
+
+# --------------------------------------------------------------------------- #
+# Authority is a candidate, never a verification
+# --------------------------------------------------------------------------- #
+
+
+@requires_k7
+def test_the_handoff_declares_that_verification_is_still_owed(monkeypatch, tmp_path):
+    """K8 compares public pin fields only, so whatever it hands over is an
+    unauthenticated candidate and the payload says so."""
+    from tools import delegate_tool
+
+    _arm(monkeypatch, tmp_path)
+    _no_children(monkeypatch)
+
+    payload = json.loads(
+        delegate_tool.delegate_task(
+            goal="audit the repo", background=True, parent_agent=_ParentAgent()
+        )
+    )
+
+    handoff = payload["handoff"]
+    assert handoff["authority_verified"] is False
+    assert handoff["authority_verification_required"] is True
+
+
+@requires_k7
+def test_the_registry_refuses_a_candidate_receipt_too(monkeypatch, tmp_path, spawned):
+    """Fake, sealed and candidate receipts alike: refused before row, thread,
+    child or ACK."""
+    _arm(monkeypatch, tmp_path)
+    candidate = durable_admission._mint_receipt(
+        durable_admission._MINT,
+        work_id="01a061a7-cea0-7503-b308-1f4029d450c8",
+        idempotency_key="a" * 64,
+        seam="execution",
+        content_sha256="b" * 64,
+        request_key="k8-candidate",
+        admitted_at=0,
+        authority_pin_matched=True,
+    )
+
+    for result in (
+        _dispatch(work_receipt=candidate),
+        _dispatch_batch(work_receipt=candidate),
+    ):
+        assert result["status"] == "rejected"
+        assert result["reason"] == "session_bound_dispatch_refused"
+    assert _rows() == set()
+    assert spawned == []

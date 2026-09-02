@@ -6695,7 +6695,26 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-            result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+            # Durable admission (K8): hand this turn's one-shot carrier to the
+            # single run_conversation it was minted for, then take it back off
+            # the agent — gateway agents are cached across turns, so leaving it
+            # attached would offer a spent admission to the next one.
+            _k8_carrier = getattr(ctx, "k8_pre_admission", None)
+            if _k8_carrier is not None:
+                agent._k8_pre_admission = _k8_carrier
+            try:
+                result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+            finally:
+                if _k8_carrier is not None:
+                    # The turn is over on every exit — completion, refusal,
+                    # exception, cancellation, proxy hand-off, background
+                    # re-entry, retry. Retire the carrier here, in the frame
+                    # that owns it, so no later invocation can ride it.
+                    try:
+                        _k8_carrier.invalidate()
+                        agent._k8_pre_admission = None
+                    except Exception:
+                        logger.debug("K8 carrier retirement failed", exc_info=True)
         finally:
             unregister_gateway_notify(_approval_session_key)
             # Cancel any pending clarify entries so blocked agent
@@ -17920,9 +17939,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # ContextVar the helper publishes is scoped to this per-message asyncio
         # task's context, so it is this request's and no sibling's.
         try:
-            from agent.durable_admission import admission_enabled as _k8_armed
+            from agent.durable_admission import ModeError as _K8ModeError
+            from agent.durable_admission import resolve_mode as _k8_resolve_mode
 
-            _k8_on = _k8_armed()
+            _k8_on = _k8_resolve_mode()
+        except _K8ModeError as _k8_mode_exc:
+            # A misconfigured mode is not "off". An operator who typo'd the
+            # arming value asked for enforcement and must not silently get
+            # none, so the turn stops here — before any config, subprocess or
+            # model — with a stable refusal.
+            logger.error("durable admission mode refused: %s", _k8_mode_exc)
+            return (
+                "This message was not processed: the durable-admission mode "
+                "setting is not recognised, so the work ledger could not be "
+                "consulted. Nothing has run."
+            )
         except Exception:
             logger.debug("durable admission probe failed", exc_info=True)
             _k8_on = False
@@ -23940,9 +23971,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Signal is recorded here, against the task's own id, so it precedes
         # that preprocessing exactly as it does on the interactive path.
         try:
-            from agent.durable_admission import admission_enabled as _k8_armed
+            from agent.durable_admission import ModeError as _K8ModeError
+            from agent.durable_admission import resolve_mode as _k8_resolve_mode
 
-            _k8_on = _k8_armed()
+            _k8_on = _k8_resolve_mode()
+        except _K8ModeError as _k8_mode_exc:
+            # Same rule on the background lane: an unrecognised mode stops the
+            # task rather than running it unadmitted.
+            logger.error(
+                "durable admission mode refused for background task %s: %s",
+                task_id,
+                _k8_mode_exc,
+            )
+            return
         except Exception:
             logger.debug("durable admission probe failed", exc_info=True)
             _k8_on = False
@@ -30232,7 +30273,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         long_tool_hint_fired = [False]
         _LONG_TOOL_THRESHOLD_S = 30.0
 
+        # Durable admission (K8): pick the request's one-shot carrier up HERE,
+        # in the async parent, and hand it to the turn explicitly. The worker
+        # must not fish it out of a copied context — see TurnContext.k8_pre_admission.
+        try:
+            from agent.durable_admission import current_pre_admission as _k8_carrier
+
+            _k8_pre_admission = _k8_carrier()
+        except Exception:
+            logger.debug("K8 carrier pickup failed", exc_info=True)
+            _k8_pre_admission = None
+
         turn_ctx = TurnContext(
+            k8_pre_admission=_k8_pre_admission,
             source=source,
             _run_still_current=_run_still_current,
             _live_status_adapter=_live_status_adapter,

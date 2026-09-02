@@ -3833,10 +3833,23 @@ def delegate_task(
     # the current admitted turn, and only under an admission this call tree
     # already inherited. It never opens a second Work for one execution, and it
     # never mutates: it is a read-only fan-out whose results return in-turn.
-    from agent.durable_admission import admission_enabled
+    from agent.durable_admission import ModeError, resolve_mode
+
+    try:
+        _k8_armed = resolve_mode()
+    except ModeError as exc:
+        return json.dumps(
+            {
+                "status": "admission_required",
+                "reason": ModeError.reason_code,
+                "retryable": False,
+                "error": "Nothing was started. %s" % exc,
+            },
+            ensure_ascii=False,
+        )
 
     _inherited_turn = None
-    if admission_enabled():
+    if _k8_armed:
         from agent.durable_admission import (
             EXTERNAL_WORK_DISPATCHER,
             ExecutionHandoff,
@@ -3886,6 +3899,7 @@ def delegate_task(
                 work_id=_admission.work_id,
                 request_key=_admission.request_key,
                 retryable=_admission.retryable,
+                authority_pin_matched=_admission.authority_pin_matched,
             )
             _payload = _handoff.payload()
             _payload["count"] = len(task_list)

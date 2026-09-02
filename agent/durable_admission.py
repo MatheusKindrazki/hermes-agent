@@ -185,10 +185,20 @@ class _State(threading.local):
 _state = _State()
 
 # The verified pre-admission produced at the gateway ingress and consumed once,
-# further in. A ContextVar (not an argument) because the real gateway paths
-# reach ``run_conversation`` through several call shapes, and threading a new
-# parameter through them would touch files outside this package's scope.
-_PRE_ADMISSION: contextvars.ContextVar[Optional["AdmissionOutcome"]] = (
+# further in.
+#
+# It is a SHARED MUTABLE BOX, not a ContextVar, and that is the whole point.
+# The gateway hands blocking turn work to a thread pool through
+# ``_run_in_executor_with_context``, which runs the worker under
+# ``copy_context()``. A ContextVar cleared inside that copy does not clear the
+# async parent's — so a carrier built on one is not one-shot: a second executor
+# call in the SAME request re-reads an admission that was already spent, and a
+# second model invocation rides it. A box is shared by reference, so the take
+# is visible to the parent that owns the lifecycle.
+#
+# The ContextVar below carries only the BOX, so paths that never touch the
+# executor still find it; the one-shot guarantee lives in the box itself.
+_PRE_ADMISSION: contextvars.ContextVar[Optional["PreAdmission"]] = (
     contextvars.ContextVar("hermes_k8_pre_admission", default=None)
 )
 # The admitted execution the current call tree runs inside. A nested/sync
@@ -224,7 +234,7 @@ class WorkReceipt:
     content_sha256: str
     request_key: str
     admitted_at: int
-    authority_verified: bool
+    authority_pin_matched: bool
     seal: str = field(repr=False)
 
     def sealed_core(self) -> Dict[str, Any]:
@@ -235,7 +245,7 @@ class WorkReceipt:
             "content_sha256": self.content_sha256,
             "request_key": self.request_key,
             "admitted_at": self.admitted_at,
-            "authority_verified": self.authority_verified,
+            "authority_pin_matched": self.authority_pin_matched,
         }
 
     def as_dict(self) -> Dict[str, Any]:
@@ -280,9 +290,16 @@ class ExecutionHandoff:
     work_id: Optional[str] = None
     request_key: Optional[str] = None
     retryable: bool = False
+    authority_pin_matched: bool = False
 
     def payload(self) -> Dict[str, Any]:
-        """The stable, typed shape a tool returns. Never says 'dispatched'."""
+        """The stable, typed shape a tool returns. Never says 'dispatched'.
+
+        ``authority_verification_required`` is always true: K8 compares the
+        public AuthorityPin fields only, so whatever it hands over is an
+        unauthenticated candidate. The dispatcher must authenticate the
+        attestation before acting on it.
+        """
         return {
             "status": "handoff_required",
             "handoff": {
@@ -290,6 +307,9 @@ class ExecutionHandoff:
                 "reason": self.reason_code,
                 "work_id": self.work_id,
                 "request_key": self.request_key,
+                "authority_pin_matched": self.authority_pin_matched,
+                "authority_verified": False,
+                "authority_verification_required": True,
             },
             "retryable": self.retryable,
             "error": self.detail,
@@ -312,7 +332,9 @@ class AdmissionOutcome:
     session_id: Optional[str] = None
     model_may_run: bool = False
     kernel_effects_allowed: bool = False
-    authority_verified: bool = False
+    # The public pin fields matched. NOT an authentication — see
+    # _authority_pin_matched.
+    authority_pin_matched: bool = False
     signal_persisted: bool = False
     replayed: bool = False
     retryable: bool = False
@@ -325,11 +347,26 @@ class AdmissionOutcome:
         return not self.mode_off and not self.model_may_run
 
     @property
+    def authority_verified(self) -> bool:
+        """Always False in K8, and it is a property so it cannot be assigned.
+
+        Verification means recomputing the attestation HMAC against the pinned
+        authority's credential. K8 cannot do that — it compares public fields
+        only — so claiming verification here would be a lie that a downstream
+        gate would act on. K9 owns this.
+        """
+        return False
+
+    @property
     def effects_allowed(self) -> bool:
-        """An effect needs BOTH: the kernel released it AND the authority that
-        released it was verified as the pinned remote. A fixture-minted or
-        unattested receipt is refused here, not downstream."""
-        return bool(self.kernel_effects_allowed and self.authority_verified)
+        """No effect is ever released by K8.
+
+        An effect needs a Work whose issuing authority was AUTHENTICATED, and
+        K8 cannot authenticate one. A matched pin is a candidate, not a
+        capability, so this stays False even for a receipt the kernel itself
+        marked ``effects_allowed`` — long work is handed off instead.
+        """
+        return False
 
     @property
     def has_work_receipt(self) -> bool:
@@ -351,8 +388,54 @@ class AdmissionOutcome:
             content_sha256=self.content_sha256 or "",
             request_key=self.request_key or "",
             admitted_at=self.admitted_at,
-            authority_verified=self.authority_verified,
+            authority_pin_matched=self.authority_pin_matched,
         )
+
+
+class PreAdmission:
+    """A one-shot carrier for one admitted request.
+
+    Shared by reference across the executor boundary, so ``take()`` is visible
+    to the async parent that owns the turn's lifecycle. Thread-safe because the
+    taker and the invalidator genuinely run on different threads.
+    """
+
+    __slots__ = ("_outcome", "_lock", "_taken", "_invalidated")
+
+    def __init__(self, outcome: "AdmissionOutcome") -> None:
+        self._outcome = outcome
+        self._lock = threading.Lock()
+        self._taken = False
+        self._invalidated = False
+
+    def take(self) -> Optional["AdmissionOutcome"]:
+        """Return the outcome exactly once, ever."""
+        with self._lock:
+            if self._taken or self._invalidated:
+                return None
+            self._taken = True
+            return self._outcome
+
+    def peek(self) -> Optional["AdmissionOutcome"]:
+        """Read without spending. For lifecycle decisions, never for release."""
+        with self._lock:
+            return None if (self._taken or self._invalidated) else self._outcome
+
+    def invalidate(self) -> None:
+        """Retire the carrier. Idempotent, and safe to call from any thread.
+
+        The parent calls this in its own ``finally`` for every exit — success,
+        refusal, exception, cancellation, proxy, background and retry — so a
+        carrier can never outlive the request that minted it.
+        """
+        with self._lock:
+            self._invalidated = True
+            self._outcome = None
+
+    @property
+    def spent(self) -> bool:
+        with self._lock:
+            return self._taken or self._invalidated
 
 
 def _off() -> AdmissionOutcome:
@@ -382,7 +465,7 @@ def _refuse(
         seam=seam,
         model_may_run=False,
         kernel_effects_allowed=False,
-        authority_verified=False,
+        authority_pin_matched=False,
         signal_persisted=signal_persisted,
         retryable=retryable,
         **extra,
@@ -394,25 +477,46 @@ def _refuse(
 # --------------------------------------------------------------------------- #
 
 
-def admission_enabled(environ: Optional[Mapping[str, str]] = None) -> bool:
-    """Is K8 armed?
+class ModeError(RuntimeError):
+    """The mode setting is not one this build understands."""
+
+    reason_code = "kernel_mode_invalid"
+
+
+def resolve_mode(environ: Optional[Mapping[str, str]] = None) -> bool:
+    """Armed? One environment read, no side effects of any kind.
 
     Arming is explicit: ``HERMES_KERNEL_V1_MODE`` must say so. Pointing
     ``HERMES_KERNEL_ADMITTER_BIN`` at a kernel does NOT arm anything — a path is
     where the kernel lives, not a decision to enforce with it.
 
-    When this answers False it has opened no config file, spawned no process,
-    touched no database and changed no notice.
+    An UNRECOGNISED value raises. Treating a typo as "off" is a fail-open: an
+    operator who wrote ``enfroce`` asked for enforcement and would silently get
+    none. Refusing is the only reading that cannot quietly disable the gate,
+    and it happens here — before any config read, any subprocess and any model.
+
+    A valid "off" returns False having done nothing at all.
     """
     env = os.environ if environ is None else environ
     mode = (env.get(ENV_MODE) or "").strip().lower()
     if mode in _ARMING_MODES:
         return True
-    if mode not in _OFF_MODES:
-        # An unrecognised mode is not an invitation to guess which way the
-        # operator meant it; the safe reading of a typo is "not armed".
-        logger.warning("%s=%r is not a recognised mode; K8 stays off", ENV_MODE, mode)
-    return False
+    if mode in _OFF_MODES:
+        return False
+    raise ModeError(
+        "%s=%r is not a recognised mode (expected one of %s, or one of %s to "
+        "disable); refusing rather than guessing which the operator meant"
+        % (ENV_MODE, mode, sorted(_ARMING_MODES), sorted(m for m in _OFF_MODES if m))
+    )
+
+
+def admission_enabled(environ: Optional[Mapping[str, str]] = None) -> bool:
+    """Armed? Answers False for a valid off, True for a valid arming value.
+
+    An invalid mode is NOT a boolean question, so it propagates as
+    :class:`ModeError` rather than collapsing into False.
+    """
+    return resolve_mode(environ)
 
 
 def content_sha256(text: str) -> str:
@@ -425,7 +529,7 @@ def last_outcome() -> Optional[AdmissionOutcome]:
 
 def reset_state_for_tests() -> None:
     _state.outcome = None
-    _PRE_ADMISSION.set(None)
+    clear_pre_admission()
     _EXECUTION.set(None)
     _ADMITTED_TURN.set(None)
 
@@ -440,21 +544,49 @@ def _remember(outcome: AdmissionOutcome) -> AdmissionOutcome:
 # --------------------------------------------------------------------------- #
 
 
-def publish_pre_admission(outcome: AdmissionOutcome) -> contextvars.Token:
-    """Publish the gateway's verified admission for this request."""
-    return _PRE_ADMISSION.set(outcome)
+def publish_pre_admission(outcome: AdmissionOutcome) -> "PreAdmission":
+    """Publish the gateway's verified admission and return its one-shot carrier.
+
+    The caller OWNS the returned carrier: it transports it explicitly to the one
+    ``run_conversation`` it belongs to, and invalidates it when the request ends.
+    The ContextVar is a convenience for in-thread paths, not the guarantee.
+    """
+    # Retire whatever this context still holds before minting a new one. A
+    # previous request's box may still be referenced by a worker that never
+    # took it; replacing the ContextVar alone would leave that reference live.
+    previous = _PRE_ADMISSION.get()
+    if previous is not None:
+        previous.invalidate()
+    carrier = PreAdmission(outcome)
+    _PRE_ADMISSION.set(carrier)
+    return carrier
 
 
-def consume_pre_admission() -> Optional[AdmissionOutcome]:
+def current_pre_admission() -> Optional["PreAdmission"]:
+    """The carrier published on this context, spent or not."""
+    return _PRE_ADMISSION.get()
+
+
+def clear_pre_admission() -> None:
+    """Retire whatever carrier this context holds. Parent-side lifecycle only."""
+    carrier = _PRE_ADMISSION.get()
+    if carrier is not None:
+        carrier.invalidate()
+    _PRE_ADMISSION.set(None)
+
+
+def consume_pre_admission(carrier: Optional["PreAdmission"] = None) -> Optional[AdmissionOutcome]:
     """Take the pre-admission exactly once.
 
-    Consuming (rather than peeking) is what stops a later turn on the same
-    context from riding an earlier turn's admission.
+    ``carrier`` is the explicitly transported one — the only form that survives
+    the executor boundary correctly. Falling back to the ContextVar keeps the
+    in-thread paths working; the box is what makes both one-shot.
     """
-    outcome = _PRE_ADMISSION.get()
-    if outcome is not None:
-        _PRE_ADMISSION.set(None)
-    return outcome
+    if carrier is None:
+        carrier = _PRE_ADMISSION.get()
+    if carrier is None:
+        return None
+    return carrier.take()
 
 
 def current_execution() -> Optional[WorkReceipt]:
@@ -637,16 +769,21 @@ def _authority_pin(settings: Mapping[str, Any]) -> Optional[Dict[str, str]]:
     }
 
 
-def _authority_verified(document: Mapping[str, Any], pin: Optional[Mapping[str, str]]) -> bool:
-    """Compare everything a forger controls against the pin, in K7's order.
+def _authority_pin_matched(document: Mapping[str, Any], pin: Optional[Mapping[str, str]]) -> bool:
+    """Compare the PUBLIC pin fields a forger controls, in K7's order.
 
-    ⚠️ This is the pin-comparison half of K7's ``verify_pinned_attestation``.
-    The remaining half — recomputing the HMAC — needs the credential behind
-    ``secret_ref``, which this package is not permitted to hold. So a receipt
-    that passes here is *not yet proven authentic*; it has only stopped being
-    obviously forged. Nothing in K8 runs an effect on the strength of it: a
-    long execution is handed off, never executed locally. Closing the HMAC half
-    is K9's, and is stated in ``EXPORTED_CONTRACT``.
+    ⚠️ This is ONLY the pin-comparison half of K7's
+    ``verify_pinned_attestation``, and its name says so. The half that actually
+    authenticates — recomputing the HMAC over the attested core — needs the
+    credential behind ``secret_ref``, which this package may not hold. Every
+    field compared here is public data printed on the receipt itself.
+
+    So a receipt that passes is an UNAUTHENTICATED CANDIDATE, never a verified
+    one. ``authority_verified`` stays False unconditionally, no capability is
+    released on the strength of a match, and the handoff carries
+    ``authority_verification_required`` so K9 is told what is still owed.
+    Calling a public-field comparison "verified" is exactly how a hand-written
+    JSON with an invented work_id once unlocked an enforced gate.
     """
     if not pin:
         return False
@@ -898,7 +1035,15 @@ def _run_admission(
     declares_execution: bool,
     observed_at: int = OBSERVED_AT_UNKNOWN,
 ) -> AdmissionOutcome:
-    if not admission_enabled():
+    try:
+        armed = resolve_mode()
+    except ModeError as exc:
+        # Before config, before subprocess, before the model.
+        logger.error("durable admission mode refused: %s", exc)
+        return _remember(
+            _refuse(ModeError.reason_code, str(exc), seam=seam, session_id=session_id)
+        )
+    if not armed:
         return _off()
 
     settings = _settings()
@@ -1045,7 +1190,7 @@ def _run_admission(
             idempotency_key=document.get("idempotency_key"),
             model_may_run=bool(document.get("model_may_run")),
             kernel_effects_allowed=bool(document.get("effects_allowed")),
-            authority_verified=_authority_verified(document, _authority_pin(settings)),
+            authority_pin_matched=_authority_pin_matched(document, _authority_pin(settings)),
             signal_persisted=signal_persisted,
             replayed=bool(document.get("replayed")),
             admitted_at=int(now),
@@ -1137,6 +1282,7 @@ def handoff_for(outcome: AdmissionOutcome, *, detail: str) -> ExecutionHandoff:
         work_id=outcome.work_id,
         request_key=outcome.request_key,
         retryable=outcome.retryable,
+        authority_pin_matched=outcome.authority_pin_matched,
     )
 
 
@@ -1213,12 +1359,25 @@ def admit_turn_or_block(
     A delegated child is skipped: it runs inside the parent's already-admitted
     execution, and admitting its turn would open a second Work for one job.
     """
-    if not admission_enabled():
-        return None
+    try:
+        if not resolve_mode():
+            return None
+    except ModeError as exc:
+        # A misconfigured mode must not read as "off".
+        logger.error("durable admission mode refused: %s", exc)
+        return blocked_turn_result(
+            agent,
+            _refuse(ModeError.reason_code, str(exc)),
+            conversation_history,
+        )
     if getattr(agent, "_delegate_depth", 0) or getattr(agent, "_subagent_id", None):
         return None
 
-    pre = consume_pre_admission()
+    # The gateway transports its one-shot carrier explicitly (TurnContext ->
+    # the agent, for exactly this call). Prefer it over the ContextVar: turn
+    # work runs under copy_context(), where the ContextVar is a copy and only
+    # the shared box is authoritative.
+    pre = consume_pre_admission(getattr(agent, "_k8_pre_admission", None))
     if pre is not None:
         if pre.mode_off or pre.model_may_run:
             # Bound before any tool can run, so a read-only synchronous subtask
@@ -1270,11 +1429,18 @@ EXPORTED_CONTRACT: Dict[str, Any] = {
     "observed_at": "0 is the explicit 'upstream observation time unknown' "
     "sentinel; the wall clock is NEVER used in the envelope. Recording time "
     "rides --now and is stored by K7 as the Signal's recorded_at.",
+    "authority": "K8 compares PUBLIC AuthorityPin fields only "
+    "(authority_pin_matched). It never authenticates: authority_verified is a "
+    "read-only False, effects_allowed is a read-only False, and no work "
+    "receipt capability is released. Every handoff carries "
+    "authority_verification_required=true.",
+    "carrier": "one-shot PreAdmission box, transported on "
+    "gateway.turn_context.TurnContext.k8_pre_admission and retired by the "
+    "parent frame; never a ContextVar cleared inside a copied executor context",
     "still_open_for_k9": (
         "recompute the attestation HMAC against the pinned AuthorityPin and the "
-        "credential behind its secret_ref; K8 performs the pin comparison half "
-        "(source, root, key id, alg, version, binding) and treats a receipt that "
-        "passes it as NOT-obviously-forged, never as proven authentic",
+        "credential behind its secret_ref; until then nothing K8 emits may "
+        "release an effect, and authority_verified stays a read-only False",
         "effects_allowed enforcement for mutating tools other than delegate_task "
         "(needs model_tools/tool_executor, outside K8's file scope)",
         "an input above MAX_INPUT_CHARS cannot be represented in the frozen "
