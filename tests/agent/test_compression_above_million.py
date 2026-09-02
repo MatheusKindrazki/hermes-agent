@@ -28,6 +28,12 @@ def _turn(content: str) -> dict:
     return {"role": "user", "content": content}
 
 
+def _link_live_tip(spool: DurableCompressionTurnSpool, parent: str, child: str) -> None:
+    epoch = spool.begin_attempt(parent, f"owner-{parent}")
+    assert epoch is not None
+    assert spool.commit_attempt(parent, f"owner-{parent}", epoch, live_tip=child)
+
+
 def test_blocked_compressor_two_turns_are_durable_ordered_and_exactly_once(
     tmp_path,
 ):
@@ -374,6 +380,78 @@ def test_same_session_invalid_state_blocks_ack_without_cross_session_poison(tmp_
     assert [row["client_turn_id"] for row in spool.pending("healthy")] == [
         "healthy-1", "healthy-2"
     ]
+
+
+@pytest.mark.parametrize("invalid_bytes", [b"{broken", b"{}"])
+def test_invalid_child_lineage_blocks_ack_and_preserves_every_byte(
+    tmp_path, invalid_bytes
+):
+    root = tmp_path / "spool"
+    spool = DurableCompressionTurnSpool(root)
+    _link_live_tip(spool, "parent", "child")
+    spool.records("unrelated-empty")  # establish the global lock before snapshot
+    child_state = spool._state_path("child")
+    child_state.write_bytes(invalid_bytes)
+    before = {path.name: path.read_bytes() for path in root.iterdir()}
+
+    with pytest.raises(RuntimeError, match="corrupt|state schema"):
+        spool.enqueue(
+            "parent", _turn("must not ack"), token_count=1,
+            client_turn_id="blocked-turn",
+        )
+    assert {path.name: path.read_bytes() for path in root.iterdir()} == before
+
+
+def test_unrelated_corrupt_lineage_does_not_block_healthy_chain(tmp_path):
+    root = tmp_path / "spool"
+    spool = DurableCompressionTurnSpool(root)
+    _link_live_tip(spool, "healthy-root", "healthy-tip")
+    spool._state_path("unrelated").write_bytes(b"{}")
+
+    receipt = spool.enqueue(
+        "healthy-root", _turn("isolated"), token_count=1,
+        client_turn_id="healthy-turn",
+    )
+    assert receipt["durable"] is True
+    assert [row["client_turn_id"] for row in spool.pending("healthy-root")] == [
+        "healthy-turn"
+    ]
+    assert spool._state_path("unrelated").read_bytes() == b"{}"
+
+
+def test_live_tip_cycle_is_explicit_pre_ack_error_without_mutation(tmp_path):
+    root = tmp_path / "spool"
+    spool = DurableCompressionTurnSpool(root)
+    _link_live_tip(spool, "parent", "child")
+    _link_live_tip(spool, "child", "parent")
+    spool.records("unrelated-empty")  # establish the global lock before snapshot
+    before = {path.name: path.read_bytes() for path in root.iterdir()}
+
+    with pytest.raises(RuntimeError, match="cycle"):
+        spool.enqueue(
+            "parent", _turn("must not choose a tip"), token_count=1,
+            client_turn_id="cycle-turn",
+        )
+    assert {path.name: path.read_bytes() for path in root.iterdir()} == before
+
+
+def test_valid_transitive_lineage_accepts_orders_and_drains_once(tmp_path):
+    spool = DurableCompressionTurnSpool(tmp_path / "spool")
+    _link_live_tip(spool, "root", "mid")
+    _link_live_tip(spool, "mid", "tip")
+    for turn_id in ("one", "two"):
+        assert spool.enqueue(
+            "root", _turn(turn_id), token_count=1, client_turn_id=turn_id
+        )["durable"]
+    assert [row["client_turn_id"] for row in spool.pending("root")] == [
+        "one", "two"
+    ]
+    seen = []
+    assert spool.drain(
+        "root", lambda row, tip: seen.append((row["client_turn_id"], tip))
+    ) == ["one", "two"]
+    assert seen == [("one", "tip"), ("two", "tip")]
+    assert spool.drain("root", lambda *_: None) == []
 
 
 def test_root_swap_after_open_refuses_noncanonical_durable_ack(tmp_path, monkeypatch):

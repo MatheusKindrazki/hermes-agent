@@ -565,7 +565,9 @@ class DurableCompressionTurnSpool:
             if tip == current:
                 return current
             current = tip
-        return current
+        raise RuntimeError(
+            f"compression spool live-tip cycle detected for session: {session_id}"
+        )
 
     def resolve_live_tip(self, session_id: str) -> str:
         with self._locked("global") as root_fd:
@@ -638,7 +640,7 @@ class DurableCompressionTurnSpool:
             # resolved and drained. Validate its state before touching global
             # sequence metadata or creating/revalidating a record. State for
             # unrelated sessions is intentionally not consulted.
-            self._state(str(session_id), root_fd=root_fd)
+            self._resolve_live_tip(str(session_id), root_fd=root_fd)
             for path, payload in self._record_rows(root_fd=root_fd):
                 if (
                     payload.get("origin_session") == session_id
