@@ -795,6 +795,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                         help="Don't actually spawn processes; just print what would happen")
     p_disp.add_argument("--max", type=int, default=None,
                         help="Cap number of spawns this pass")
+    p_disp.add_argument(
+        "--task-id",
+        default=None,
+        help=(
+            "Dispatch only this ready task. The target must belong to the "
+            "selected board/tenant and pass the usual assignee and capacity gates."
+        ),
+    )
     p_disp.add_argument("--failure-limit", type=int,
                         default=kb.DEFAULT_SPAWN_FAILURE_LIMIT,
                         help=f"Auto-block a task after this many consecutive non-success attempts "
@@ -1640,6 +1648,13 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
 
 
 def _cmd_create(args: argparse.Namespace) -> int:
+    # Reject an empty card before parsing can reach any board lookup, DB
+    # initialization, or idempotency reservation. This mirrors the structured
+    # tool's pre-connect validation and keeps every create surface side-effect
+    # free for empty/whitespace payloads.
+    if not getattr(args, "title", None) or not str(args.title).strip():
+        print("kanban: title is required", file=sys.stderr)
+        return 2
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
         branch_name = _parse_branch_flag(getattr(args, "branch", None))
@@ -2761,6 +2776,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn,
+            task_id=getattr(args, "task_id", None),
             dry_run=args.dry_run,
             max_spawn=max_spawn,
             max_in_progress=max_in_progress,
@@ -2787,6 +2803,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
+            "target_reason": res.target_reason,
         }, indent=2))
         return 0
     print(f"Reclaimed:    {res.reclaimed}")

@@ -57,7 +57,9 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
 
     monkeypatch.setattr(kanban_db, "dispatch_once", fake_dispatch_once)
 
-    args = argparse.Namespace(dry_run=True, max=None, failure_limit=2, json=False)
+    args = argparse.Namespace(
+        dry_run=True, max=None, failure_limit=2, json=False, task_id=None,
+    )
     kb_cli._cmd_dispatch(args)
 
     # Every config value must have reached dispatch_once.
@@ -86,11 +88,37 @@ def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypat
         lambda conn, **kw: (captured.update(kw), kanban_db.DispatchResult())[1],
     )
 
-    args = argparse.Namespace(dry_run=True, max=2, failure_limit=2, json=False)
+    args = argparse.Namespace(
+        dry_run=True, max=2, failure_limit=2, json=False, task_id=None,
+    )
     kb_cli._cmd_dispatch(args)
 
     assert captured.get("max_spawn") == 2, (
         f"CLI --max=2 must override config kanban.max_spawn=10; got {captured.get('max_spawn')!r}"
     )
 
+
+def test_cli_dispatch_passes_explicit_task_id(isolated_kanban_home, monkeypatch):
+    """An operator-targeted dispatch must reach the DB dispatcher unchanged."""
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"kanban": {}})
+    captured = {}
+    monkeypatch.setattr(
+        kanban_db,
+        "dispatch_once",
+        lambda conn, **kw: (captured.update(kw), kanban_db.DispatchResult())[1],
+    )
+
+    args = argparse.Namespace(
+        dry_run=True,
+        max=None,
+        failure_limit=2,
+        json=False,
+        task_id="t_second",
+    )
+    kb_cli._cmd_dispatch(args)
+
+    assert captured["task_id"] == "t_second"
 

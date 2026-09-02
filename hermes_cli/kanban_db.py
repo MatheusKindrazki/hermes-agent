@@ -3404,21 +3404,6 @@ def create_task(
             )
         skills_list = cleaned
 
-    # Idempotency check — return the existing task instead of creating a
-    # duplicate. Done BEFORE entering write_txn to keep the fast path fast
-    # and to avoid holding a write lock during the lookup. Race is
-    # acceptable: two concurrent creators with the same key might both
-    # insert, at which point both rows exist but the next lookup stabilises.
-    if idempotency_key:
-        row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1",
-            (idempotency_key,),
-        ).fetchone()
-        if row:
-            return row["id"]
-
     now = int(time.time())
 
     # Resolve workspace_path from board-level default_workdir when the
@@ -3443,12 +3428,27 @@ def create_task(
 
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
-        task_id = _new_task_id()
         try:
             # ``allow_nested=True``: graph builders (kanban_swarm.create_swarm)
             # compose create_task calls under one outer commit so the
             # dispatcher can never observe a partially constructed graph.
             with write_txn(conn, allow_nested=True):
+                # The idempotency lookup and insert share the same IMMEDIATE
+                # transaction. SQLite serializes writers, so two connections
+                # using the same key cannot both pass the lookup: the loser
+                # observes and returns the winner's canonical id without an
+                # exposed IntegrityError or a second workspace-bearing row.
+                if idempotency_key:
+                    row = conn.execute(
+                        "SELECT id FROM tasks WHERE idempotency_key = ? "
+                        "AND status != 'archived' "
+                        "ORDER BY created_at DESC LIMIT 1",
+                        (idempotency_key,),
+                    ).fetchone()
+                    if row:
+                        return row["id"]
+
+                task_id = _new_task_id()
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -8093,6 +8093,16 @@ class DispatchResult:
     spawned. ``None`` when memory was fine/unknown and the guard imposed
     no restriction. Reclaim/promotion bookkeeping still ran either way;
     deferred tasks stay queued for the next tick."""
+    target_reason: Optional[str] = None
+    """Stable reason code for an explicit ``task_id`` dispatch.
+
+    ``None`` means this was a legacy global pass. Targeted passes report one
+    of: ``spawned``, ``task_not_found``, ``board_mismatch``,
+    ``tenant_mismatch``, ``status_not_ready``, ``assignee_required``,
+    ``assignee_not_spawnable``, ``board_capacity_exhausted``,
+    ``host_capacity_exhausted``, ``assignee_capacity_exhausted``,
+    ``memory_pressure``, ``respawn_guarded``, ``claim_failed``, or
+    ``spawn_failed``. Callers can branch on these codes without parsing logs."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -9819,6 +9829,7 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
+    task_id: Optional[str] = None,
     spawn_fn=None,
     ttl_seconds: Optional[int] = None,
     dry_run: bool = False,
@@ -9846,6 +9857,14 @@ def dispatch_once(
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
     cross-process / cross-platform mechanics.
     """
+    if task_id and board is not None:
+        actual_row = conn.execute("PRAGMA database_list").fetchone()
+        actual = str(actual_row["file"] if hasattr(actual_row, "keys") else actual_row[2])
+        expected = str(kanban_db_path(board=board))
+        if actual and Path(actual).resolve() != Path(expected).resolve():
+            result = DispatchResult(target_reason="board_mismatch")
+            _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+            return result
     try:
         db_path = kanban_db_path(board=board)
     except Exception:
@@ -9854,6 +9873,7 @@ def dispatch_once(
         # rather than dropping work.
         result = _dispatch_once_locked(
             conn,
+            task_id=task_id,
             spawn_fn=spawn_fn,
             ttl_seconds=ttl_seconds,
             dry_run=dry_run,
@@ -9874,6 +9894,7 @@ def dispatch_once(
         else:
             result = _dispatch_once_locked(
                 conn,
+                task_id=task_id,
                 spawn_fn=spawn_fn,
                 ttl_seconds=ttl_seconds,
                 dry_run=dry_run,
@@ -9901,6 +9922,7 @@ def dispatch_once(
 def _dispatch_once_locked(
     conn: sqlite3.Connection,
     *,
+    task_id: Optional[str] = None,
     spawn_fn=None,
     ttl_seconds: Optional[int] = None,
     dry_run: bool = False,
@@ -9948,11 +9970,36 @@ def _dispatch_once_locked(
     ``board`` pins workspace/log/db resolution for this tick to a specific
     board. When omitted, the current-board resolution chain is used.
     """
+    result = DispatchResult()
+
+    # A targeted dispatch is an explicit, fail-closed operation. Validate its
+    # identity and routing boundaries before any reclaim, promotion, default
+    # assignment, claim, workspace, or launcher effect. The legacy global
+    # dispatcher keeps its existing sweep semantics when task_id is absent.
+    if task_id:
+        target = conn.execute(
+            "SELECT id, status, assignee, tenant FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if target is None:
+            result.target_reason = "task_not_found"
+            return result
+        expected_tenant = (os.environ.get("HERMES_TENANT") or "").strip() or None
+        target_tenant = (target["tenant"] or "").strip() or None
+        if expected_tenant != target_tenant:
+            result.target_reason = "tenant_mismatch"
+            return result
+        if target["status"] != "ready":
+            result.target_reason = "status_not_ready"
+            return result
+        if not (target["assignee"] or "").strip():
+            result.target_reason = "assignee_required"
+            return result
+
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
 
-    result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
     if reconcile_orphans:
         # Orphaned-card reconciliation: requeue 'running' cards whose claim
@@ -9999,6 +10046,8 @@ def _dispatch_once_locked(
     # budget so the total number of new workers stays bounded.
     if max_spawn is not None:
         if running_count >= max_spawn:
+            if task_id:
+                result.target_reason = "board_capacity_exhausted"
             return result
         spawn_budget = max_spawn - running_count
 
@@ -10015,6 +10064,8 @@ def _dispatch_once_locked(
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            if task_id:
+                result.target_reason = "host_capacity_exhausted"
             return result
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
@@ -10030,6 +10081,8 @@ def _dispatch_once_locked(
     pressure = _memory_pressure_level()
     if pressure == "critical":
         result.memory_pressure = pressure
+        if task_id:
+            result.target_reason = "memory_pressure"
         _log.warning(
             "kanban dispatch: system memory pressure is critical; "
             "spawning no new workers this tick (deferred, not dropped)"
@@ -10044,15 +10097,22 @@ def _dispatch_once_locked(
             )
             spawn_budget = 1
 
-    ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
-        "WHERE status = 'ready' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
-    ).fetchall()
+    if task_id:
+        ready_rows = conn.execute(
+            "SELECT id, assignee FROM tasks "
+            "WHERE id = ? AND status = 'ready' AND claim_lock IS NULL",
+            (task_id,),
+        ).fetchall()
+    else:
+        ready_rows = conn.execute(
+            "SELECT id, assignee FROM tasks "
+            "WHERE status = 'ready' AND claim_lock IS NULL "
+            "ORDER BY priority DESC, created_at ASC"
+        ).fetchall()
     # Review rows are enumerated up front (not after the ready loop) so the
     # budget split below can see whether review work exists at all.
     review_rows = []
-    if review_dispatch_enabled():
+    if not task_id and review_dispatch_enabled():
         review_rows = conn.execute(
             "SELECT id, assignee FROM tasks "
             "WHERE status = 'review' AND claim_lock IS NULL "
@@ -10191,6 +10251,8 @@ def _dispatch_once_locked(
             # multi-lane setups where the ready queue is steadily full
             # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
+            if task_id:
+                result.target_reason = "assignee_not_spawnable"
             continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
@@ -10204,6 +10266,8 @@ def _dispatch_once_locked(
                 result.skipped_per_profile_capped.append(
                     (row["id"], row_assignee, current)
                 )
+                if task_id:
+                    result.target_reason = "assignee_capacity_exhausted"
                 continue
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
@@ -10216,6 +10280,8 @@ def _dispatch_once_locked(
         guard_reason = check_respawn_guard(conn, row["id"])
         if guard_reason is not None:
             result.respawn_guarded.append((row["id"], guard_reason))
+            if task_id:
+                result.target_reason = "respawn_guarded"
             # Emit an event so operators can see why the task was
             # skipped when reading `hermes kanban tail` — without
             # this the task appears stuck in ready with no diagnosis.
@@ -10228,6 +10294,8 @@ def _dispatch_once_locked(
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
+            if task_id:
+                result.target_reason = "spawned"
             spawned += 1
             # Increment per-profile counter even in dry_run so the cap
             # check sees the would-be spawn on subsequent iterations.
@@ -10240,6 +10308,8 @@ def _dispatch_once_locked(
             continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
+            if task_id:
+                result.target_reason = "claim_failed"
             continue
         try:
             resolved_branch_name = None
@@ -10254,6 +10324,8 @@ def _dispatch_once_locked(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+            if task_id:
+                result.target_reason = "spawn_failed"
             continue
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
@@ -10291,6 +10363,8 @@ def _dispatch_once_locked(
             # counter is cleared only on successful completion (see
             # complete_task).
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
+            if task_id:
+                result.target_reason = "spawned"
             spawned += 1
             # Track the new in-flight count for this profile so later
             # iterations in this same tick respect the per-profile cap
@@ -10306,6 +10380,8 @@ def _dispatch_once_locked(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+            if task_id:
+                result.target_reason = "spawn_failed"
 
     # ---- review column dispatch ----
     # Review tasks are tasks that a worker moved to 'review' after
@@ -10717,6 +10793,73 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
+_WORKER_PATH_SOURCE_SCRIPT = r'''
+actual=$(/usr/bin/shasum -a 256 -- "$1") || {
+  printf '%s\n' worker_path_hash_unavailable >&2
+  exit 2
+}
+actual=${actual%% *}
+if [ "$actual" != "$2" ]; then
+  printf '%s\n' worker_path_hash_mismatch >&2
+  exit 2
+fi
+source "$1" || {
+  rc=$?
+  printf '%s\n' worker_path_source_failed >&2
+  exit "$rc"
+}
+'''
+
+_WORKER_PATH_EXEC_SCRIPT = _WORKER_PATH_SOURCE_SCRIPT + r'''
+shift 2
+exec "$@"
+'''
+
+
+def _validate_worker_path_lib(env: Mapping[str, str]) -> tuple[str, str]:
+    """Validate and source the configured worker PATH library fail-closed.
+
+    Returns the absolute library path and normalized SHA-256 for the actual
+    launcher wrapper. Errors expose stable reason codes only; paths, PATH
+    contents, card payloads, and source stderr are deliberately omitted.
+    """
+    lib_value = (env.get("HERMES_WORKER_PATH_LIB") or "").strip()
+    if not lib_value:
+        raise RuntimeError("worker_path_lib_missing")
+    lib_path = Path(lib_value)
+    if not lib_path.is_absolute() or not lib_path.is_file():
+        raise RuntimeError("worker_path_lib_invalid")
+
+    expected = (env.get("K5_WORKER_PATH_SHA256") or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise RuntimeError("worker_path_hash_invalid")
+    try:
+        actual = hashlib.sha256(lib_path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise RuntimeError("worker_path_hash_unavailable") from exc
+    if not secrets.compare_digest(actual, expected):
+        raise RuntimeError("worker_path_hash_mismatch")
+
+    probe = subprocess.run(
+        [
+            "/bin/bash",
+            "-c",
+            _WORKER_PATH_SOURCE_SCRIPT,
+            "hermes-worker-path-probe",
+            str(lib_path),
+            expected,
+        ],
+        env=dict(env),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if probe.returncode != 0:
+        raise RuntimeError("worker_path_source_failed")
+    return str(lib_path), expected
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -10895,6 +11038,23 @@ def _default_spawn(
         # turn, prints text, exits rc=0, and the dispatcher records a
         # protocol violation (incident 2026-06-09 t_d9cbe312).
         cmd.append("-Q")
+
+    # The Mini worker PATH library is a signed launcher prerequisite, not an
+    # optional shell-init convenience. Validate and source it in a disposable
+    # shell before the first launcher-side persistent effect (log directory,
+    # rotation, or Popen). The real child repeats the hash+source check below
+    # to close the validation/use race. Card content never enters either shell
+    # program; only positional argv values do.
+    worker_path_lib, worker_path_sha256 = _validate_worker_path_lib(env)
+    cmd = [
+        "/bin/bash",
+        "-c",
+        _WORKER_PATH_EXEC_SCRIPT,
+        "hermes-worker-path",
+        worker_path_lib,
+        worker_path_sha256,
+        *cmd,
+    ]
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
