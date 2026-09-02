@@ -122,6 +122,20 @@ class DurableCompressionTurnSpool:
         finally:
             os.close(root_fd)
 
+    def _open_root_fd(self) -> int:
+        """Open and pin the validated spool directory for one operation."""
+        self._ensure_root()
+        flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(self.root, flags)
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            os.close(fd)
+            raise RuntimeError("compression spool root is not a directory")
+        return fd
+
     @staticmethod
     def _assert_regular_no_symlink(path: Path, *, allow_missing: bool) -> bool:
         try:
@@ -140,17 +154,17 @@ class DurableCompressionTurnSpool:
 
     @contextlib.contextmanager
     def _locked(self, scope: str):
-        self._ensure_root()
-        lock_key = f"{self.root.resolve()}::{scope}"
+        root_fd = self._open_root_fd()
+        root_stat = os.fstat(root_fd)
+        lock_key = f"{root_stat.st_dev}:{root_stat.st_ino}::{scope}"
         with self._locks_guard:
             local_lock = self._locks.setdefault(lock_key, threading.RLock())
         with local_lock:
-            lock_path = self.root / f".lock-{self._key(scope)}"
-            self._assert_regular_no_symlink(lock_path, allow_missing=True)
+            lock_name = f".lock-{self._key(scope)}"
             flags = os.O_CREAT | os.O_RDWR
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
-            lock_fd = os.open(lock_path, flags, 0o600)
+            lock_fd = os.open(lock_name, flags, 0o600, dir_fd=root_fd)
             os.fchmod(lock_fd, 0o600)
             if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
                 os.close(lock_fd)
@@ -164,18 +178,39 @@ class DurableCompressionTurnSpool:
                     raise RuntimeError("compression spool requires fcntl locking") from exc
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
                 acquired = True
-                yield
+                yield root_fd
             finally:
                 try:
                     if acquired:
                         fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
                 finally:
                     lock_file.close()
+                    os.close(root_fd)
 
-    def _write_json(self, path: Path, payload: dict[str, Any]) -> None:
-        self._ensure_root()
-        self._assert_regular_no_symlink(path, allow_missing=True)
-        fd, temp_name = tempfile.mkstemp(prefix=".compression-turn-", dir=self.root)
+    @staticmethod
+    def _relative_name(path: Path | str) -> str:
+        name = Path(path).name
+        if name != str(path) and Path(path).parent != Path("."):
+            # Public helpers pass absolute Paths rooted at self.root. Only the
+            # basename is used after the root fd has been pinned.
+            name = Path(path).name
+        if not name or name in {".", ".."} or "/" in name or "\\" in name:
+            raise RuntimeError("invalid compression spool filename")
+        return name
+
+    def _write_json(
+        self, path: Path | str, payload: dict[str, Any], *, root_fd: Optional[int] = None
+    ) -> None:
+        own_fd = root_fd is None
+        if own_fd:
+            root_fd = self._open_root_fd()
+        assert root_fd is not None
+        name = self._relative_name(path)
+        temp_name = f".compression-turn-{uuid.uuid4().hex}.tmp"
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(temp_name, flags, 0o600, dir_fd=root_fd)
         try:
             os.fchmod(fd, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -183,34 +218,33 @@ class DurableCompressionTurnSpool:
                 handle.write("\n")
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temp_name, path)
-            dir_flags = os.O_RDONLY
-            if hasattr(os, "O_DIRECTORY"):
-                dir_flags |= os.O_DIRECTORY
-            if hasattr(os, "O_NOFOLLOW"):
-                dir_flags |= os.O_NOFOLLOW
-            dir_fd = os.open(self.root, dir_flags)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
+            os.rename(temp_name, name, src_dir_fd=root_fd, dst_dir_fd=root_fd)
+            os.fsync(root_fd)
         finally:
-            if os.path.exists(temp_name):
-                os.unlink(temp_name)
+            try:
+                os.unlink(temp_name, dir_fd=root_fd)
+            except FileNotFoundError:
+                pass
+            if own_fd:
+                os.close(root_fd)
 
-    def _read_json(self, path: Path) -> Optional[dict[str, Any]]:
-        self._ensure_root()
-        if not self._assert_regular_no_symlink(path, allow_missing=True):
-            return None
+    def _read_json(
+        self, path: Path | str, *, root_fd: Optional[int] = None
+    ) -> Optional[dict[str, Any]]:
+        own_fd = root_fd is None
+        if own_fd:
+            root_fd = self._open_root_fd()
+        assert root_fd is not None
+        name = self._relative_name(path)
         flags = os.O_RDONLY
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         try:
-            fd = os.open(path, flags)
+            fd = os.open(name, flags, dir_fd=root_fd)
             try:
                 if not stat.S_ISREG(os.fstat(fd).st_mode):
                     raise RuntimeError(
-                        f"compression spool path changed during validation: {path.name}"
+                        f"compression spool path changed during validation: {name}"
                     )
                 with os.fdopen(fd, "r", encoding="utf-8") as handle:
                     fd = -1
@@ -218,18 +252,60 @@ class DurableCompressionTurnSpool:
             finally:
                 if fd >= 0:
                     os.close(fd)
+        except FileNotFoundError:
+            return None
         except (ValueError, TypeError) as exc:
-            raise RuntimeError(f"corrupt compression spool JSON: {path.name}") from exc
+            raise RuntimeError(f"corrupt compression spool JSON: {name}") from exc
+        finally:
+            if own_fd:
+                os.close(root_fd)
         if not isinstance(value, dict):
-            raise RuntimeError(f"corrupt compression spool JSON: {path.name}")
+            raise RuntimeError(f"corrupt compression spool JSON: {name}")
         return value
+
+    def _resync_file(self, path: Path | str, *, root_fd: int) -> None:
+        name = self._relative_name(path)
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(name, flags, dir_fd=root_fd)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise RuntimeError(f"compression spool path is not regular: {name}")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.fsync(root_fd)
 
     def _state_path(self, session_id: str) -> Path:
         return self.root / f"state-{self._key(session_id)}.json"
 
-    def _state(self, session_id: str) -> dict[str, Any]:
-        state = self._read_json(self._state_path(session_id)) or {}
+    def _state(self, session_id: str, *, root_fd: Optional[int] = None) -> dict[str, Any]:
+        state = self._read_json(self._state_path(session_id), root_fd=root_fd)
+        if state is None:
+            state = {}
+        elif not (
+            state.get("version", 1) == 1
+            and not isinstance(state.get("version", 1), bool)
+            and isinstance(state.get("session_id"), str)
+            and state.get("session_id") == session_id
+            and isinstance(state.get("epoch"), int)
+            and not isinstance(state.get("epoch"), bool)
+            and isinstance(state.get("committed_epoch"), int)
+            and not isinstance(state.get("committed_epoch"), bool)
+            and (state.get("owner") is None or isinstance(state.get("owner"), str))
+            and isinstance(state.get("live_tip"), str)
+            and (
+                state.get("owner_pid") is None
+                or (
+                    isinstance(state.get("owner_pid"), int)
+                    and not isinstance(state.get("owner_pid"), bool)
+                )
+            )
+        ):
+            raise RuntimeError("invalid compression spool state schema")
         return {
+            "version": 1,
             "session_id": session_id,
             "epoch": int(state.get("epoch") or 0),
             "owner": state.get("owner"),
@@ -237,23 +313,57 @@ class DurableCompressionTurnSpool:
             "committed_epoch": int(state.get("committed_epoch") or 0),
             "owner_pid": state.get("owner_pid"),
             "lease_expires_ns": int(state.get("lease_expires_ns") or 0),
+            "owner_process_identity": state.get("owner_process_identity"),
+            "lease_started_monotonic_ns": int(
+                state.get("lease_started_monotonic_ns") or 0
+            ),
+            "lease_duration_ns": int(state.get("lease_duration_ns") or 0),
         }
 
     @staticmethod
-    def _pid_alive(pid: Any) -> bool:
+    def _process_identity(pid: Any) -> Optional[str]:
         try:
             pid_int = int(pid)
         except (TypeError, ValueError):
-            return True
+            return None
         if pid_int <= 0:
-            return True
+            return None
+        boot = "unknown"
+        try:
+            boot = Path("/proc/sys/kernel/random/boot_id").read_text(
+                encoding="utf-8"
+            ).strip()
+        except OSError:
+            try:
+                import subprocess
+
+                boot = subprocess.check_output(
+                    ["sysctl", "-n", "kern.boottime"], text=True
+                ).strip()
+            except Exception:
+                boot = "unknown"
+        start = None
         try:
             os.kill(pid_int, 0)
-            return True
+            try:
+                fields = Path(f"/proc/{pid_int}/stat").read_text(
+                    encoding="utf-8"
+                ).split()
+                start = fields[21]
+            except (OSError, IndexError):
+                try:
+                    import subprocess
+
+                    start = subprocess.check_output(
+                        ["ps", "-o", "lstart=", "-p", str(pid_int)], text=True
+                    ).strip()
+                except Exception:
+                    return None
         except ProcessLookupError:
-            return False
+            return None
         except (PermissionError, OSError):
-            return True
+            return None
+        return f"{boot}:{pid_int}:{start}" if start else None
 
     def begin_attempt(
         self,
@@ -263,22 +373,27 @@ class DurableCompressionTurnSpool:
         allow_stale_owner_takeover: bool = False,
         lease_seconds: float = 300.0,
     ) -> Optional[int]:
-        with self._locked(f"state:{session_id}"):
-            state = self._state(session_id)
+        with self._locked(f"state:{session_id}") as root_fd:
+            state = self._state(session_id, root_fd=root_fd)
             if state["owner"]:
-                lease_expired = time.time_ns() >= int(state["lease_expires_ns"] or 0)
-                owner_dead = not self._pid_alive(state.get("owner_pid"))
-                if not (
-                    allow_stale_owner_takeover and lease_expired and owner_dead
-                ):
+                current_identity = self._process_identity(state.get("owner_pid"))
+                owner_dead_or_reused = (
+                    current_identity is None
+                    or current_identity != state.get("owner_process_identity")
+                )
+                if not (allow_stale_owner_takeover and owner_dead_or_reused):
                     return None
             state["epoch"] += 1
             state["owner"] = owner
             state["owner_pid"] = os.getpid()
+            state["owner_process_identity"] = self._process_identity(os.getpid())
+            duration_ns = max(1, int(float(lease_seconds) * 1_000_000_000))
+            state["lease_started_monotonic_ns"] = time.monotonic_ns()
+            state["lease_duration_ns"] = duration_ns
             state["lease_expires_ns"] = time.time_ns() + max(
-                1, int(float(lease_seconds) * 1_000_000_000)
+                1, duration_ns
             )
-            self._write_json(self._state_path(session_id), state)
+            self._write_json(self._state_path(session_id), state, root_fd=root_fd)
             return int(state["epoch"])
 
     def commit_attempt(
@@ -289,18 +404,26 @@ class DurableCompressionTurnSpool:
         *,
         live_tip: str,
     ) -> bool:
-        with self._locked(f"state:{session_id}"):
-            state = self._state(session_id)
+        with self._locked(f"state:{session_id}") as root_fd:
+            state = self._state(session_id, root_fd=root_fd)
             if state["owner"] != owner or int(state["epoch"]) != int(epoch):
                 return False
-            if time.time_ns() >= int(state["lease_expires_ns"] or 0):
+            if self._process_identity(state.get("owner_pid")) != state.get(
+                "owner_process_identity"
+            ):
+                return False
+            if (
+                time.monotonic_ns() - int(state["lease_started_monotonic_ns"] or 0)
+                >= int(state["lease_duration_ns"] or 0)
+            ):
                 return False
             state["owner"] = None
             state["owner_pid"] = None
+            state["owner_process_identity"] = None
             state["lease_expires_ns"] = 0
             state["committed_epoch"] = int(epoch)
             state["live_tip"] = str(live_tip)
-            self._write_json(self._state_path(session_id), state)
+            self._write_json(self._state_path(session_id), state, root_fd=root_fd)
             return True
 
     def refresh_attempt(
@@ -311,52 +434,97 @@ class DurableCompressionTurnSpool:
         *,
         lease_seconds: float = 300.0,
     ) -> bool:
-        with self._locked(f"state:{session_id}"):
-            state = self._state(session_id)
+        with self._locked(f"state:{session_id}") as root_fd:
+            state = self._state(session_id, root_fd=root_fd)
             if state["owner"] != owner or int(state["epoch"]) != int(epoch):
                 return False
-            state["lease_expires_ns"] = time.time_ns() + max(
-                1, int(float(lease_seconds) * 1_000_000_000)
-            )
-            self._write_json(self._state_path(session_id), state)
+            duration_ns = max(1, int(float(lease_seconds) * 1_000_000_000))
+            state["lease_started_monotonic_ns"] = time.monotonic_ns()
+            state["lease_duration_ns"] = duration_ns
+            state["lease_expires_ns"] = time.time_ns() + duration_ns
+            self._write_json(self._state_path(session_id), state, root_fd=root_fd)
             return True
 
     def abort_attempt(self, session_id: str, owner: str, epoch: int) -> bool:
-        with self._locked(f"state:{session_id}"):
-            state = self._state(session_id)
+        with self._locked(f"state:{session_id}") as root_fd:
+            state = self._state(session_id, root_fd=root_fd)
             if state["owner"] != owner or int(state["epoch"]) != int(epoch):
                 return False
             state["owner"] = None
             state["owner_pid"] = None
+            state["owner_process_identity"] = None
             state["lease_expires_ns"] = 0
-            self._write_json(self._state_path(session_id), state)
+            self._write_json(self._state_path(session_id), state, root_fd=root_fd)
             return True
 
-    def resolve_live_tip(self, session_id: str) -> str:
+    def reconcile_canonical_tip(
+        self,
+        session_id: str,
+        live_tip: str,
+        *,
+        expected_owner: Optional[str] = None,
+        expected_epoch: Optional[int] = None,
+    ) -> bool:
+        """Record a SessionDB-proven child after a partial spool commit."""
+        if not live_tip or str(live_tip) == str(session_id):
+            return False
+        with self._locked(f"state:{session_id}") as root_fd:
+            state = self._state(session_id, root_fd=root_fd)
+            if state["live_tip"] == str(live_tip):
+                self._resync_file(self._state_path(session_id), root_fd=root_fd)
+                return True
+            caller_still_fenced = (
+                expected_owner is not None
+                and expected_epoch is not None
+                and state["owner"] == expected_owner
+                and int(state["epoch"]) == int(expected_epoch)
+            )
+            if not caller_still_fenced:
+                if state["owner"] and self._process_identity(
+                    state.get("owner_pid")
+                ) == state.get("owner_process_identity"):
+                    return False
+                state["epoch"] = int(state["epoch"]) + 1
+            state["committed_epoch"] = int(state["epoch"])
+            state["owner"] = None
+            state["owner_pid"] = None
+            state["owner_process_identity"] = None
+            state["lease_expires_ns"] = 0
+            state["lease_started_monotonic_ns"] = 0
+            state["lease_duration_ns"] = 0
+            state["live_tip"] = str(live_tip)
+            self._write_json(self._state_path(session_id), state, root_fd=root_fd)
+            return True
+
+    def _resolve_live_tip(self, session_id: str, *, root_fd: int) -> str:
         current = str(session_id)
         visited: set[str] = set()
         while current not in visited:
             visited.add(current)
-            tip = str(self._state(current)["live_tip"] or current)
+            tip = str(self._state(current, root_fd=root_fd)["live_tip"] or current)
             if tip == current:
                 return current
             current = tip
         return current
 
-    def _iter_record_files(self):
-        self._ensure_root()
+    def resolve_live_tip(self, session_id: str) -> str:
+        with self._locked("global") as root_fd:
+            return self._resolve_live_tip(session_id, root_fd=root_fd)
+
+    def _iter_record_files(self, *, root_fd: int):
         return [
-            path
-            for path in self.root.glob("*.json")
-            if not path.name.startswith("state-")
-            and path.name != "global-state.json"
+            self.root / name
+            for name in os.listdir(root_fd)
+            if name.endswith(".json")
+            and not name.startswith("state-")
+            and name != "global-state.json"
         ]
 
-    def _record_rows(self) -> list[tuple[Path, dict[str, Any]]]:
+    def _record_rows(self, *, root_fd: int) -> list[tuple[Path, dict[str, Any]]]:
         rows = []
-        for path in self._iter_record_files():
-            payload = self._read_json(path)
-            if not payload or not isinstance(payload.get("message"), dict):
+        for path in self._iter_record_files(root_fd=root_fd):
+            payload = self._read_json(path, root_fd=root_fd)
+            if payload is None:
                 continue
             payload.setdefault("session_id", payload.get("origin_session"))
             payload.setdefault("origin_session", payload.get("session_id"))
@@ -364,6 +532,34 @@ class DurableCompressionTurnSpool:
             payload.setdefault("created_ns", 0)
             payload.setdefault("sequence", int(payload.get("created_ns") or 0))
             payload.setdefault("status", "pending")
+            valid = (
+                isinstance(payload.get("origin_session"), str)
+                and bool(payload.get("origin_session"))
+                and isinstance(payload.get("session_id"), str)
+                and bool(payload.get("session_id"))
+                and payload.get("session_id") == payload.get("origin_session")
+                and isinstance(payload.get("client_turn_id"), str)
+                and bool(payload.get("client_turn_id"))
+                and isinstance(payload.get("message"), dict)
+                and isinstance(payload["message"].get("role"), str)
+                and "content" in payload["message"]
+                and isinstance(payload.get("created_ns"), int)
+                and not isinstance(payload.get("created_ns"), bool)
+                and isinstance(payload.get("sequence"), int)
+                and not isinstance(payload.get("sequence"), bool)
+                and payload.get("status") in {"pending", "drained"}
+                and (
+                    "version" not in payload
+                    or (
+                        payload.get("version") == 1
+                        and not isinstance(payload.get("version"), bool)
+                        and isinstance(payload.get("token_count"), int)
+                        and not isinstance(payload.get("token_count"), bool)
+                    )
+                )
+            )
+            if not valid:
+                raise RuntimeError(f"invalid compression spool record schema: {path.name}")
             rows.append((path, payload))
         rows.sort(key=lambda item: (int(item[1]["sequence"]), int(item[1]["created_ns"])))
         return rows
@@ -377,18 +573,31 @@ class DurableCompressionTurnSpool:
         client_turn_id: Optional[str] = None,
     ) -> dict[str, Any]:
         turn_id = str(client_turn_id or uuid.uuid4().hex)
-        with self._locked("global"):
-            for path, payload in self._record_rows():
+        with self._locked("global") as root_fd:
+            for path, payload in self._record_rows(root_fd=root_fd):
                 if (
                     payload.get("origin_session") == session_id
                     and payload.get("client_turn_id") == turn_id
                 ):
+                    self._resync_file(path, root_fd=root_fd)
                     return {"accepted": True, "durable": True, "turn_id": turn_id, "path": path}
             global_path = self.root / "global-state.json"
-            global_state = self._read_json(global_path) or {"sequence": 0}
+            global_state = self._read_json(global_path, root_fd=root_fd)
+            if global_state is None:
+                global_state = {"version": 1, "sequence": 0}
+            elif not (
+                global_state.get("version", 1) == 1
+                and not isinstance(global_state.get("version", 1), bool)
+                and isinstance(global_state.get("sequence"), int)
+                and not isinstance(global_state.get("sequence"), bool)
+            ):
+                raise RuntimeError("invalid compression spool global schema")
+            else:
+                self._resync_file(global_path, root_fd=root_fd)
             sequence = int(global_state.get("sequence") or 0) + 1
             global_state["sequence"] = sequence
-            self._write_json(global_path, global_state)
+            global_state["version"] = 1
+            self._write_json(global_path, global_state, root_fd=root_fd)
             created_ns = time.time_ns()
             record_path = self.root / f"turn-{sequence:020d}-{uuid.uuid4().hex}.json"
             payload = {
@@ -402,7 +611,7 @@ class DurableCompressionTurnSpool:
                 "created_ns": created_ns,
                 "status": "pending",
             }
-            self._write_json(record_path, payload)
+            self._write_json(record_path, payload, root_fd=root_fd)
             return {
                 "accepted": True,
                 "durable": True,
@@ -411,26 +620,29 @@ class DurableCompressionTurnSpool:
             }
 
     def records(self, session_id: str) -> list[dict[str, Any]]:
-        target_tip = self.resolve_live_tip(session_id)
-        return [
-            copy.deepcopy(payload)
-            for _path, payload in self._record_rows()
-            if payload.get("origin_session")
-            and self.resolve_live_tip(str(payload["origin_session"])) == target_tip
-        ]
+        with self._locked("global") as root_fd:
+            target_tip = self._resolve_live_tip(session_id, root_fd=root_fd)
+            return [
+                copy.deepcopy(payload)
+                for _path, payload in self._record_rows(root_fd=root_fd)
+                if payload.get("origin_session")
+                and self._resolve_live_tip(
+                    str(payload["origin_session"]), root_fd=root_fd
+                ) == target_tip
+            ]
 
     def pending(self, session_id: str) -> list[dict[str, Any]]:
         return [row for row in self.records(session_id) if row.get("status") != "drained"]
 
     def drain(self, session_id: str, consumer: Callable[[dict[str, Any], str], None]) -> list[str]:
         drained: list[str] = []
-        with self._locked("global"):
-            live_tip = self.resolve_live_tip(session_id)
-            for path, payload in self._record_rows():
+        with self._locked("global") as root_fd:
+            live_tip = self._resolve_live_tip(session_id, root_fd=root_fd)
+            for path, payload in self._record_rows(root_fd=root_fd):
                 origin = payload.get("origin_session")
                 if (
                     not origin
-                    or self.resolve_live_tip(str(origin)) != live_tip
+                    or self._resolve_live_tip(str(origin), root_fd=root_fd) != live_tip
                     or payload.get("status") == "drained"
                 ):
                     continue
@@ -438,7 +650,7 @@ class DurableCompressionTurnSpool:
                 payload["status"] = "drained"
                 payload["drained_tip"] = live_tip
                 payload["drained_ns"] = time.time_ns()
-                self._write_json(path, payload)
+                self._write_json(path, payload, root_fd=root_fd)
                 drained.append(str(payload["client_turn_id"]))
         return drained
 
@@ -446,6 +658,26 @@ class DurableCompressionTurnSpool:
 def compression_turn_spool() -> DurableCompressionTurnSpool:
     home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
     return DurableCompressionTurnSpool(home / "compression_turn_spool")
+
+
+def ensure_compression_turn_identity(message: dict[str, Any]) -> str:
+    """Stamp one stable internal identity before transcript persistence."""
+    metadata = message.get("display_metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+        message["display_metadata"] = metadata
+    turn_id = str(
+        message.get("client_turn_id")
+        or message.get("platform_message_id")
+        or message.get("message_id")
+        or message.get("_compression_spool_turn_id")
+        or metadata.get("_compression_turn_id")
+        or f"compression-turn:{uuid.uuid4().hex}"
+    )
+    message["client_turn_id"] = turn_id
+    message["_compression_spool_turn_id"] = turn_id
+    metadata["_compression_turn_id"] = turn_id
+    return turn_id
 
 
 def spool_deferred_compression_turn(
@@ -467,13 +699,7 @@ def spool_deferred_compression_turn(
         return None
     message = copy.deepcopy(source)
     message.pop("_db_persisted", None)
-    turn_id = str(
-        message.get("client_turn_id")
-        or message.get("platform_message_id")
-        or message.get("message_id")
-        or uuid.uuid4().hex
-    )
-    message["_compression_spool_turn_id"] = turn_id
+    turn_id = ensure_compression_turn_identity(message)
     return compression_turn_spool().enqueue(
         session_id,
         message,
@@ -503,24 +729,13 @@ def drain_compression_turns_into_agent(
                 message.get("platform_message_id"),
                 message.get("message_id"),
                 message.get("client_turn_id"),
+                (message.get("display_metadata") or {}).get(
+                    "_compression_turn_id"
+                ) if isinstance(message.get("display_metadata"), dict) else None,
             )
             if value not in (None, "")
         }
         dedupe_ids = {spool_dedupe_id, *original_ids}
-        has_id = getattr(session_db, "has_platform_message_id", None)
-        already_durable = bool(
-            callable(has_id)
-            and any(has_id(live_tip, candidate) for candidate in dedupe_ids)
-        )
-        if not already_durable:
-            persisted_id = next(iter(sorted(original_ids)), spool_dedupe_id)
-            session_db.append_message(
-                live_tip,
-                str(message.get("role") or "user"),
-                message.get("content"),
-                platform_message_id=persisted_id,
-                timestamp=message.get("timestamp"),
-            )
         already_live = False
         for existing in live_messages:
             if not isinstance(existing, dict):
@@ -532,12 +747,29 @@ def drain_compression_turns_into_agent(
                     existing.get("platform_message_id"),
                     existing.get("message_id"),
                     existing.get("client_turn_id"),
+                    (existing.get("display_metadata") or {}).get(
+                        "_compression_turn_id"
+                    ) if isinstance(existing.get("display_metadata"), dict) else None,
                 )
                 if value not in (None, "")
             }
             if turn_id in existing_ids or bool(original_ids & existing_ids):
                 already_live = True
                 break
+        has_id = getattr(session_db, "has_platform_message_id", None)
+        already_durable = bool(
+            callable(has_id)
+            and any(has_id(live_tip, candidate) for candidate in dedupe_ids)
+        ) or already_live
+        if not already_durable:
+            persisted_id = next(iter(sorted(original_ids)), spool_dedupe_id)
+            session_db.append_message(
+                live_tip,
+                str(message.get("role") or "user"),
+                message.get("content"),
+                platform_message_id=persisted_id,
+                timestamp=message.get("timestamp"),
+            )
         if not already_live:
             message["_compression_spool_turn_id"] = turn_id
             message["_db_persisted"] = True
@@ -2192,7 +2424,11 @@ def recover_rotated_compression_session(
             recovered = _adopt_live_compression_child(agent, session_db, session_id)
             if recovered is not None:
                 try:
-                    drain_compression_turns_into_agent(agent, session_id, recovered)
+                    canonical_tip = session_db.get_compression_tip(session_id)
+                    if compression_turn_spool().reconcile_canonical_tip(
+                        session_id, str(canonical_tip or "")
+                    ):
+                        drain_compression_turns_into_agent(agent, session_id, recovered)
                 except Exception:
                     logger.warning(
                         "compression turn spool recovery drain failed for %s",
@@ -5053,6 +5289,27 @@ def compress_context(
                     _lock_sid,
                     exc_info=True,
                 )
+                try:
+                    _canonical_tip = (
+                        _lock_db.get_compression_tip(_lock_sid)
+                        if _lock_db is not None
+                        else None
+                    )
+                    if _turn_spool.reconcile_canonical_tip(
+                        _lock_sid,
+                        str(_canonical_tip or ""),
+                        expected_owner=_lock_holder,
+                        expected_epoch=_turn_spool_epoch,
+                    ):
+                        drain_compression_turns_into_agent(
+                            agent, _lock_sid, compressed
+                        )
+                except Exception:
+                    logger.warning(
+                        "compression canonical tip reconciliation failed for %s",
+                        _lock_sid,
+                        exc_info=True,
+                    )
 
         # Round-2 #4: the activity heartbeat's terminal "context compression
         # completed" stamp landed on the PARENT row (force-persisted before

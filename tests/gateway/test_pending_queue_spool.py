@@ -9,6 +9,7 @@ successful transcript flush — not silently discarded (#78182, #82616).
 import json
 import logging
 import os
+import stat
 import builtins
 import threading
 
@@ -262,7 +263,7 @@ class TestSpoolPrimitives:
         with pytest.raises(RuntimeError, match="requires fcntl"):
             spool.enqueue("s", {"role": "user", "content": "x"}, token_count=1)
 
-    @pytest.mark.parametrize("fail_call", [1, 2])
+    @pytest.mark.parametrize("fail_call", [1, 2, 3, 4])
     def test_file_or_directory_fsync_failure_prevents_ack(
         self, spool_home, monkeypatch, fail_call
     ):
@@ -280,3 +281,37 @@ class TestSpoolPrimitives:
         spool = DurableCompressionTurnSpool(spool_home / "compression_turn_spool")
         with pytest.raises(OSError, match="fsync failed"):
             spool.enqueue("s", {"role": "user", "content": "x"}, token_count=1)
+
+    def test_visible_record_is_revalidated_before_retry_ack(
+        self, spool_home, monkeypatch
+    ):
+        spool = DurableCompressionTurnSpool(spool_home / "compression_turn_spool")
+        # Establish global metadata so the injected directory failure lands
+        # after the record replace has made the turn visible.
+        spool.enqueue(
+            "seed", {"role": "user", "content": "seed"},
+            token_count=1, client_turn_id="seed",
+        )
+        real_fsync = os.fsync
+        directory_calls = 0
+
+        def reject_directory(fd):
+            nonlocal directory_calls
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                directory_calls += 1
+                if directory_calls >= 3:
+                    raise OSError("directory fsync failed")
+            return real_fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", reject_directory)
+        message = {"role": "user", "content": "retry me"}
+        with pytest.raises(OSError, match="directory fsync failed"):
+            spool.enqueue("s", message, token_count=1, client_turn_id="retry-id")
+        # The replace is visible, but that is not durable evidence. A retry
+        # under the same fault must not ACK the visible record.
+        with pytest.raises(OSError, match="directory fsync failed"):
+            spool.enqueue("s", message, token_count=1, client_turn_id="retry-id")
+
+        monkeypatch.setattr(os, "fsync", real_fsync)
+        receipt = spool.enqueue("s", message, token_count=1, client_turn_id="retry-id")
+        assert receipt["durable"] is True

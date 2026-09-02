@@ -10,11 +10,13 @@ import json
 import os
 import stat
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 from agent.conversation_compression import (
     DurableCompressionTurnSpool,
     drain_compression_turns_into_agent,
+    ensure_compression_turn_identity,
 )
 from agent.conversation_loop import _compression_deferred_result
 from hermes_state import SessionDB
@@ -318,6 +320,55 @@ def test_corrupt_json_is_explicit_and_preserved(tmp_path):
     assert global_state.read_bytes() == b"{broken-global"
 
 
+def test_structurally_invalid_json_is_explicit_and_preserved(tmp_path):
+    root = tmp_path / "spool"
+    spool = DurableCompressionTurnSpool(root)
+    spool.enqueue("s", _turn("ok"), token_count=1)
+
+    record = next(root.glob("turn-*.json"))
+    record.write_bytes(b"{}")
+    with __import__("pytest").raises(RuntimeError, match="record schema"):
+        spool.pending("s")
+    assert record.read_bytes() == b"{}"
+    record.unlink()
+
+    state = spool._state_path("s")
+    state.write_bytes(b"{}")
+    with __import__("pytest").raises(RuntimeError, match="state schema"):
+        spool.begin_attempt("s", "owner")
+    assert state.read_bytes() == b"{}"
+    state.unlink()
+
+    global_state = root / "global-state.json"
+    global_state.write_bytes(b"{}")
+    with __import__("pytest").raises(RuntimeError, match="global schema"):
+        spool.enqueue("s", _turn("new"), token_count=1)
+    assert global_state.read_bytes() == b"{}"
+
+
+def test_root_swap_after_open_cannot_write_external_directory(tmp_path, monkeypatch):
+    root = tmp_path / "spool"
+    external = tmp_path / "external"
+    external.mkdir()
+    spool = DurableCompressionTurnSpool(root)
+    original = spool._open_root_fd
+    swapped = False
+
+    def swap_after_open():
+        nonlocal swapped
+        fd = original()
+        if not swapped:
+            swapped = True
+            parked = tmp_path / "parked"
+            root.rename(parked)
+            root.symlink_to(external, target_is_directory=True)
+        return fd
+
+    monkeypatch.setattr(spool, "_open_root_fd", swap_after_open)
+    spool.enqueue("s", _turn("anchored"), token_count=1)
+    assert list(external.iterdir()) == []
+
+
 def test_real_session_db_and_live_context_dedupe_original_message_id(
     monkeypatch, tmp_path
 ):
@@ -365,3 +416,71 @@ def test_real_session_db_and_live_context_dedupe_original_message_id(
     assert [
         row["content"] for row in db.get_messages_as_conversation("child")
     ].count("already durable") == 1
+
+
+def test_two_identical_no_id_turns_remain_exactly_two_after_mark_crash(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("child", source="test")
+    spool = DurableCompressionTurnSpool(tmp_path / "compression_turn_spool")
+    turns = [_turn("same"), _turn("same")]
+    ids = [ensure_compression_turn_identity(turn) for turn in turns]
+    assert len(set(ids)) == 2
+    for turn, turn_id in zip(turns, ids):
+        db.append_message(
+            "child", "user", turn["content"],
+            display_metadata=turn["display_metadata"],
+        )
+        spool.enqueue("parent", turn, token_count=1, client_turn_id=turn_id)
+    epoch = spool.begin_attempt("parent", "owner")
+    assert spool.commit_attempt("parent", "owner", epoch, live_tip="child")
+
+    agent = SimpleNamespace(_session_db=db)
+    live = db.get_messages_as_conversation("child")
+    drain_compression_turns_into_agent(agent, "parent", live)
+    assert [row["content"] for row in db.get_messages_as_conversation("child")] == [
+        "same", "same"
+    ]
+
+    # Simulate append -> durable drained-mark loss for both records.
+    for path in (tmp_path / "compression_turn_spool").glob("turn-*.json"):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["status"] = "pending"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    restarted_live = db.get_messages_as_conversation("child")
+    drain_compression_turns_into_agent(agent, "parent", restarted_live)
+    assert [row["content"] for row in db.get_messages_as_conversation("child")] == [
+        "same", "same"
+    ]
+
+
+def test_db_child_tip_reconciles_after_spool_commit_write_failure(tmp_path, monkeypatch):
+    spool = DurableCompressionTurnSpool(tmp_path / "spool")
+    spool.enqueue("parent", _turn("queued"), token_count=1, client_turn_id="turn")
+    epoch = spool.begin_attempt("parent", "owner")
+    original_write = spool._write_json
+    failed = False
+
+    def fail_state_once(path, payload, **kwargs):
+        nonlocal failed
+        if not failed and Path(path).name.startswith("state-"):
+            failed = True
+            raise OSError("state commit failed")
+        return original_write(path, payload, **kwargs)
+
+    monkeypatch.setattr(spool, "_write_json", fail_state_once)
+    with __import__("pytest").raises(OSError, match="state commit failed"):
+        spool.commit_attempt("parent", "owner", epoch, live_tip="child")
+
+    # SessionDB has already published child. The same fenced owner can repair
+    # the spool boundary and the pending turn drains only to that child.
+    assert spool.reconcile_canonical_tip(
+        "parent", "child", expected_owner="owner", expected_epoch=epoch
+    )
+    seen = []
+    assert spool.drain(
+        "parent", lambda row, tip: seen.append((row["client_turn_id"], tip))
+    ) == ["turn"]
+    assert seen == [("turn", "child")]

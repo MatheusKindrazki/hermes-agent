@@ -35,6 +35,7 @@ from agent.conversation_compression import (
     PRE_API_COMPRESSION_STATUS_TEMPLATE,
     compression_skipped_due_to_lock,
     conversation_history_after_compression,
+    ensure_compression_turn_identity,
     spool_deferred_compression_turn,
 )
 from agent.context_engine import automatic_compaction_status_message
@@ -1908,6 +1909,24 @@ def run_conversation(
                     persist_user_message = _decoded_message
         except Exception:
             pass
+
+    # Bind a durable, per-input identity before build_turn_context performs
+    # its crash-resilience append. The staged mapping is the same object the
+    # turn prologue adopts, so the ID reaches both SessionDB display metadata
+    # and a later compression spool without changing provider-visible content.
+    _expected_persist_content = (
+        persist_user_message if persist_user_message is not None else user_message
+    )
+    _staged_user = getattr(agent, "_pending_cli_user_message", None)
+    if not (
+        isinstance(_staged_user, dict)
+        and _staged_user.get("content") == _expected_persist_content
+    ):
+        _staged_user = {"role": "user", "content": _expected_persist_content}
+        if persist_user_timestamp is not None:
+            _staged_user["timestamp"] = persist_user_timestamp
+        agent._pending_cli_user_message = _staged_user
+    ensure_compression_turn_identity(_staged_user)
 
     # The gateway caches agents across user turns.  Compression state is
     # per-turn: carrying a prior in-place boundary forward would make a later

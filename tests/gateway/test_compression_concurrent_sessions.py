@@ -240,3 +240,30 @@ def test_expired_owner_cannot_publish_live_tip(tmp_path: Path) -> None:
     time.sleep(0.02)
     assert spool.commit_attempt("shared", "owner", epoch, live_tip="bad") is False
     assert spool.resolve_live_tip("shared") == "shared"
+
+
+def test_pid_reuse_and_wall_clock_rollback_do_not_wedge_takeover(
+    tmp_path: Path, monkeypatch
+) -> None:
+    spool = DurableCompressionTurnSpool(tmp_path / "compression-spool")
+    monkeypatch.setattr(spool, "_process_identity", lambda _pid: "boot-a:proc-old")
+    assert spool.begin_attempt("shared", "old", lease_seconds=0.01) == 1
+    monkeypatch.setattr(time, "time_ns", lambda: 1)
+    monkeypatch.setattr(spool, "_process_identity", lambda _pid: "boot-a:proc-reused")
+    assert spool.begin_attempt(
+        "shared", "new", allow_stale_owner_takeover=True
+    ) == 2
+    assert spool.commit_attempt("shared", "old", 1, live_tip="stale") is False
+    assert spool.commit_attempt("shared", "new", 2, live_tip="child") is True
+
+
+def test_live_owner_identity_is_never_stolen_after_wall_clock_jump(
+    tmp_path: Path, monkeypatch
+) -> None:
+    spool = DurableCompressionTurnSpool(tmp_path / "compression-spool")
+    monkeypatch.setattr(spool, "_process_identity", lambda _pid: "boot-a:live")
+    assert spool.begin_attempt("shared", "live", lease_seconds=0.01) == 1
+    monkeypatch.setattr(time, "time_ns", lambda: 10**30)
+    assert spool.begin_attempt(
+        "shared", "contender", allow_stale_owner_takeover=True
+    ) is None
