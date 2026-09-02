@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import logging
 import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Tuple
 
@@ -262,9 +266,74 @@ class EgressPolicy:
             content=content,
             metadata=original,
         )
+        # ``off`` is deliberately byte-compatible with the pre-K10 route: no
+        # subprocess, no schema lookup and no new metadata.  Shadow/enforce
+        # must however prove the immutable voice envelope at the common egress
+        # seam, not merely trust a caller's prompt.
         if self.mode != "off":
+            tone = self._evaluate_tone_envelope(original)
+            original["tone_gate"] = tone
+            if not tone["allowed"]:
+                return original, EgressDecision(
+                    False, "rejected", tuple(tone["reasons"]), self.mode,
+                    True, decision.envelope,
+                )
             original["egress_policy"] = decision.metadata()
         return original, decision
+
+    def _evaluate_tone_envelope(self, metadata: Mapping[str, Any]) -> dict[str, Any]:
+        """Run the pinned K11 executable without a shell.
+
+        K10 intentionally accepts an explicit ``tone_envelope`` only.  It
+        cannot safely invent immutable facts from prose.  A missing envelope,
+        a non-absolute executable, a timeout, or a schema mismatch is a
+        fail-closed refusal in both shadow and enforce modes.
+        """
+        envelope = metadata.get("tone_envelope")
+        if not isinstance(envelope, Mapping):
+            return {"allowed": False, "reasons": ["tone_envelope_missing"]}
+        raw = json.dumps(dict(envelope), sort_keys=True, separators=(",", ":")).encode()
+        gate = str(os.environ.get("HERMES_TONE_GATE_BIN") or "").strip()
+        pinned_sha = str(os.environ.get("HERMES_TONE_SCHEMA_SHA256") or "").strip()
+        if not gate or not os.path.isabs(gate) or not os.access(gate, os.X_OK):
+            return {"allowed": False, "reasons": ["tone_gate_unavailable"]}
+        if len(pinned_sha) != 64 or any(c not in "0123456789abcdef" for c in pinned_sha):
+            return {"allowed": False, "reasons": ["tone_schema_unpinned"]}
+        policy = Path(gate).with_name("tone-policy.v1.json")
+        if not policy.is_file():
+            return {"allowed": False, "reasons": ["tone_policy_unavailable"]}
+        try:
+            gate_env = dict(os.environ)
+            # K11 defaults to off for standalone safety.  The already-resolved
+            # egress mode is the sole authority that arms this invocation.
+            gate_env["HERMES_TONE_CONTRACT_V2"] = self.mode
+            result = subprocess.run(
+                [gate, "evaluate", "--stdin", "--policy", str(policy),
+                 "--require-schema-sha256", pinned_sha],
+                input=raw, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=2.0, check=False, env=gate_env,
+            )
+        except subprocess.TimeoutExpired:
+            return {"allowed": False, "reasons": ["tone_gate_timeout"]}
+        except OSError:
+            return {"allowed": False, "reasons": ["tone_gate_unavailable"]}
+        try:
+            receipt = json.loads(result.stdout.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return {"allowed": False, "reasons": ["tone_gate_invalid_receipt"]}
+        if not isinstance(receipt, Mapping):
+            return {"allowed": False, "reasons": ["tone_gate_invalid_receipt"]}
+        if receipt.get("schema_version") != "tone-envelope.v1" or receipt.get("schema_sha256") != pinned_sha:
+            return {"allowed": False, "reasons": ["tone_schema_mismatch"]}
+        if receipt.get("timeout_ms") != 2000:
+            return {"allowed": False, "reasons": ["tone_timeout_contract_mismatch"]}
+        if result.returncode != 0 or receipt.get("ok") is not True or receipt.get("facts_match") is not True:
+            return {"allowed": False, "reasons": ["tone_gate_rejected"]}
+        # K11 only permits high-risk as draft-only.  Any other non-sendable
+        # result is a refusal at the physical egress seam.
+        if self.mode == "enforce" and receipt.get("sendable") is not True:
+            return {"allowed": False, "reasons": ["tone_gate_not_sendable"]}
+        return {"allowed": True, "reasons": [], "receipt": dict(receipt)}
 
     def evaluate(
         self,
