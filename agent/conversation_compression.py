@@ -126,7 +126,12 @@ class DurableCompressionTurnSpool:
                         raise RuntimeError(
                             "compression spool canonical root is missing"
                         )
-                    os.mkdir(part, 0o700, dir_fd=current_fd)
+                    try:
+                        os.mkdir(part, 0o700, dir_fd=current_fd)
+                    except FileExistsError:
+                        # Another process won the same safe component create.
+                        # The no-follow open below revalidates what appeared.
+                        pass
                     next_fd = os.open(
                         part, self._directory_flags(), dir_fd=current_fd
                     )
@@ -230,6 +235,19 @@ class DurableCompressionTurnSpool:
                         lock_file.close()
         finally:
             os.close(root_fd)
+
+    @contextlib.contextmanager
+    def _lineage_locked(self, session_id: str):
+        """Fence lineage reads/writes with one cross-process lock order.
+
+        Lock order is always ``global lineage`` then ``session state``.
+        Enqueue/drain only need the outer global fence; every state writer
+        enters through this helper. No code may acquire global while holding a
+        session lock, preventing nested inversion across threads/processes.
+        """
+        with self._locked("global"):
+            with self._locked(f"state:{session_id}") as root_fd:
+                yield root_fd
 
     @staticmethod
     def _relative_name(path: Path | str) -> str:
@@ -434,7 +452,7 @@ class DurableCompressionTurnSpool:
         allow_stale_owner_takeover: bool = False,
         lease_seconds: float = 300.0,
     ) -> Optional[int]:
-        with self._locked(f"state:{session_id}") as root_fd:
+        with self._lineage_locked(session_id) as root_fd:
             state = self._state(session_id, root_fd=root_fd)
             if state["owner"]:
                 owner_liveness = self._owner_liveness(state)
@@ -467,12 +485,18 @@ class DurableCompressionTurnSpool:
         *,
         live_tip: str,
     ) -> bool:
-        with self._locked(f"state:{session_id}") as root_fd:
+        with self._lineage_locked(session_id) as root_fd:
             state = self._state(session_id, root_fd=root_fd)
             if state["owner"] != owner or int(state["epoch"]) != int(epoch):
                 return False
             if self._owner_liveness(state) != "alive":
                 return False
+            if str(live_tip) != str(session_id):
+                proposed_tip = self._resolve_live_tip(
+                    str(live_tip), root_fd=root_fd
+                )
+                if proposed_tip == str(session_id):
+                    return False
             if (
                 time.monotonic_ns() - int(state["lease_started_monotonic_ns"] or 0)
                 >= int(state["lease_duration_ns"] or 0)
@@ -495,7 +519,7 @@ class DurableCompressionTurnSpool:
         *,
         lease_seconds: float = 300.0,
     ) -> bool:
-        with self._locked(f"state:{session_id}") as root_fd:
+        with self._lineage_locked(session_id) as root_fd:
             state = self._state(session_id, root_fd=root_fd)
             if state["owner"] != owner or int(state["epoch"]) != int(epoch):
                 return False
@@ -507,7 +531,7 @@ class DurableCompressionTurnSpool:
             return True
 
     def abort_attempt(self, session_id: str, owner: str, epoch: int) -> bool:
-        with self._locked(f"state:{session_id}") as root_fd:
+        with self._lineage_locked(session_id) as root_fd:
             state = self._state(session_id, root_fd=root_fd)
             if state["owner"] != owner or int(state["epoch"]) != int(epoch):
                 return False
@@ -529,8 +553,14 @@ class DurableCompressionTurnSpool:
         """Record a SessionDB-proven child after a partial spool commit."""
         if not live_tip:
             return False
-        with self._locked(f"state:{session_id}") as root_fd:
+        with self._lineage_locked(session_id) as root_fd:
             state = self._state(session_id, root_fd=root_fd)
+            if str(live_tip) != str(session_id):
+                proposed_tip = self._resolve_live_tip(
+                    str(live_tip), root_fd=root_fd
+                )
+                if proposed_tip == str(session_id):
+                    return False
             caller_still_fenced = (
                 expected_owner is not None
                 and expected_epoch is not None

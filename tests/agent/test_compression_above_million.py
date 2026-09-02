@@ -423,7 +423,22 @@ def test_live_tip_cycle_is_explicit_pre_ack_error_without_mutation(tmp_path):
     root = tmp_path / "spool"
     spool = DurableCompressionTurnSpool(root)
     _link_live_tip(spool, "parent", "child")
-    _link_live_tip(spool, "child", "parent")
+    # Simulate a legacy/on-disk cycle. Public writers now reject creating it;
+    # enqueue must still fail explicitly when recovery encounters old bytes.
+    spool._state_path("child").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "session_id": "child",
+                "epoch": 0,
+                "committed_epoch": 0,
+                "owner": None,
+                "owner_pid": None,
+                "live_tip": "parent",
+            }
+        ),
+        encoding="utf-8",
+    )
     spool.records("unrelated-empty")  # establish the global lock before snapshot
     before = {path.name: path.read_bytes() for path in root.iterdir()}
 
@@ -452,6 +467,77 @@ def test_valid_transitive_lineage_accepts_orders_and_drains_once(tmp_path):
     ) == ["one", "two"]
     assert seen == [("one", "tip"), ("two", "tip")]
     assert spool.drain("root", lambda *_: None) == []
+
+
+@pytest.mark.parametrize("cyclic", [True, False])
+def test_enqueue_ack_is_fenced_against_concurrent_live_tip_commit(
+    tmp_path, monkeypatch, cyclic
+):
+    spool = DurableCompressionTurnSpool(tmp_path / "spool")
+    if cyclic:
+        _link_live_tip(spool, "child", "parent")
+    epoch = spool.begin_attempt("parent", "writer")
+    assert epoch is not None
+    validated = threading.Event()
+    writer_finished = threading.Event()
+    original_resolve = spool._resolve_live_tip
+    paused = False
+
+    def pause_after_validation(session_id, *, root_fd):
+        nonlocal paused
+        tip = original_resolve(session_id, root_fd=root_fd)
+        if (
+            threading.current_thread().name == "enqueue-thread"
+            and session_id == "parent"
+            and not paused
+        ):
+            paused = True
+            validated.set()
+            writer_finished.wait(timeout=0.25)
+        return tip
+
+    monkeypatch.setattr(spool, "_resolve_live_tip", pause_after_validation)
+    receipts = []
+    commit_results = []
+
+    def enqueue_turn():
+        receipts.append(
+            spool.enqueue(
+                "parent", _turn("raced"), token_count=1,
+                client_turn_id="raced-turn",
+            )
+        )
+
+    def publish_tip():
+        assert validated.wait(timeout=5)
+        commit_results.append(
+            spool.commit_attempt(
+                "parent", "writer", epoch, live_tip="child"
+            )
+        )
+        writer_finished.set()
+
+    enqueue_thread = threading.Thread(target=enqueue_turn, name="enqueue-thread")
+    writer_thread = threading.Thread(target=publish_tip, name="writer-thread")
+    enqueue_thread.start()
+    writer_thread.start()
+    enqueue_thread.join(timeout=5)
+    writer_thread.join(timeout=5)
+    assert not enqueue_thread.is_alive() and not writer_thread.is_alive()
+    assert receipts and receipts[0]["durable"] is True
+
+    if cyclic:
+        assert commit_results == [False]
+        assert spool.resolve_live_tip("parent") == "parent"
+        assert spool.abort_attempt("parent", "writer", epoch) is True
+    else:
+        assert commit_results == [True]
+        assert spool.resolve_live_tip("parent") == "child"
+    seen = []
+    assert spool.drain(
+        "parent", lambda row, tip: seen.append((row["client_turn_id"], tip))
+    ) == ["raced-turn"]
+    assert seen == [("raced-turn", "parent" if cyclic else "child")]
 
 
 def test_root_swap_after_open_refuses_noncanonical_durable_ack(tmp_path, monkeypatch):

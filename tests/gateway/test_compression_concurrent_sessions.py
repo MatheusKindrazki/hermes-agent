@@ -210,6 +210,53 @@ def _hold_spool_owner(root: str, ready, release) -> None:
     release.get(timeout=10)
 
 
+def _run_spool_fence_operation(root: str, start, results, operation: str) -> None:
+    spool = DurableCompressionTurnSpool(root)
+    start.wait(timeout=10)
+    if operation == "enqueue":
+        result = spool.enqueue(
+            "root", {"role": "user", "content": "multiprocess"},
+            token_count=1, client_turn_id="mp-turn",
+        )["durable"]
+    elif operation == "commit":
+        epoch = spool.begin_attempt("root", "commit-owner")
+        result = bool(
+            epoch
+            and spool.commit_attempt(
+                "root", "commit-owner", epoch, live_tip="child"
+            )
+        )
+    elif operation == "abort":
+        epoch = spool.begin_attempt("abort-session", "abort-owner")
+        result = bool(
+            epoch
+            and spool.abort_attempt("abort-session", "abort-owner", epoch)
+        )
+    elif operation == "reconcile":
+        epoch = spool.begin_attempt("reconcile-session", "reconcile-owner")
+        result = bool(
+            epoch
+            and spool.reconcile_canonical_tip(
+                "reconcile-session",
+                "reconcile-tip",
+                expected_owner="reconcile-owner",
+                expected_epoch=epoch,
+            )
+        )
+    else:  # pragma: no cover - test helper guard
+        raise AssertionError(operation)
+    results.put((operation, result))
+
+
+def _drain_spool_in_process(root: str, results) -> None:
+    spool = DurableCompressionTurnSpool(root)
+    seen = []
+    drained = spool.drain(
+        "root", lambda row, tip: seen.append((row["client_turn_id"], tip))
+    )
+    results.put((drained, seen))
+
+
 def test_live_process_owner_cannot_be_taken_over(tmp_path: Path) -> None:
     root = str(tmp_path / "compression-spool")
     ctx = multiprocessing.get_context("spawn")
@@ -233,6 +280,47 @@ def test_live_process_owner_cannot_be_taken_over(tmp_path: Path) -> None:
     assert spool.commit_attempt("shared", "child-owner", 1, live_tip="bad") is False
     assert spool.commit_attempt("shared", "contender", 2, live_tip="good") is True
     assert spool.resolve_live_tip("shared") == "good"
+
+
+def test_multiprocess_lineage_fence_operations_terminate_canonically(
+    tmp_path: Path,
+) -> None:
+    root = str(tmp_path / "compression-spool")
+    # Establish the shared root and global lock before the contention phase;
+    # this test targets lock ordering, not first-create path races (covered by
+    # the dedicated canonical-root adversarial tests).
+    DurableCompressionTurnSpool(root).records("seed")
+    ctx = multiprocessing.get_context("spawn")
+    start = ctx.Event()
+    results = ctx.Queue()
+    operations = ("enqueue", "commit", "abort", "reconcile")
+    processes = [
+        ctx.Process(
+            target=_run_spool_fence_operation,
+            args=(root, start, results, operation),
+        )
+        for operation in operations
+    ]
+    for process in processes:
+        process.start()
+    start.set()
+    observed = dict(results.get(timeout=15) for _ in operations)
+    for process in processes:
+        process.join(timeout=15)
+        assert process.exitcode == 0
+    assert observed == {operation: True for operation in operations}
+
+    drain_results = ctx.Queue()
+    drainer = ctx.Process(target=_drain_spool_in_process, args=(root, drain_results))
+    drainer.start()
+    drained, seen = drain_results.get(timeout=15)
+    drainer.join(timeout=15)
+    assert drainer.exitcode == 0
+    assert drained == ["mp-turn"]
+    assert seen == [("mp-turn", "child")]
+    spool = DurableCompressionTurnSpool(root)
+    assert spool.resolve_live_tip("root") == "child"
+    assert spool.pending("root") == []
 
 
 def test_expired_owner_cannot_publish_live_tip(tmp_path: Path) -> None:
