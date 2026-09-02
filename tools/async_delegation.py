@@ -708,6 +708,50 @@ def has_live_for_session(
         )
 
 
+def _refuse_session_bound_dispatch(work_receipt: Any = None) -> Optional[Dict[str, Any]]:
+    """Refuse to accept long work into this registry while K8 is armed.
+
+    This registry is SESSION-BOUND: its records, its executor and its recovery
+    all belong to the process that owns them. An ACK from here is therefore a
+    promise that dies with the process — which is exactly what a killed owner
+    recovering as ``unknown`` was telling us. So under durable admission the
+    answer is not "dispatch it with a receipt", it is "this is not the place":
+    long work is handed to the external Work dispatcher by
+    ``delegate_tool.delegate_task`` before it ever reaches this module.
+
+    A ``work_receipt`` argument changes nothing and is refused whatever it
+    holds. It is still verified rather than ignored, because the interesting
+    failure is a caller that believes a hand-built ``{"work_id": "fake"}``
+    bought it a dispatch: that must be a named refusal, not an accident of
+    ordering. Runs BEFORE the capacity check, the ledger insert and
+    ``executor.submit``, so a refusal leaves no row, no thread and no handle.
+
+    Returns None when the dispatch may proceed — which, unarmed, is always: the
+    pre-K8 registry is preserved exactly, and no schema is migrated.
+    """
+    from agent.durable_admission import admission_enabled, verify_work_receipt
+
+    if not admission_enabled():
+        return None
+    sealed = verify_work_receipt(work_receipt)
+    logger.warning(
+        "async delegation refused: durable admission is armed and this "
+        "registry is session-bound (sealed_receipt=%s)", bool(sealed),
+    )
+    return {
+        "status": "rejected",
+        "reason": "session_bound_dispatch_refused",
+        "error": (
+            "Nothing was started. Durable admission is enabled, and background "
+            "delegations may not run in this process-local registry — it cannot "
+            "survive a restart, so its acknowledgement would be a promise "
+            "nobody can keep. Long work is handed to the external Work "
+            "dispatcher instead. No subagent was spawned and no record was "
+            "created."
+        ),
+    }
+
+
 def _new_delegation_id() -> str:
     return f"deleg_{uuid.uuid4().hex[:8]}"
 
@@ -773,6 +817,7 @@ def dispatch_async_delegation(
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     progress_fn: Optional[Callable[[], tuple]] = None,
+    work_receipt: Any = None,
 ) -> Dict[str, Any]:
     """Spawn ``runner`` on the daemon executor and return a handle immediately.
 
@@ -809,13 +854,21 @@ def dispatch_async_delegation(
         Concurrency cap. When at capacity the dispatch is REJECTED (the caller
         should fall back to sync or tell the user) rather than queued, so a
         runaway model can't pile up unbounded background work.
+    work_receipt
+        Present only so a caller that believes it holds one gets a NAMED
+        refusal. While durable admission is armed no receipt authorises a
+        session-bound dispatch (see ``_refuse_session_bound_dispatch``).
 
     Returns
     -------
     dict
         ``{"status": "dispatched", "delegation_id": ...}`` on success, or
-        ``{"status": "rejected", "error": ...}`` when at capacity.
+        ``{"status": "rejected", "error": ...}`` when at capacity or when
+        durable admission refuses this registry entirely.
     """
+    refusal = _refuse_session_bound_dispatch(work_receipt)
+    if refusal is not None:
+        return refusal
     delegation_id = _new_delegation_id()
     dispatched_at = time.time()
     record: Dict[str, Any] = {
@@ -1036,6 +1089,7 @@ def dispatch_async_delegation_batch(
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     delegation_id: Optional[str] = None,
     progress_fn: Optional[Callable[[], tuple]] = None,
+    work_receipt: Any = None,
 ) -> Dict[str, Any]:
     """Dispatch a WHOLE fan-out batch as ONE background unit.
 
@@ -1055,8 +1109,11 @@ def dispatch_async_delegation_batch(
 
     Returns ``{"status": "dispatched", "delegation_id": ...}`` on success or
     ``{"status": "rejected", "error": ...}`` when the async pool is at
-    capacity.
+    capacity or when durable admission refuses this registry entirely.
     """
+    refusal = _refuse_session_bound_dispatch(work_receipt)
+    if refusal is not None:
+        return refusal
     delegation_id = delegation_id or _new_delegation_id()
     dispatched_at = time.time()
     n = len(goals)

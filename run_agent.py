@@ -8474,6 +8474,14 @@ class AIAgent:
 
         New DELEGATE_TASK_SCHEMA fields only need to be added here to reach all
         invocation paths (concurrent, sequential, inline).
+
+        Durable admission (K8) is deliberately NOT applied here. The Work gate
+        lives inside ``delegate_task`` itself, in front of the background
+        branch, so it covers every caller by construction: this dispatch, the
+        sibling registry handler at the bottom of ``delegate_tool``, direct
+        Python callers and the review engine. Gating at this call site instead
+        would leave those siblings able to ACK a detached child with no
+        recoverable Work — the exact bug class the gate exists to close.
         """
         from tools.delegate_tool import (
             _strip_model_hidden_task_fields,

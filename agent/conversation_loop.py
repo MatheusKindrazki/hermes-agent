@@ -40,6 +40,7 @@ from agent.conversation_compression import (
 )
 from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
+from agent.durable_admission import admit_turn_or_block
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.message_metadata import append_message
 from agent.turn_context import (
@@ -1909,6 +1910,30 @@ def run_conversation(
                     persist_user_message = _decoded_message
         except Exception:
             pass
+
+    # ── Durable admission (K8) ──
+    # Nothing model-facing may run before the kernel has durably recorded this
+    # input. The seam sits HERE — after the MoA decode, so what is admitted is
+    # the text the user actually wrote rather than the transport envelope, and
+    # before ``build_turn_context``, which runs preflight compression, the
+    # oversized-resume rebuild and the ``pre_llm_call`` hook. The Codex
+    # app-server runtime branches further down, after that call, so it is
+    # covered by this one gate.
+    #
+    # On a gateway turn the Signal was already recorded at ingress, before
+    # vision/STT/compression rewrote this text; that verified outcome is
+    # consumed here rather than re-admitted, so one inbound message is one
+    # Signal and never two. Nothing about the request is altered either way:
+    # no synthetic turn, no system-prompt or history edit, no toolset change.
+    #
+    # Unarmed, this is a single environment read and a ``None``, so the pre-K8
+    # turn is preserved exactly: no config file is opened, no subprocess exists,
+    # and no database is touched.
+    _admission_block = admit_turn_or_block(
+        agent, user_message, conversation_history=conversation_history
+    )
+    if _admission_block is not None:
+        return _admission_block
 
     # Bind a durable, per-input identity before build_turn_context performs
     # its crash-resilience append. The staged mapping is the same object the
