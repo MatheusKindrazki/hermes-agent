@@ -22,6 +22,7 @@ import multiprocessing
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -246,10 +247,14 @@ def test_pid_reuse_and_wall_clock_rollback_do_not_wedge_takeover(
     tmp_path: Path, monkeypatch
 ) -> None:
     spool = DurableCompressionTurnSpool(tmp_path / "compression-spool")
-    monkeypatch.setattr(spool, "_process_identity", lambda _pid: "boot-a:proc-old")
+    monkeypatch.setattr(
+        spool, "_process_liveness", lambda _pid: ("alive", "boot-a:proc-old")
+    )
     assert spool.begin_attempt("shared", "old", lease_seconds=0.01) == 1
     monkeypatch.setattr(time, "time_ns", lambda: 1)
-    monkeypatch.setattr(spool, "_process_identity", lambda _pid: "boot-a:proc-reused")
+    monkeypatch.setattr(
+        spool, "_process_liveness", lambda _pid: ("alive", "boot-a:proc-reused")
+    )
     assert spool.begin_attempt(
         "shared", "new", allow_stale_owner_takeover=True
     ) == 2
@@ -261,9 +266,49 @@ def test_live_owner_identity_is_never_stolen_after_wall_clock_jump(
     tmp_path: Path, monkeypatch
 ) -> None:
     spool = DurableCompressionTurnSpool(tmp_path / "compression-spool")
-    monkeypatch.setattr(spool, "_process_identity", lambda _pid: "boot-a:live")
+    monkeypatch.setattr(
+        spool, "_process_liveness", lambda _pid: ("alive", "boot-a:live")
+    )
     assert spool.begin_attempt("shared", "live", lease_seconds=0.01) == 1
     monkeypatch.setattr(time, "time_ns", lambda: 10**30)
     assert spool.begin_attempt(
         "shared", "contender", allow_stale_owner_takeover=True
     ) is None
+
+
+def test_unknown_process_identity_is_fail_closed_for_takeover(
+    tmp_path: Path, monkeypatch
+) -> None:
+    spool = DurableCompressionTurnSpool(tmp_path / "compression-spool")
+    monkeypatch.setattr(
+        spool, "_process_liveness", lambda _pid: ("alive", "known-owner")
+    )
+    assert spool.begin_attempt("shared", "owner") == 1
+    monkeypatch.setattr(
+        spool, "_process_liveness", lambda _pid: ("unknown", None)
+    )
+    assert spool.begin_attempt(
+        "shared", "contender", allow_stale_owner_takeover=True
+    ) is None
+
+
+def test_typed_turn_metadata_reaches_pre_persistence_context(monkeypatch) -> None:
+    from agent import conversation_loop
+
+    agent = SimpleNamespace(_pending_cli_user_message=None)
+    captured = {}
+
+    def capture_build(*args, **kwargs):
+        captured.update(kwargs["persist_user_display_metadata"])
+        raise RuntimeError("captured")
+
+    monkeypatch.setattr(conversation_loop, "build_turn_context", capture_build)
+    with pytest.raises(RuntimeError, match="captured"):
+        conversation_loop.run_conversation(
+            agent,
+            "continue",
+            persist_user_display_kind="auto_continue",
+            persist_user_display_metadata={"task_count": 2},
+        )
+    assert captured["task_count"] == 2
+    assert captured["_compression_turn_id"].startswith("compression-turn:")

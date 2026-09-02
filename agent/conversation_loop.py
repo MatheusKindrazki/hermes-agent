@@ -1926,7 +1926,24 @@ def run_conversation(
         if persist_user_timestamp is not None:
             _staged_user["timestamp"] = persist_user_timestamp
         agent._pending_cli_user_message = _staged_user
+    _typed_metadata = (
+        dict(persist_user_display_metadata)
+        if isinstance(persist_user_display_metadata, dict)
+        else {}
+    )
+    _typed_metadata.pop("_compression_turn_id", None)
+    _staged_metadata = _staged_user.get("display_metadata")
+    if not isinstance(_staged_metadata, dict):
+        _staged_metadata = {}
+    else:
+        _staged_metadata = dict(_staged_metadata)
+    _staged_metadata.update(_typed_metadata)
+    _staged_user["display_metadata"] = _staged_metadata
     ensure_compression_turn_identity(_staged_user)
+    if persist_user_display_kind:
+        # turn_context applies typed metadata after adopting this staged dict;
+        # pass the merged mapping so that assignment retains the internal ID.
+        persist_user_display_metadata = _staged_user["display_metadata"]
 
     # The gateway caches agents across user turns.  Compression state is
     # per-turn: carrying a prior in-place boundary forward would make a later

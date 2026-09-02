@@ -13,6 +13,8 @@ import threading
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from agent.conversation_compression import (
     DurableCompressionTurnSpool,
     drain_compression_turns_into_agent,
@@ -346,7 +348,7 @@ def test_structurally_invalid_json_is_explicit_and_preserved(tmp_path):
     assert global_state.read_bytes() == b"{}"
 
 
-def test_root_swap_after_open_cannot_write_external_directory(tmp_path, monkeypatch):
+def test_root_swap_after_open_refuses_noncanonical_durable_ack(tmp_path, monkeypatch):
     root = tmp_path / "spool"
     external = tmp_path / "external"
     external.mkdir()
@@ -365,7 +367,19 @@ def test_root_swap_after_open_cannot_write_external_directory(tmp_path, monkeypa
         return fd
 
     monkeypatch.setattr(spool, "_open_root_fd", swap_after_open)
-    spool.enqueue("s", _turn("anchored"), token_count=1)
+    with pytest.raises(RuntimeError, match="canonical|symlink|non-directory"):
+        spool.enqueue("s", _turn("anchored"), token_count=1)
+    assert list(external.iterdir()) == []
+
+
+def test_intermediate_symlink_is_rejected_without_external_write(tmp_path):
+    external = tmp_path / "external"
+    external.mkdir()
+    linked_home = tmp_path / "linked-home"
+    linked_home.symlink_to(external, target_is_directory=True)
+    spool = DurableCompressionTurnSpool(linked_home / "compression_turn_spool")
+    with pytest.raises(RuntimeError, match="symlink|directory|canonical"):
+        spool.enqueue("s", _turn("must stay out"), token_count=1)
     assert list(external.iterdir()) == []
 
 
@@ -484,3 +498,31 @@ def test_db_child_tip_reconciles_after_spool_commit_write_failure(tmp_path, monk
         "parent", lambda row, tip: seen.append((row["client_turn_id"], tip))
     ) == ["turn"]
     assert seen == [("turn", "child")]
+
+
+def test_in_place_tip_reconciles_after_state_commit_failure(tmp_path, monkeypatch):
+    spool = DurableCompressionTurnSpool(tmp_path / "spool")
+    spool.enqueue("same", _turn("queued"), token_count=1, client_turn_id="turn")
+    epoch = spool.begin_attempt("same", "owner")
+    original_write = spool._write_json
+    failed = False
+
+    def fail_state_once(path, payload, **kwargs):
+        nonlocal failed
+        if not failed and Path(path).name.startswith("state-"):
+            failed = True
+            raise OSError("state commit failed")
+        return original_write(path, payload, **kwargs)
+
+    monkeypatch.setattr(spool, "_write_json", fail_state_once)
+    with pytest.raises(OSError, match="state commit failed"):
+        spool.commit_attempt("same", "owner", epoch, live_tip="same")
+    assert spool.reconcile_canonical_tip(
+        "same", "same", expected_owner="owner", expected_epoch=epoch
+    )
+    state = spool._state("same")
+    assert state["owner"] is None
+    assert state["committed_epoch"] == epoch
+    seen = []
+    assert spool.drain("same", lambda row, tip: seen.append((row["client_turn_id"], tip))) == ["turn"]
+    assert seen == [("turn", "same")]

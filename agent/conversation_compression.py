@@ -98,43 +98,84 @@ class DurableCompressionTurnSpool:
     _locks: dict[str, threading.RLock] = {}
 
     def __init__(self, root: Path | str) -> None:
-        self.root = Path(root)
+        self.root = Path(os.path.abspath(os.fspath(root)))
 
-    def _ensure_root(self) -> None:
-        try:
-            root_stat = os.lstat(self.root)
-        except FileNotFoundError:
-            self.root.parent.mkdir(parents=True, exist_ok=True)
-            os.mkdir(self.root, 0o700)
-            root_stat = os.lstat(self.root)
-        if os.path.islink(self.root) or not stat.S_ISDIR(root_stat.st_mode):
-            raise RuntimeError("compression spool root must be a real directory")
-        root_flags = os.O_RDONLY
-        if hasattr(os, "O_DIRECTORY"):
-            root_flags |= os.O_DIRECTORY
-        if hasattr(os, "O_NOFOLLOW"):
-            root_flags |= os.O_NOFOLLOW
-        root_fd = os.open(self.root, root_flags)
-        try:
-            if not stat.S_ISDIR(os.fstat(root_fd).st_mode):
-                raise RuntimeError("compression spool root changed during validation")
-            os.fchmod(root_fd, 0o700)
-        finally:
-            os.close(root_fd)
-
-    def _open_root_fd(self) -> int:
-        """Open and pin the validated spool directory for one operation."""
-        self._ensure_root()
+    @staticmethod
+    def _directory_flags() -> int:
         flags = os.O_RDONLY
         if hasattr(os, "O_DIRECTORY"):
             flags |= os.O_DIRECTORY
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
-        fd = os.open(self.root, flags)
+        return flags
+
+    def _open_root_path_fd(self, *, create: bool) -> int:
+        """Walk the absolute root one no-follow directory component at a time."""
+        parts = self.root.parts
+        if not parts or parts[0] != os.sep or any(part in {"", ".", ".."} for part in parts[1:]):
+            raise RuntimeError("compression spool root must be an absolute safe path")
+        current_fd = os.open(os.sep, self._directory_flags())
+        try:
+            for index, part in enumerate(parts[1:]):
+                try:
+                    next_fd = os.open(
+                        part, self._directory_flags(), dir_fd=current_fd
+                    )
+                except FileNotFoundError:
+                    if not create:
+                        raise RuntimeError(
+                            "compression spool canonical root is missing"
+                        )
+                    os.mkdir(part, 0o700, dir_fd=current_fd)
+                    next_fd = os.open(
+                        part, self._directory_flags(), dir_fd=current_fd
+                    )
+                except OSError as exc:
+                    raise RuntimeError(
+                        "compression spool path contains a symlink or non-directory"
+                    ) from exc
+                os.close(current_fd)
+                current_fd = next_fd
+                if index == len(parts[1:]) - 1:
+                    os.fchmod(current_fd, 0o700)
+            return current_fd
+        except Exception:
+            os.close(current_fd)
+            raise
+
+    def _ensure_root(self) -> None:
+        root_fd = self._open_root_path_fd(create=True)
+        os.close(root_fd)
+
+    def _open_root_fd(self) -> int:
+        """Open and pin the validated spool directory for one operation."""
+        fd = self._open_root_path_fd(create=True)
         if not stat.S_ISDIR(os.fstat(fd).st_mode):
             os.close(fd)
             raise RuntimeError("compression spool root is not a directory")
         return fd
+
+    def _assert_canonical_root(self, root_fd: int, record_name: Optional[str] = None) -> None:
+        canonical_fd = self._open_root_path_fd(create=False)
+        try:
+            pinned = os.fstat(root_fd)
+            canonical = os.fstat(canonical_fd)
+            if (pinned.st_dev, pinned.st_ino) != (canonical.st_dev, canonical.st_ino):
+                raise RuntimeError("compression spool canonical root changed")
+            if record_name is not None:
+                flags = os.O_RDONLY
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                record_fd = os.open(record_name, flags, dir_fd=canonical_fd)
+                try:
+                    if not stat.S_ISREG(os.fstat(record_fd).st_mode):
+                        raise RuntimeError(
+                            "compression spool canonical record is not regular"
+                        )
+                finally:
+                    os.close(record_fd)
+        finally:
+            os.close(canonical_fd)
 
     @staticmethod
     def _assert_regular_no_symlink(path: Path, *, allow_missing: bool) -> bool:
@@ -159,33 +200,36 @@ class DurableCompressionTurnSpool:
         lock_key = f"{root_stat.st_dev}:{root_stat.st_ino}::{scope}"
         with self._locks_guard:
             local_lock = self._locks.setdefault(lock_key, threading.RLock())
-        with local_lock:
-            lock_name = f".lock-{self._key(scope)}"
-            flags = os.O_CREAT | os.O_RDWR
-            if hasattr(os, "O_NOFOLLOW"):
-                flags |= os.O_NOFOLLOW
-            lock_fd = os.open(lock_name, flags, 0o600, dir_fd=root_fd)
-            os.fchmod(lock_fd, 0o600)
-            if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
-                os.close(lock_fd)
-                raise RuntimeError("compression spool lock is not a regular file")
-            lock_file = os.fdopen(lock_fd, "a+b")
-            acquired = False
-            try:
+        try:
+            local_context = local_lock
+            with local_context:
+                lock_name = f".lock-{self._key(scope)}"
+                flags = os.O_CREAT | os.O_RDWR
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                lock_fd = os.open(lock_name, flags, 0o600, dir_fd=root_fd)
+                os.fchmod(lock_fd, 0o600)
+                if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
+                    os.close(lock_fd)
+                    raise RuntimeError("compression spool lock is not a regular file")
+                lock_file = os.fdopen(lock_fd, "a+b")
+                acquired = False
                 try:
-                    import fcntl
-                except ImportError as exc:
-                    raise RuntimeError("compression spool requires fcntl locking") from exc
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-                acquired = True
-                yield root_fd
-            finally:
-                try:
-                    if acquired:
-                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                    try:
+                        import fcntl
+                    except ImportError as exc:
+                        raise RuntimeError("compression spool requires fcntl locking") from exc
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                    acquired = True
+                    yield root_fd
                 finally:
-                    lock_file.close()
-                    os.close(root_fd)
+                    try:
+                        if acquired:
+                            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                    finally:
+                        lock_file.close()
+        finally:
+            os.close(root_fd)
 
     @staticmethod
     def _relative_name(path: Path | str) -> str:
@@ -321,14 +365,19 @@ class DurableCompressionTurnSpool:
         }
 
     @staticmethod
-    def _process_identity(pid: Any) -> Optional[str]:
+    def _process_liveness(pid: Any) -> tuple[str, Optional[str]]:
         try:
             pid_int = int(pid)
         except (TypeError, ValueError):
-            return None
+            return "unknown", None
         if pid_int <= 0:
-            return None
-        boot = "unknown"
+            return "unknown", None
+        try:
+            os.kill(pid_int, 0)
+        except ProcessLookupError:
+            return "dead_or_reused", None
+        except (PermissionError, OSError):
+            return "unknown", None
         try:
             boot = Path("/proc/sys/kernel/random/boot_id").read_text(
                 encoding="utf-8"
@@ -341,29 +390,41 @@ class DurableCompressionTurnSpool:
                     ["sysctl", "-n", "kern.boottime"], text=True
                 ).strip()
             except Exception:
-                boot = "unknown"
+                return "unknown", None
         start = None
         try:
-            os.kill(pid_int, 0)
+            fields = Path(f"/proc/{pid_int}/stat").read_text(
+                encoding="utf-8"
+            ).split()
+            start = fields[21]
+        except (OSError, IndexError):
             try:
-                fields = Path(f"/proc/{pid_int}/stat").read_text(
-                    encoding="utf-8"
-                ).split()
-                start = fields[21]
-            except (OSError, IndexError):
-                try:
-                    import subprocess
+                import subprocess
 
-                    start = subprocess.check_output(
-                        ["ps", "-o", "lstart=", "-p", str(pid_int)], text=True
-                    ).strip()
-                except Exception:
-                    return None
-        except ProcessLookupError:
-            return None
-        except (PermissionError, OSError):
-            return None
-        return f"{boot}:{pid_int}:{start}" if start else None
+                start = subprocess.check_output(
+                    ["ps", "-o", "lstart=", "-p", str(pid_int)], text=True
+                ).strip()
+            except Exception:
+                return "unknown", None
+        if not boot or not start:
+            return "unknown", None
+        return "alive", f"{boot}:{pid_int}:{start}"
+
+    @classmethod
+    def _process_identity(cls, pid: Any) -> Optional[str]:
+        status, identity = cls._process_liveness(pid)
+        return identity if status == "alive" else None
+
+    def _owner_liveness(self, state: dict[str, Any]) -> str:
+        status, identity = self._process_liveness(state.get("owner_pid"))
+        if status == "dead_or_reused":
+            return status
+        if status != "alive":
+            return "unknown"
+        stored = state.get("owner_process_identity")
+        if not isinstance(stored, str) or not stored:
+            return "unknown"
+        return "alive" if identity == stored else "dead_or_reused"
 
     def begin_attempt(
         self,
@@ -376,17 +437,19 @@ class DurableCompressionTurnSpool:
         with self._locked(f"state:{session_id}") as root_fd:
             state = self._state(session_id, root_fd=root_fd)
             if state["owner"]:
-                current_identity = self._process_identity(state.get("owner_pid"))
-                owner_dead_or_reused = (
-                    current_identity is None
-                    or current_identity != state.get("owner_process_identity")
-                )
-                if not (allow_stale_owner_takeover and owner_dead_or_reused):
+                owner_liveness = self._owner_liveness(state)
+                if not (
+                    allow_stale_owner_takeover
+                    and owner_liveness == "dead_or_reused"
+                ):
                     return None
+            own_status, own_identity = self._process_liveness(os.getpid())
+            if own_status != "alive" or not own_identity:
+                raise RuntimeError("compression spool process identity is unknown")
             state["epoch"] += 1
             state["owner"] = owner
             state["owner_pid"] = os.getpid()
-            state["owner_process_identity"] = self._process_identity(os.getpid())
+            state["owner_process_identity"] = own_identity
             duration_ns = max(1, int(float(lease_seconds) * 1_000_000_000))
             state["lease_started_monotonic_ns"] = time.monotonic_ns()
             state["lease_duration_ns"] = duration_ns
@@ -408,9 +471,7 @@ class DurableCompressionTurnSpool:
             state = self._state(session_id, root_fd=root_fd)
             if state["owner"] != owner or int(state["epoch"]) != int(epoch):
                 return False
-            if self._process_identity(state.get("owner_pid")) != state.get(
-                "owner_process_identity"
-            ):
+            if self._owner_liveness(state) != "alive":
                 return False
             if (
                 time.monotonic_ns() - int(state["lease_started_monotonic_ns"] or 0)
@@ -466,23 +527,22 @@ class DurableCompressionTurnSpool:
         expected_epoch: Optional[int] = None,
     ) -> bool:
         """Record a SessionDB-proven child after a partial spool commit."""
-        if not live_tip or str(live_tip) == str(session_id):
+        if not live_tip:
             return False
         with self._locked(f"state:{session_id}") as root_fd:
             state = self._state(session_id, root_fd=root_fd)
-            if state["live_tip"] == str(live_tip):
-                self._resync_file(self._state_path(session_id), root_fd=root_fd)
-                return True
             caller_still_fenced = (
                 expected_owner is not None
                 and expected_epoch is not None
                 and state["owner"] == expected_owner
                 and int(state["epoch"]) == int(expected_epoch)
+                and self._owner_liveness(state) == "alive"
             )
+            if state["live_tip"] == str(live_tip) and not state["owner"]:
+                self._resync_file(self._state_path(session_id), root_fd=root_fd)
+                return True
             if not caller_still_fenced:
-                if state["owner"] and self._process_identity(
-                    state.get("owner_pid")
-                ) == state.get("owner_process_identity"):
+                if state["owner"] and self._owner_liveness(state) != "dead_or_reused":
                     return False
                 state["epoch"] = int(state["epoch"]) + 1
             state["committed_epoch"] = int(state["epoch"])
@@ -580,6 +640,7 @@ class DurableCompressionTurnSpool:
                     and payload.get("client_turn_id") == turn_id
                 ):
                     self._resync_file(path, root_fd=root_fd)
+                    self._assert_canonical_root(root_fd, path.name)
                     return {"accepted": True, "durable": True, "turn_id": turn_id, "path": path}
             global_path = self.root / "global-state.json"
             global_state = self._read_json(global_path, root_fd=root_fd)
@@ -612,6 +673,7 @@ class DurableCompressionTurnSpool:
                 "status": "pending",
             }
             self._write_json(record_path, payload, root_fd=root_fd)
+            self._assert_canonical_root(root_fd, record_path.name)
             return {
                 "accepted": True,
                 "durable": True,
