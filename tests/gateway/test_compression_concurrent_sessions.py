@@ -26,6 +26,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from hermes_state import SessionDB
+from agent.conversation_compression import DurableCompressionTurnSpool
 
 
 # ---------------------------------------------------------------------------
@@ -187,3 +188,14 @@ def test_concurrent_compressions_same_session_serialize(tmp_path: Path) -> None:
         "Compression lock leaked: still held on the parent session_id after both "
         "threads joined. Future compression on the child session would deadlock."
     )
+
+
+def test_compression_attempt_epoch_refuses_stale_owner_commit(tmp_path: Path) -> None:
+    spool = DurableCompressionTurnSpool(tmp_path / "compression-spool")
+    epoch = spool.begin_attempt("shared", "winner")
+    assert epoch == 1
+    assert spool.begin_attempt("shared", "loser") is None
+    assert spool.commit_attempt("shared", "loser", epoch, live_tip="bad") is False
+    assert spool.commit_attempt("shared", "winner", epoch, live_tip="child") is True
+    assert spool.commit_attempt("shared", "winner", epoch, live_tip="stale") is False
+    assert spool.resolve_live_tip("shared") == "child"

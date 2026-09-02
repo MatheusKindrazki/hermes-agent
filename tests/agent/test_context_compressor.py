@@ -3411,6 +3411,38 @@ class TestContextLengthSetterCoherence:
         assert c.threshold_tokens == 150_000
 
 
+def test_synthetic_above_million_uses_local_fallback_without_budget_change():
+    """K6: 1_000_001 is a counter only; no million-token payload is built."""
+    messages = [{"role": "system", "content": "system"}]
+    for index in range(12):
+        messages.extend(
+            [
+                {"role": "user", "content": f"question {index}"},
+                {"role": "assistant", "content": f"answer {index}"},
+            ]
+        )
+    with patch(
+        "agent.context_compressor.get_model_context_length", return_value=1_000_000
+    ):
+        compressor = ContextCompressor(
+            model="test",
+            quiet_mode=True,
+            protect_first_n=2,
+            protect_last_n=2,
+        )
+    configured_threshold = compressor.threshold_tokens
+    configured_context = compressor.context_length
+    with patch("agent.context_compressor.call_llm") as call_llm_mock:
+        result = compressor.compress(messages, current_tokens=1_000_001)
+    call_llm_mock.assert_not_called()
+    assert len(result) < len(messages)
+    assert compressor.threshold_tokens == configured_threshold
+    assert compressor.context_length == configured_context
+    assert compressor._last_compression_telemetry["failure_class"] == (
+        "oversized_local_fallback"
+    )
+
+
 
 class TestPreLlmFeasibilityCheck:
     """Tests for the pre-LLM feasibility skip in compress().

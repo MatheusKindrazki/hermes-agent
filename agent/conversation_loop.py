@@ -35,6 +35,7 @@ from agent.conversation_compression import (
     PRE_API_COMPRESSION_STATUS_TEMPLATE,
     compression_skipped_due_to_lock,
     conversation_history_after_compression,
+    spool_deferred_compression_turn,
 )
 from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
@@ -1468,6 +1469,8 @@ def _compression_deferred_result(
     agent,
     messages: List[Dict],
     api_call_count: int,
+    *,
+    token_count: int = 0,
 ) -> Dict[str, Any]:
     """Build the soft turn result for a lock-contended compression defer.
 
@@ -1491,24 +1494,45 @@ def _compression_deferred_result(
         agent.session_id or "none",
         holder if isinstance(holder, str) else "unconfirmed",
     )
+    receipt = None
+    spool_error = None
+    try:
+        receipt = spool_deferred_compression_turn(
+            agent.session_id or "",
+            messages,
+            token_count=int(token_count or 0),
+        )
+    except Exception as exc:
+        spool_error = type(exc).__name__
+        logger.warning("compression turn durable handoff failed: %s", exc)
     try:
         agent._flush_status_buffer()
     except Exception:
         pass
-    _final = (
-        "Context compression is already running for this session. "
-        "Please retry in a moment — your next message will be processed "
-        "once the concurrent compression finishes."
-    )
+    accepted = bool(receipt and receipt.get("durable"))
+    if accepted:
+        _final = (
+            "Your turn was durably accepted while context compression finishes. "
+            "It will resume automatically on the live continuation."
+        )
+    else:
+        _final = (
+            "Context compression is still in progress. This turn was not "
+            "accepted for automatic handoff; please retry shortly."
+        )
     return {
         "final_response": _final,
         "messages": messages,
         "completed": False,
         "api_calls": api_call_count,
-        "error": _final,
+        "error": None if accepted else _final,
         "partial": True,
         "failed": False,
         "compression_deferred": True,
+        "compression_handoff_accepted": accepted,
+        "compression_spool_turn_id": receipt.get("turn_id") if accepted else None,
+        "compression_spool_error": spool_error,
+        "retryable": True,
         "session_id": agent.session_id,
     }
 
@@ -5740,7 +5764,10 @@ def run_conversation(
                         compression_attempts -= 1
                         agent._persist_session(messages, conversation_history)
                         return _compression_deferred_result(
-                            agent, messages, api_call_count
+                            agent,
+                            messages,
+                            api_call_count,
+                            token_count=approx_tokens,
                         )
                     conversation_history = conversation_history_after_compression(
                         agent, messages, conversation_history
@@ -5898,7 +5925,10 @@ def run_conversation(
                                 compression_attempts -= 1
                                 agent._persist_session(messages, conversation_history)
                                 return _compression_deferred_result(
-                                    agent, messages, api_call_count
+                                    agent,
+                                    messages,
+                                    api_call_count,
+                                    token_count=request_input_estimate,
                                 )
                             conversation_history = conversation_history_after_compression(
                                 agent, messages, conversation_history
@@ -6058,7 +6088,10 @@ def run_conversation(
                         compression_attempts -= 1
                         agent._persist_session(messages, conversation_history)
                         return _compression_deferred_result(
-                            agent, messages, api_call_count
+                            agent,
+                            messages,
+                            api_call_count,
+                            token_count=approx_tokens,
                         )
                     conversation_history = conversation_history_after_compression(
                         agent, messages, conversation_history

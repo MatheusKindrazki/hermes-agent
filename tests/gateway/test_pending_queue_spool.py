@@ -14,6 +14,7 @@ import pytest
 
 from gateway import shutdown_flush
 from gateway.session import SessionStore
+from agent.conversation_compression import DurableCompressionTurnSpool
 
 
 def _make_store(db):
@@ -221,3 +222,17 @@ class TestSpoolPrimitives:
         assert remaining == 0
         assert seen == ["c0", "c1", "c2"]
         assert _spool_files(spool_home) == []
+
+    def test_compression_spool_ack_is_durable_before_return(self, spool_home):
+        spool = DurableCompressionTurnSpool(spool_home / "compression_turn_spool")
+        receipt = spool.enqueue(
+            "session-over-ceiling",
+            {"role": "user", "content": "queued"},
+            token_count=1_000_001,
+            client_turn_id="turn-durable",
+        )
+        assert receipt["accepted"] is True
+        assert receipt["durable"] is True
+        assert receipt["path"].exists()
+        payload = json.loads(receipt["path"].read_text(encoding="utf-8"))
+        assert payload["client_turn_id"] == "turn-durable"

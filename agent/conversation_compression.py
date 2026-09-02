@@ -52,7 +52,9 @@ thread, not the conversation thread. Extension authors must assume:
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import copy
+import hashlib
 import inspect
 import json
 import logging
@@ -79,6 +81,330 @@ from agent.model_metadata import (
 from agent.session_activity import ActivityProvenance, normalize_activity_provenance
 
 logger = logging.getLogger(__name__)
+
+COMPRESSION_TURN_HARD_CEILING_TOKENS = 1_000_000
+
+
+class DurableCompressionTurnSpool:
+    """Append-only durable handoff for turns racing context compression.
+
+    Records are atomically replaced only to advance ``pending`` → ``drained``;
+    they are never deleted. A root-scoped sequence preserves enqueue order,
+    while per-session monotonic epochs fence compression lineage publication.
+    """
+
+    _locks_guard = threading.Lock()
+    _locks: dict[str, threading.RLock] = {}
+
+    def __init__(self, root: Path | str) -> None:
+        self.root = Path(root)
+
+    @staticmethod
+    def _key(session_id: str) -> str:
+        return hashlib.sha256(str(session_id).encode("utf-8")).hexdigest()[:24]
+
+    @contextlib.contextmanager
+    def _locked(self, scope: str):
+        self.root.mkdir(parents=True, exist_ok=True)
+        lock_key = f"{self.root.resolve()}::{scope}"
+        with self._locks_guard:
+            local_lock = self._locks.setdefault(lock_key, threading.RLock())
+        with local_lock:
+            lock_path = self.root / f".lock-{self._key(scope)}"
+            lock_file = lock_path.open("a+b")
+            try:
+                try:
+                    import fcntl
+
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                except (ImportError, OSError):
+                    pass
+                yield
+            finally:
+                try:
+                    import fcntl
+
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                except (ImportError, OSError):
+                    pass
+                lock_file.close()
+
+    def _write_json(self, path: Path, payload: dict[str, Any]) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(prefix=".compression-turn-", dir=self.root)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, path)
+            try:
+                dir_fd = os.open(self.root, os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                pass
+        finally:
+            if os.path.exists(temp_name):
+                os.unlink(temp_name)
+
+    @staticmethod
+    def _read_json(path: Path) -> Optional[dict[str, Any]]:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    def _state_path(self, session_id: str) -> Path:
+        return self.root / f"state-{self._key(session_id)}.json"
+
+    def _state(self, session_id: str) -> dict[str, Any]:
+        state = self._read_json(self._state_path(session_id)) or {}
+        return {
+            "session_id": session_id,
+            "epoch": int(state.get("epoch") or 0),
+            "owner": state.get("owner"),
+            "live_tip": state.get("live_tip") or session_id,
+            "committed_epoch": int(state.get("committed_epoch") or 0),
+        }
+
+    def begin_attempt(
+        self,
+        session_id: str,
+        owner: str,
+        *,
+        allow_stale_owner_takeover: bool = False,
+    ) -> Optional[int]:
+        with self._locked(f"state:{session_id}"):
+            state = self._state(session_id)
+            if state["owner"] and not allow_stale_owner_takeover:
+                return None
+            state["epoch"] += 1
+            state["owner"] = owner
+            self._write_json(self._state_path(session_id), state)
+            return int(state["epoch"])
+
+    def commit_attempt(
+        self,
+        session_id: str,
+        owner: str,
+        epoch: int,
+        *,
+        live_tip: str,
+    ) -> bool:
+        with self._locked(f"state:{session_id}"):
+            state = self._state(session_id)
+            if state["owner"] != owner or int(state["epoch"]) != int(epoch):
+                return False
+            state["owner"] = None
+            state["committed_epoch"] = int(epoch)
+            state["live_tip"] = str(live_tip)
+            self._write_json(self._state_path(session_id), state)
+            return True
+
+    def abort_attempt(self, session_id: str, owner: str, epoch: int) -> bool:
+        with self._locked(f"state:{session_id}"):
+            state = self._state(session_id)
+            if state["owner"] != owner or int(state["epoch"]) != int(epoch):
+                return False
+            state["owner"] = None
+            self._write_json(self._state_path(session_id), state)
+            return True
+
+    def resolve_live_tip(self, session_id: str) -> str:
+        current = str(session_id)
+        visited: set[str] = set()
+        while current not in visited:
+            visited.add(current)
+            tip = str(self._state(current)["live_tip"] or current)
+            if tip == current:
+                return current
+            current = tip
+        return current
+
+    def _iter_record_files(self):
+        if not self.root.exists():
+            return []
+        return [
+            path
+            for path in self.root.glob("*.json")
+            if not path.name.startswith("state-")
+            and path.name != "global-state.json"
+        ]
+
+    def _record_rows(self) -> list[tuple[Path, dict[str, Any]]]:
+        rows = []
+        for path in self._iter_record_files():
+            payload = self._read_json(path)
+            if not payload or not isinstance(payload.get("message"), dict):
+                continue
+            payload.setdefault("session_id", payload.get("origin_session"))
+            payload.setdefault("origin_session", payload.get("session_id"))
+            payload.setdefault("client_turn_id", path.stem)
+            payload.setdefault("created_ns", 0)
+            payload.setdefault("sequence", int(payload.get("created_ns") or 0))
+            payload.setdefault("status", "pending")
+            rows.append((path, payload))
+        rows.sort(key=lambda item: (int(item[1]["sequence"]), int(item[1]["created_ns"])))
+        return rows
+
+    def enqueue(
+        self,
+        session_id: str,
+        message: dict[str, Any],
+        *,
+        token_count: int,
+        client_turn_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        turn_id = str(client_turn_id or uuid.uuid4().hex)
+        with self._locked("global"):
+            for path, payload in self._record_rows():
+                if (
+                    payload.get("origin_session") == session_id
+                    and payload.get("client_turn_id") == turn_id
+                ):
+                    return {"accepted": True, "durable": True, "turn_id": turn_id, "path": path}
+            global_path = self.root / "global-state.json"
+            global_state = self._read_json(global_path) or {"sequence": 0}
+            sequence = int(global_state.get("sequence") or 0) + 1
+            global_state["sequence"] = sequence
+            self._write_json(global_path, global_state)
+            created_ns = time.time_ns()
+            record_path = self.root / f"turn-{sequence:020d}-{uuid.uuid4().hex}.json"
+            payload = {
+                "version": 1,
+                "origin_session": str(session_id),
+                "session_id": str(session_id),
+                "client_turn_id": turn_id,
+                "message": copy.deepcopy(message),
+                "token_count": int(token_count),
+                "sequence": sequence,
+                "created_ns": created_ns,
+                "status": "pending",
+            }
+            self._write_json(record_path, payload)
+            return {
+                "accepted": True,
+                "durable": True,
+                "turn_id": turn_id,
+                "path": record_path,
+            }
+
+    def records(self, session_id: str) -> list[dict[str, Any]]:
+        target_tip = self.resolve_live_tip(session_id)
+        return [
+            copy.deepcopy(payload)
+            for _path, payload in self._record_rows()
+            if payload.get("origin_session")
+            and self.resolve_live_tip(str(payload["origin_session"])) == target_tip
+        ]
+
+    def pending(self, session_id: str) -> list[dict[str, Any]]:
+        return [row for row in self.records(session_id) if row.get("status") != "drained"]
+
+    def drain(self, session_id: str, consumer: Callable[[dict[str, Any], str], None]) -> list[str]:
+        drained: list[str] = []
+        with self._locked("global"):
+            live_tip = self.resolve_live_tip(session_id)
+            for path, payload in self._record_rows():
+                origin = payload.get("origin_session")
+                if (
+                    not origin
+                    or self.resolve_live_tip(str(origin)) != live_tip
+                    or payload.get("status") == "drained"
+                ):
+                    continue
+                consumer(copy.deepcopy(payload), live_tip)
+                payload["status"] = "drained"
+                payload["drained_tip"] = live_tip
+                payload["drained_ns"] = time.time_ns()
+                self._write_json(path, payload)
+                drained.append(str(payload["client_turn_id"]))
+        return drained
+
+
+def compression_turn_spool() -> DurableCompressionTurnSpool:
+    home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    return DurableCompressionTurnSpool(home / "compression_turn_spool")
+
+
+def spool_deferred_compression_turn(
+    session_id: str,
+    messages: list[dict[str, Any]],
+    *,
+    token_count: int,
+) -> Optional[dict[str, Any]]:
+    """Durably accept the newest user turn above the absolute hard ceiling."""
+    if int(token_count or 0) < COMPRESSION_TURN_HARD_CEILING_TOKENS:
+        return None
+    source = next(
+        (
+            message
+            for message in reversed(messages)
+            if isinstance(message, dict) and message.get("role") == "user"
+        ),
+        None,
+    )
+    if source is None:
+        return None
+    message = copy.deepcopy(source)
+    message.pop("_db_persisted", None)
+    turn_id = str(
+        message.get("client_turn_id")
+        or message.get("platform_message_id")
+        or message.get("message_id")
+        or uuid.uuid4().hex
+    )
+    message["_compression_spool_turn_id"] = turn_id
+    return compression_turn_spool().enqueue(
+        session_id,
+        message,
+        token_count=int(token_count),
+        client_turn_id=turn_id,
+    )
+
+
+def drain_compression_turns_into_agent(
+    agent: Any,
+    origin_session_id: str,
+    live_messages: list[dict[str, Any]],
+) -> list[str]:
+    """Drain queued turns to the transitive live tip with durable dedupe."""
+    session_db = getattr(agent, "_session_db", None)
+    if session_db is None:
+        return []
+    spool = compression_turn_spool()
+
+    def _consume(record: dict[str, Any], live_tip: str) -> None:
+        message = copy.deepcopy(record["message"])
+        turn_id = str(record["client_turn_id"])
+        dedupe_id = f"compression-spool:{turn_id}"
+        has_id = getattr(session_db, "has_platform_message_id", None)
+        already_durable = bool(
+            callable(has_id) and has_id(live_tip, dedupe_id)
+        )
+        if not already_durable:
+            session_db.append_message(
+                live_tip,
+                str(message.get("role") or "user"),
+                message.get("content"),
+                platform_message_id=dedupe_id,
+                timestamp=message.get("timestamp"),
+            )
+        if not any(
+            isinstance(existing, dict)
+            and existing.get("_compression_spool_turn_id") == turn_id
+            for existing in live_messages
+        ):
+            message["_compression_spool_turn_id"] = turn_id
+            message["_db_persisted"] = True
+            live_messages.append(message)
+
+    return spool.drain(origin_session_id, _consume)
 
 # Terminal compression outcomes published by host/hygiene timeout or cooldown
 # writers. Detached heartbeat workers must not clobber these back to
@@ -1726,6 +2052,14 @@ def recover_rotated_compression_session(
         for attempt in range(21):
             recovered = _adopt_live_compression_child(agent, session_db, session_id)
             if recovered is not None:
+                try:
+                    drain_compression_turns_into_agent(agent, session_id, recovered)
+                except Exception:
+                    logger.warning(
+                        "compression turn spool recovery drain failed for %s",
+                        session_id,
+                        exc_info=True,
+                    )
                 return recovered
             holder = holder_getter(session_id) if callable(holder_getter) else None
             if not holder or attempt == 20:
@@ -2948,6 +3282,9 @@ def compress_context(
     _lock_db = getattr(agent, "_session_db", None)
     _lock_sid = agent.session_id or ""
     _lock_holder: Optional[str] = None
+    _turn_spool = compression_turn_spool()
+    _turn_spool_epoch: Optional[int] = None
+    _turn_spool_committed = False
     # Watermark captured at compression start (#75316); None = fall back to
     # archive-everything (no concurrent-tail preservation this cycle).
     _commit_watermark: Optional[int] = None
@@ -3178,6 +3515,20 @@ def compress_context(
             _complete_compaction_lifecycle()
         finally:
             try:
+                if (
+                    _turn_spool_epoch is not None
+                    and _lock_holder
+                    and not _turn_spool_committed
+                ):
+                    try:
+                        _turn_spool.abort_attempt(
+                            _lock_sid, _lock_holder, _turn_spool_epoch
+                        )
+                    except Exception:
+                        logger.debug(
+                            "compression turn spool attempt abort failed",
+                            exc_info=True,
+                        )
                 _release_lock_holder_only()
             finally:
                 try:
@@ -3221,6 +3572,21 @@ def compress_context(
     # Publish the holder-qualified release hook before a timeout can win the
     # fence. If no durable lock was acquired there is no hook to publish.
     _finish_lock_setup()
+
+    if _lock_holder is not None and _lock_sid:
+        try:
+            _turn_spool_epoch = _turn_spool.begin_attempt(
+                _lock_sid,
+                _lock_holder,
+                allow_stale_owner_takeover=True,
+            )
+        except Exception:
+            logger.warning(
+                "compression turn spool attempt registration failed for %s",
+                _lock_sid,
+                exc_info=True,
+            )
+            _turn_spool_epoch = None
 
     # A delayed contender can acquire the parent lock after the winning path
     # has released it and completed rotation. The lock serializes work but does
@@ -4513,6 +4879,27 @@ def compress_context(
             bool(_old_sid) or compacted_in_place
         )
         _boundary_parent = _old_sid or agent.session_id or ""
+
+        if _session_commit_succeeded and _turn_spool_epoch is not None and _lock_holder:
+            try:
+                _turn_spool_committed = _turn_spool.commit_attempt(
+                    _lock_sid,
+                    _lock_holder,
+                    _turn_spool_epoch,
+                    live_tip=agent.session_id or _lock_sid,
+                )
+                if _turn_spool_committed:
+                    drain_compression_turns_into_agent(
+                        agent,
+                        _lock_sid,
+                        compressed,
+                    )
+            except Exception:
+                logger.warning(
+                    "compression turn spool commit/drain failed for %s",
+                    _lock_sid,
+                    exc_info=True,
+                )
 
         # Round-2 #4: the activity heartbeat's terminal "context compression
         # completed" stamp landed on the PARENT row (force-persisted before
