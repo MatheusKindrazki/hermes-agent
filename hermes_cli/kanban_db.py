@@ -79,8 +79,10 @@ import random
 import secrets
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import logging
 import time
@@ -93,6 +95,11 @@ from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missi
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
+
+# Keep the worker-path probe independent from tests/custom launchers that
+# replace ``subprocess.Popen`` to capture the actual worker invocation. The
+# probe is a distinct security boundary and must still execute real bash.
+_REAL_SUBPROCESS_POPEN = subprocess.Popen
 
 
 # ---------------------------------------------------------------------------
@@ -4614,6 +4621,21 @@ def recompute_ready(
 # Claim / complete / block
 # ---------------------------------------------------------------------------
 
+@dataclass(frozen=True)
+class TargetClaimConstraints:
+    expected_tenant: Optional[str]
+    expected_assignee: str
+    max_board_running: Optional[int] = None
+    max_host_running: Optional[int] = None
+    other_boards_running: int = 0
+    max_assignee_running: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class TargetClaimResult:
+    task: Optional[Task]
+    reason: Optional[str]
+
 def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return whether every direct parent is terminal for dependency gating."""
     return conn.execute(
@@ -4631,7 +4653,8 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
-) -> Optional[Task]:
+    target_constraints: Optional[TargetClaimConstraints] = None,
+) -> Optional[Task] | TargetClaimResult:
     """Atomically transition ``ready -> running``.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
@@ -4641,6 +4664,47 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if target_constraints is not None:
+            identity = conn.execute(
+                "SELECT status, claim_lock, tenant, assignee FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if identity is None:
+                return TargetClaimResult(None, "task_not_found")
+            if identity["status"] != "ready" or identity["claim_lock"] is not None:
+                return TargetClaimResult(None, "status_not_ready")
+            tenant = (identity["tenant"] or "").strip() or None
+            if tenant != target_constraints.expected_tenant:
+                return TargetClaimResult(None, "tenant_mismatch")
+            assignee = (identity["assignee"] or "").strip()
+            if not assignee:
+                return TargetClaimResult(None, "assignee_required")
+            if assignee != target_constraints.expected_assignee:
+                return TargetClaimResult(None, "assignee_mismatch")
+
+            running = int(conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+            ).fetchone()[0])
+            if (
+                target_constraints.max_board_running is not None
+                and running >= target_constraints.max_board_running
+            ):
+                return TargetClaimResult(None, "board_capacity_exhausted")
+            if (
+                target_constraints.max_host_running is not None
+                and running + target_constraints.other_boards_running
+                >= target_constraints.max_host_running
+            ):
+                return TargetClaimResult(None, "host_capacity_exhausted")
+            if target_constraints.max_assignee_running is not None:
+                assignee_running = int(conn.execute(
+                    "SELECT COUNT(*) FROM tasks "
+                    "WHERE status = 'running' AND assignee = ?",
+                    (assignee,),
+                ).fetchone()[0])
+                if assignee_running >= target_constraints.max_assignee_running:
+                    return TargetClaimResult(None, "assignee_capacity_exhausted")
+
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -4665,6 +4729,8 @@ def claim_task(
                 conn, task_id, "claim_rejected",
                 {"reason": "parents_not_done"},
             )
+            if target_constraints is not None:
+                return TargetClaimResult(None, "parents_not_done")
             return None
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
@@ -4686,8 +4752,7 @@ def claim_task(
                 """,
                 (now, int(stale["current_run_id"])),
             )
-        cur = conn.execute(
-            """
+        claim_sql = """
             UPDATE tasks
                SET status        = 'running',
                    claim_lock    = ?,
@@ -4696,10 +4761,18 @@ def claim_task(
              WHERE id = ?
                AND status = 'ready'
                AND claim_lock IS NULL
-            """,
-            (lock, expires, now, task_id),
-        )
+        """
+        claim_params: list[Any] = [lock, expires, now, task_id]
+        if target_constraints is not None:
+            claim_sql += " AND tenant IS ? AND assignee = ?"
+            claim_params.extend([
+                target_constraints.expected_tenant,
+                target_constraints.expected_assignee,
+            ])
+        cur = conn.execute(claim_sql, claim_params)
         if cur.rowcount != 1:
+            if target_constraints is not None:
+                return TargetClaimResult(None, "claim_failed")
             return None
         # Look up the current task row so we can populate the run with
         # its assignee / step / runtime cap.
@@ -4744,6 +4817,8 @@ def claim_task(
         assignee=claimed.assignee if claimed else None,
         run_id=run_id,
     )
+    if target_constraints is not None:
+        return TargetClaimResult(claimed, None)
     return claimed
 
 
@@ -8103,6 +8178,12 @@ class DispatchResult:
     ``host_capacity_exhausted``, ``assignee_capacity_exhausted``,
     ``memory_pressure``, ``respawn_guarded``, ``claim_failed``, or
     ``spawn_failed``. Callers can branch on these codes without parsing logs."""
+    worker_path_error: Optional[str] = None
+    """Stable fail-closed worker-path gate reason for real launcher ticks.
+
+    The gate runs before dispatch locking, housekeeping, claims, workspace
+    preparation, session retagging, logs, or Popen. ``None`` means the signed
+    immutable worker-path snapshot was accepted (or a test supplied spawn_fn)."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -9842,6 +9923,121 @@ def dispatch_once(
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
+    """Validate the immutable real-launcher image before any tick effect."""
+    if task_id:
+        preflight_reason = _target_dispatch_preflight_reason(
+            conn,
+            task_id=task_id,
+            board=board,
+            max_spawn=max_spawn,
+            max_in_progress=max_in_progress,
+            max_in_progress_per_profile=max_in_progress_per_profile,
+        )
+        if preflight_reason is not None:
+            return DispatchResult(target_reason=preflight_reason)
+    worker_path_snapshot = None
+    if spawn_fn is None and not dry_run:
+        try:
+            worker_path_snapshot = _snapshot_worker_path_lib(os.environ)
+        except RuntimeError as exc:
+            reason = str(exc)
+            return DispatchResult(
+                target_reason=reason if task_id else None,
+                worker_path_error=reason,
+            )
+    return _dispatch_once_prevalidated(
+        conn,
+        task_id=task_id,
+        spawn_fn=spawn_fn,
+        worker_path_snapshot=worker_path_snapshot,
+        ttl_seconds=ttl_seconds,
+        dry_run=dry_run,
+        max_spawn=max_spawn,
+        max_in_progress=max_in_progress,
+        failure_limit=failure_limit,
+        stale_timeout_seconds=stale_timeout_seconds,
+        board=board,
+        default_assignee=default_assignee,
+        max_in_progress_per_profile=max_in_progress_per_profile,
+        reconcile_orphans=reconcile_orphans,
+    )
+
+
+def _target_dispatch_preflight_reason(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    board: Optional[str],
+    max_spawn: Optional[int],
+    max_in_progress: Optional[int],
+    max_in_progress_per_profile: Optional[int],
+) -> Optional[str]:
+    """Read-only fast-fail before the immutable launcher gate.
+
+    This establishes operator-facing reason precedence without weakening the
+    later transactional revalidation, which remains the authority for claim.
+    """
+    if board is not None:
+        actual_row = conn.execute("PRAGMA database_list").fetchone()
+        actual = str(
+            actual_row["file"] if hasattr(actual_row, "keys") else actual_row[2]
+        )
+        expected = str(kanban_db_path(board=board))
+        if actual and Path(actual).resolve() != Path(expected).resolve():
+            return "board_mismatch"
+    target = conn.execute(
+        "SELECT status, assignee, tenant FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if target is None:
+        return "task_not_found"
+    expected_tenant = (os.environ.get("HERMES_TENANT") or "").strip() or None
+    target_tenant = (target["tenant"] or "").strip() or None
+    if expected_tenant != target_tenant:
+        return "tenant_mismatch"
+    if target["status"] != "ready":
+        return "status_not_ready"
+    if not (target["assignee"] or "").strip():
+        return "assignee_required"
+    running = int(conn.execute(
+        "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+    ).fetchone()[0])
+    if max_spawn is not None and running >= max_spawn:
+        return "board_capacity_exhausted"
+    if max_in_progress is not None:
+        total_running = running + count_running_tasks_other_boards(board)
+        if total_running >= max_in_progress:
+            return "host_capacity_exhausted"
+    if (
+        isinstance(max_in_progress_per_profile, int)
+        and max_in_progress_per_profile > 0
+    ):
+        assignee_running = int(conn.execute(
+            "SELECT COUNT(*) FROM tasks "
+            "WHERE status = 'running' AND assignee = ?",
+            (target["assignee"],),
+        ).fetchone()[0])
+        if assignee_running >= max_in_progress_per_profile:
+            return "assignee_capacity_exhausted"
+    return None
+
+
+def _dispatch_once_prevalidated(
+    conn: sqlite3.Connection,
+    *,
+    task_id: Optional[str] = None,
+    spawn_fn=None,
+    worker_path_snapshot=None,
+    ttl_seconds: Optional[int] = None,
+    dry_run: bool = False,
+    max_spawn: Optional[int] = None,
+    max_in_progress: Optional[int] = None,
+    failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
+    stale_timeout_seconds: int = 0,
+    board: Optional[str] = None,
+    default_assignee: Optional[str] = None,
+    max_in_progress_per_profile: Optional[int] = None,
+    reconcile_orphans: bool = True,
+) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
     Thin wrapper around :func:`_dispatch_once_locked`. It acquires a
@@ -9875,6 +10071,7 @@ def dispatch_once(
             conn,
             task_id=task_id,
             spawn_fn=spawn_fn,
+            worker_path_snapshot=worker_path_snapshot,
             ttl_seconds=ttl_seconds,
             dry_run=dry_run,
             max_spawn=max_spawn,
@@ -9896,6 +10093,7 @@ def dispatch_once(
                 conn,
                 task_id=task_id,
                 spawn_fn=spawn_fn,
+                worker_path_snapshot=worker_path_snapshot,
                 ttl_seconds=ttl_seconds,
                 dry_run=dry_run,
                 max_spawn=max_spawn,
@@ -9924,6 +10122,7 @@ def _dispatch_once_locked(
     *,
     task_id: Optional[str] = None,
     spawn_fn=None,
+    worker_path_snapshot=None,
     ttl_seconds: Optional[int] = None,
     dry_run: bool = False,
     max_spawn: Optional[int] = None,
@@ -9971,6 +10170,8 @@ def _dispatch_once_locked(
     board. When omitted, the current-board resolution chain is used.
     """
     result = DispatchResult()
+    target_expected_tenant: Optional[str] = None
+    target_expected_assignee: Optional[str] = None
 
     # A targeted dispatch is an explicit, fail-closed operation. Validate its
     # identity and routing boundaries before any reclaim, promotion, default
@@ -9995,39 +10196,35 @@ def _dispatch_once_locked(
         if not (target["assignee"] or "").strip():
             result.target_reason = "assignee_required"
             return result
+        target_expected_tenant = target_tenant
+        target_expected_assignee = str(target["assignee"]).strip()
 
-    # Reap zombie children from previously spawned workers. See
-    # reap_worker_zombies() for the full rationale.
-    reap_worker_zombies()
+    if not task_id:
+        # Global ticks retain the historical maintenance sweep. An explicit
+        # target is a claim operation, not a board sweep: it must reach its
+        # atomic identity/capacity decision before any unrelated durable
+        # housekeeping effect.
+        reap_worker_zombies()
 
-    result.reclaimed = release_stale_claims(conn)
-    if reconcile_orphans:
-        # Orphaned-card reconciliation: requeue 'running' cards whose claim
-        # bookkeeping is broken (no valid claim, dead/gone worker) that the
-        # TTL/crash/stale paths can never see. See reconcile_orphaned_running.
-        result.reconciled_orphans = reconcile_orphaned_running(conn)
-    result.stale = detect_stale_running(
-        conn, stale_timeout_seconds=stale_timeout_seconds,
-    )
-    result.crashed = detect_crashed_workers(conn)
-    # detect_crashed_workers stashes protocol-violation auto-blocks on
-    # itself so the public list-return stays stable. Pull them into the
-    # DispatchResult here so telemetry / tests see the trip.
-    _crash_auto_blocked = getattr(
-        detect_crashed_workers, "_last_auto_blocked", []
-    )
-    if _crash_auto_blocked:
-        result.auto_blocked.extend(_crash_auto_blocked)
-    # Rate-limited requeues (quota wall, no failure counted) — surface for
-    # telemetry / tests. These tasks went back to ``ready`` and the respawn
-    # guard will defer them until the quota window clears.
-    _crash_rate_limited = getattr(
-        detect_crashed_workers, "_last_rate_limited", []
-    )
-    if _crash_rate_limited:
-        result.rate_limited.extend(_crash_rate_limited)
-    result.timed_out = enforce_max_runtime(conn)
-    result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+        result.reclaimed = release_stale_claims(conn)
+        if reconcile_orphans:
+            result.reconciled_orphans = reconcile_orphaned_running(conn)
+        result.stale = detect_stale_running(
+            conn, stale_timeout_seconds=stale_timeout_seconds,
+        )
+        result.crashed = detect_crashed_workers(conn)
+        _crash_auto_blocked = getattr(
+            detect_crashed_workers, "_last_auto_blocked", []
+        )
+        if _crash_auto_blocked:
+            result.auto_blocked.extend(_crash_auto_blocked)
+        _crash_rate_limited = getattr(
+            detect_crashed_workers, "_last_rate_limited", []
+        )
+        if _crash_rate_limited:
+            result.rate_limited.extend(_crash_rate_limited)
+        result.timed_out = enforce_max_runtime(conn)
+        result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
@@ -10061,8 +10258,10 @@ def _dispatch_once_locked(
     # workers on every other board count against the same budget. Without
     # this, N active boards multiply the cap by N — exactly the fan-out
     # the memory-derived default exists to prevent.
+    other_boards_running = 0
     if max_in_progress is not None:
-        total_running = running_count + count_running_tasks_other_boards(board)
+        other_boards_running = count_running_tasks_other_boards(board)
+        total_running = running_count + other_boards_running
         if total_running >= max_in_progress:
             if task_id:
                 result.target_reason = "host_capacity_exhausted"
@@ -10285,7 +10484,7 @@ def _dispatch_once_locked(
             # Emit an event so operators can see why the task was
             # skipped when reading `hermes kanban tail` — without
             # this the task appears stuck in ready with no diagnosis.
-            if not dry_run:
+            if not dry_run and not task_id:
                 with write_txn(conn):
                     _append_event(
                         conn, row["id"], "respawn_guarded",
@@ -10306,7 +10505,27 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
-        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        if task_id:
+            claim_outcome = claim_task(
+                conn,
+                row["id"],
+                ttl_seconds=ttl_seconds,
+                target_constraints=TargetClaimConstraints(
+                    expected_tenant=target_expected_tenant,
+                    expected_assignee=target_expected_assignee or row_assignee,
+                    max_board_running=max_spawn,
+                    max_host_running=max_in_progress,
+                    other_boards_running=other_boards_running,
+                    max_assignee_running=_per_profile_cap,
+                ),
+            )
+            assert isinstance(claim_outcome, TargetClaimResult)
+            claimed = claim_outcome.task
+            if claimed is None:
+                result.target_reason = claim_outcome.reason or "claim_failed"
+                continue
+        else:
+            claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             if task_id:
                 result.target_reason = "claim_failed"
@@ -10332,20 +10551,28 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
-            # Back-compat: older spawn_fn signatures accept only
-            # (task, workspace). Test stubs in the suite rely on that.
-            # Introspect the callable and pass `board` only when supported.
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
+            if spawn_fn is None:
+                if worker_path_snapshot is None:
+                    raise RuntimeError("worker_path_snapshot_missing")
+                pid = _default_spawn(
+                    claimed,
+                    str(workspace),
+                    board=board,
+                    worker_path_snapshot=worker_path_snapshot,
+                )
+            else:
+                # Back-compat: older test/custom spawn_fn signatures accept
+                # only (task, workspace). Pass board only when supported.
+                import inspect
+                try:
+                    sig = inspect.signature(spawn_fn)
+                    if "board" in sig.parameters:
+                        pid = spawn_fn(claimed, str(workspace), board=board)
+                    else:
+                        pid = spawn_fn(claimed, str(workspace))
+                except (TypeError, ValueError):
+                    pid = spawn_fn(claimed, str(workspace))
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
             # Worker-lifecycle observer (RFC #58548): fires AFTER spawn_fn
@@ -10471,17 +10698,26 @@ def _dispatch_once_locked(
         claimed.skills = list(
             dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
         )
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
+            if spawn_fn is None:
+                if worker_path_snapshot is None:
+                    raise RuntimeError("worker_path_snapshot_missing")
+                pid = _default_spawn(
+                    claimed,
+                    str(workspace),
+                    board=board,
+                    worker_path_snapshot=worker_path_snapshot,
+                )
+            else:
+                import inspect
+                try:
+                    sig = inspect.signature(spawn_fn)
+                    if "board" in sig.parameters:
+                        pid = spawn_fn(claimed, str(workspace), board=board)
+                    else:
+                        pid = spawn_fn(claimed, str(workspace))
+                except (TypeError, ValueError):
+                    pid = spawn_fn(claimed, str(workspace))
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
             # Worker-lifecycle observer (RFC #58548): same contract as the
@@ -10794,15 +11030,6 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
 
 
 _WORKER_PATH_SOURCE_SCRIPT = r'''
-actual=$(/usr/bin/shasum -a 256 -- "$1") || {
-  printf '%s\n' worker_path_hash_unavailable >&2
-  exit 2
-}
-actual=${actual%% *}
-if [ "$actual" != "$2" ]; then
-  printf '%s\n' worker_path_hash_mismatch >&2
-  exit 2
-fi
 source "$1" || {
   rc=$?
   printf '%s\n' worker_path_source_failed >&2
@@ -10811,53 +11038,142 @@ source "$1" || {
 '''
 
 _WORKER_PATH_EXEC_SCRIPT = _WORKER_PATH_SOURCE_SCRIPT + r'''
-shift 2
+shift
 exec "$@"
 '''
 
 
-def _validate_worker_path_lib(env: Mapping[str, str]) -> tuple[str, str]:
-    """Validate and source the configured worker PATH library fail-closed.
+@dataclass(frozen=True)
+class _WorkerPathSnapshot:
+    approved_bytes: bytes
+    original_path: str
+    sha256: str
 
-    Returns the absolute library path and normalized SHA-256 for the actual
-    launcher wrapper. Errors expose stable reason codes only; paths, PATH
-    contents, card payloads, and source stderr are deliberately omitted.
+    def open_source_image(self):
+        """Return an unlinked, read-only FD containing approved bytes."""
+        write_fd, temp_path = tempfile.mkstemp(prefix="hermes-worker-path-")
+        try:
+            view = memoryview(self.approved_bytes)
+            while view:
+                written = os.write(write_fd, view)
+                view = view[written:]
+            os.fsync(write_fd)
+        finally:
+            os.close(write_fd)
+        try:
+            read_fd = os.open(temp_path, os.O_RDONLY)
+        finally:
+            os.unlink(temp_path)
+        return os.fdopen(read_fd, "rb")
+
+    # Tests and callers can use one stable spelling without knowing the FD
+    # until an immutable per-process image is opened.
+    @staticmethod
+    def source_path_for(fd: int) -> str:
+        return f"/dev/fd/{fd}"
+
+    @property
+    def fd(self) -> int:
+        image = getattr(self, "_test_image", None)
+        if image is None:
+            image = self.open_source_image()
+            object.__setattr__(self, "_test_image", image)
+        return image.fileno()
+
+    @property
+    def source_path(self) -> str:
+        return self.source_path_for(self.fd)
+
+    def close(self) -> None:
+        image = getattr(self, "_test_image", None)
+        if image is not None:
+            image.close()
+            object.__setattr__(self, "_test_image", None)
+
+
+def _probe_worker_path_snapshot(
+    snapshot: _WorkerPathSnapshot,
+    env: Mapping[str, str],
+) -> None:
+    image = snapshot.open_source_image()
+    try:
+        probe = _REAL_SUBPROCESS_POPEN(
+            [
+                "/bin/bash",
+                "-c",
+                _WORKER_PATH_SOURCE_SCRIPT,
+                "hermes-worker-path-probe",
+                snapshot.source_path_for(image.fileno()),
+            ],
+            env=dict(env),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            pass_fds=(image.fileno(),),
+        )
+        probe.communicate()
+    finally:
+        image.close()
+    if probe.returncode != 0:
+        raise RuntimeError("worker_path_source_failed")
+
+
+def _snapshot_worker_path_lib(env: Mapping[str, str]) -> _WorkerPathSnapshot:
+    """Read once, hash once, then source only immutable approved bytes.
+
+    The configured pathname is opened exactly once with ``O_NOFOLLOW`` when
+    available. Probe and launcher receive separate unlinked read-only images
+    of the same immutable ``bytes`` object, so replacing or rewriting the
+    configured pathname after approval cannot change what gets sourced.
     """
     lib_value = (env.get("HERMES_WORKER_PATH_LIB") or "").strip()
     if not lib_value:
         raise RuntimeError("worker_path_lib_missing")
     lib_path = Path(lib_value)
-    if not lib_path.is_absolute() or not lib_path.is_file():
+    if not lib_path.is_absolute():
         raise RuntimeError("worker_path_lib_invalid")
 
     expected = (env.get("K5_WORKER_PATH_SHA256") or "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{64}", expected):
         raise RuntimeError("worker_path_hash_invalid")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
     try:
-        actual = hashlib.sha256(lib_path.read_bytes()).hexdigest()
+        source_fd = os.open(str(lib_path), flags)
+        try:
+            if not stat.S_ISREG(os.fstat(source_fd).st_mode):
+                raise RuntimeError("worker_path_lib_invalid")
+            chunks = []
+            while True:
+                chunk = os.read(source_fd, 65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            approved_bytes = b"".join(chunks)
+        finally:
+            os.close(source_fd)
+    except RuntimeError:
+        raise
     except OSError as exc:
         raise RuntimeError("worker_path_hash_unavailable") from exc
+    actual = hashlib.sha256(approved_bytes).hexdigest()
     if not secrets.compare_digest(actual, expected):
         raise RuntimeError("worker_path_hash_mismatch")
 
-    probe = subprocess.run(
-        [
-            "/bin/bash",
-            "-c",
-            _WORKER_PATH_SOURCE_SCRIPT,
-            "hermes-worker-path-probe",
-            str(lib_path),
-            expected,
-        ],
-        env=dict(env),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        check=False,
+    snapshot = _WorkerPathSnapshot(
+        approved_bytes=approved_bytes,
+        original_path=str(lib_path),
+        sha256=expected,
     )
-    if probe.returncode != 0:
-        raise RuntimeError("worker_path_source_failed")
-    return str(lib_path), expected
+    _probe_worker_path_snapshot(snapshot, env)
+    return snapshot
+
+
+def _validate_worker_path_lib(env: Mapping[str, str]) -> tuple[str, str]:
+    """Backward-compatible validation helper backed by immutable snapshot."""
+    snapshot = _snapshot_worker_path_lib(env)
+    return snapshot.original_path, snapshot.sha256
 
 
 def _default_spawn(
@@ -10865,6 +11181,7 @@ def _default_spawn(
     workspace: str,
     *,
     board: Optional[str] = None,
+    worker_path_snapshot: Optional[_WorkerPathSnapshot] = None,
 ) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
@@ -10881,6 +11198,10 @@ def _default_spawn(
     import subprocess
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
+    if worker_path_snapshot is None:
+        # Direct callers get the same fail-closed boundary as dispatch_once,
+        # before profile lookup, retagging, logs, or process effects.
+        worker_path_snapshot = _snapshot_worker_path_lib(os.environ)
 
     from hermes_cli.profiles import normalize_profile_name
 
@@ -11045,14 +11366,13 @@ def _default_spawn(
     # rotation, or Popen). The real child repeats the hash+source check below
     # to close the validation/use race. Card content never enters either shell
     # program; only positional argv values do.
-    worker_path_lib, worker_path_sha256 = _validate_worker_path_lib(env)
+    source_image = worker_path_snapshot.open_source_image()
     cmd = [
         "/bin/bash",
         "-c",
         _WORKER_PATH_EXEC_SCRIPT,
         "hermes-worker-path",
-        worker_path_lib,
-        worker_path_sha256,
+        worker_path_snapshot.source_path_for(source_image.fileno()),
         *cmd,
     ]
     # Redirect output to a per-task log under <board-root>/logs/.
@@ -11075,15 +11395,18 @@ def _default_spawn(
             stdout=log_f,
             stderr=subprocess.STDOUT,
             env=env,
+            pass_fds=(source_image.fileno(),),
             start_new_session=True,
             creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
         )
     except FileNotFoundError:
         log_f.close()
+        source_image.close()
         raise RuntimeError(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
+    source_image.close()
     # NOTE: we intentionally do NOT close log_f here — we want Popen's
     # child process to keep writing after this function returns.  The
     # handle is kept alive by the child's inheritance.  The parent's

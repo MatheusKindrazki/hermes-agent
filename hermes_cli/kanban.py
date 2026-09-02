@@ -2784,6 +2784,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
         )
+    targeted = bool(getattr(args, "task_id", None))
+    exit_code = 0 if not targeted or res.target_reason == "spawned" else 1
     if getattr(args, "json", False):
         print(json.dumps({
             "reclaimed": res.reclaimed,
@@ -2804,8 +2806,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "auto_assigned_default": res.auto_assigned_default,
             "target_reason": res.target_reason,
+            "worker_path_error": res.worker_path_error,
         }, indent=2))
-        return 0
+        return exit_code
     print(f"Reclaimed:    {res.reclaimed}")
     print(f"Crashed:      {len(res.crashed)}")
     if res.crashed:
@@ -2841,7 +2844,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
-    return 0
+    return exit_code
 
 
 def _cmd_daemon(args: argparse.Namespace) -> int:
