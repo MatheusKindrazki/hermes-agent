@@ -229,7 +229,7 @@ def test_local_delivery_command_and_ack(tmp_path, monkeypatch):
             agent=agent,
         )
     )
-    assert result["status"] == "sent"
+    assert result["status"] == "accepted"
     assert result["to"] == "@researcher"
     assert result["process_id"] == "proc_test1234"
     assert "do NOT wait" in result["detail"]
@@ -273,7 +273,7 @@ def test_peer_delivery_command(tmp_path, monkeypatch):
     result = json.loads(
         bot_mode_dm.message_agent_tool(target="spark/researcher", message="ping", agent=agent)
     )
-    assert result["status"] == "sent"
+    assert result["status"] == "accepted"
     assert "spark" in result["to"]
     mode, _dm_file, transport_argv = _runner_parts(calls[0]["command"])
     assert mode == "stdin"
@@ -283,7 +283,7 @@ def test_peer_delivery_command(tmp_path, monkeypatch):
     result2 = json.loads(
         bot_mode_dm.message_agent_tool(target="spark", message="ping", agent=agent)
     )
-    assert result2["status"] == "sent"
+    assert result2["status"] == "accepted"
     mode, _dm_file, transport_argv = _runner_parts(calls[1]["command"])
     assert mode == "stdin"
     assert transport_argv == ["hermes", "peer", "dm", "spark"]
@@ -299,7 +299,7 @@ def test_named_profile_sender_prefix(tmp_path, monkeypatch):
     result = json.loads(
         bot_mode_dm.message_agent_tool(target="researcher", message="hi", agent=agent)
     )
-    assert result["status"] == "sent"
+    assert result["status"] == "accepted"
     _mode, dm_file, _transport_argv = _runner_parts(calls[0]["command"])
     assert Path(dm_file).read_text(encoding="utf-8").startswith(
         "Message from 🤖 coder (@coder): "
@@ -553,7 +553,7 @@ def test_successful_spawn_transfers_cleanup_to_runner(tmp_path, monkeypatch):
         )
     )
 
-    assert result["status"] == "sent"
+    assert result["status"] == "accepted"
     assert dm_file.exists(), "the parent must not delete before the background runner reads"
 
 

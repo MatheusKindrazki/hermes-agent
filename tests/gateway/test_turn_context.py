@@ -9,6 +9,7 @@ itself (that's covered by test_run_progress_topics.py et al.).
 """
 
 import asyncio
+import json
 import queue as queue_mod
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -18,6 +19,53 @@ import pytest
 from gateway.config import Platform
 from gateway.session import SessionSource
 from gateway.turn_context import TurnContext
+
+
+def test_kernel_shadow_receipt_is_content_free_atomic_and_private(tmp_path, monkeypatch):
+    from gateway.turn_context import write_kernel_shadow_receipt
+
+    spool = tmp_path / "shadow"
+    monkeypatch.setenv("HERMES_KERNEL_SHADOW_PRODUCER_ENABLED", "1")
+    monkeypatch.setenv("HERMES_KERNEL_SHADOW_RECEIPT_DIR", str(spool))
+    event = {
+        "schema": "hermes.kernel-shadow-event/v1",
+        "event_id": "evt-agent-1",
+        "work_id": "01a06c45-68ef-7d98-92cb-7225914a3437",
+        "authority_version": 7,
+        "tenant": "personal",
+        "profile": "kindra",
+        "origin_session_id": "session-origin",
+        "source_event_id": "source-1",
+        "attempt_id": "01a06c46-68ef-7d98-92cb-7225914a3437",
+        "lease_epoch": 3,
+        "action": "delivery",
+        "delivery_id": "delivery-1",
+        "question_id": "",
+        "outcome": "delivered",
+        "adapter_receipt_sha256": "a" * 64,
+        "observed_at": 1_800_000_000,
+        "fence_valid": True,
+        "material": False,
+        "waiting_for_human": False,
+        "terminal": True,
+    }
+    path = write_kernel_shadow_receipt(event)
+    assert path is not None
+    assert path.parent.stat().st_mode & 0o777 == 0o700
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert json.loads(path.read_text()) == event
+    assert not list(spool.glob("*.tmp.*"))
+
+
+def test_kernel_shadow_receipt_is_double_default_off_and_rejects_content(tmp_path, monkeypatch):
+    from gateway.turn_context import write_kernel_shadow_receipt
+
+    monkeypatch.setenv("HERMES_KERNEL_SHADOW_RECEIPT_DIR", str(tmp_path / "shadow"))
+    assert write_kernel_shadow_receipt({}) is None
+    assert not (tmp_path / "shadow").exists()
+    monkeypatch.setenv("HERMES_KERNEL_SHADOW_PRODUCER_ENABLED", "1")
+    with pytest.raises(ValueError, match="kernel_shadow_event_fields_invalid"):
+        write_kernel_shadow_receipt({"message": "must never be persisted"})
 
 
 def _make_runner(ctx):

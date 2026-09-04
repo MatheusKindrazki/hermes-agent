@@ -41,6 +41,7 @@ the same wake shape every Bot Mode agent already knows.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -51,6 +52,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
@@ -242,6 +244,7 @@ def message_agent_tool(
     target: str = "",
     message: str = "",
     task_id: Optional[str] = None,
+    origin_session_id: Optional[str] = None,
     agent: Any = None,
 ) -> str:
     """Deliver ``message`` to ``target``'s Bot Chat. Returns a JSON ack/error.
@@ -310,6 +313,7 @@ def message_agent_tool(
             stdin_file=True,
             task_id=task_id,
             agent=agent,
+            origin_session_id=origin_session_id,
         )
 
     # ── local teammate ──
@@ -344,25 +348,58 @@ def message_agent_tool(
             return relayed
         return _err("You can't message yourself. Pick a teammate from the roster.")
 
+    exact_session, route_reason = _resolve_target_bot_session(
+        resolved, origin_session_id
+    )
+    if origin_session_id and not exact_session:
+        return _err(
+            f"Delivery origin session {origin_session_id!r} is not an eligible Bot Chat "
+            f"for profile '{resolved}' ({route_reason}); refusing title fallback."
+        )
+    route_argv = ["hermes", "-p", resolved]
+    if exact_session:
+        # Top-level --resume reaches the exact session (or its compression
+        # continuation), before the chat subcommand can inspect a title.
+        route_argv += ["--resume", exact_session]
+    route_argv += [
+        "chat", "--in", "~", "-c", "Bot Chat", "--create-if-missing", "-Q"
+    ]
+
     return _start_delivery(
-        [
-            "hermes",
-            "-p",
-            resolved,
-            "chat",
-            "--in",
-            "~",
-            "-c",
-            "Bot Chat",
-            "--create-if-missing",
-            "-Q",
-        ],
+        route_argv,
         prefix + body,
         f"@{_handle(resolved)}",
         stdin_file=False,
         task_id=task_id,
         agent=agent,
+        origin_session_id=origin_session_id,
+        route_reason=route_reason,
     )
+
+
+def _resolve_target_bot_session(
+    profile: str, origin_session_id: Optional[str]
+) -> tuple[Optional[str], str]:
+    """Resolve an explicit destination session; title is only a labeled fallback."""
+    if not origin_session_id:
+        return None, "canonical_title_fallback"
+    try:
+        from hermes_cli.profiles import get_profile_dir
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=get_profile_dir(profile) / "state.db")
+        try:
+            row = db.get_session(str(origin_session_id))
+            if not row:
+                return None, "origin_session_not_found"
+            if str(row.get("title") or "") != "Bot Chat":
+                return None, "origin_session_not_bot_chat"
+            return db.get_compression_tip(str(origin_session_id)) or str(origin_session_id), "origin_exact"
+        finally:
+            db.close()
+    except Exception:
+        logger.debug("exact Bot Chat session resolution failed", exc_info=True)
+        return None, "origin_session_unavailable"
 
 
 def _try_relay_delivery(
@@ -511,6 +548,168 @@ def _write_dm_file(content: str) -> str:
     return path
 
 
+def _delivery_ledger_path(idempotency_key: str) -> Path:
+    return _dm_dir() / ("delivery-" + idempotency_key + ".json")
+
+
+@contextlib.contextmanager
+def _delivery_ledger_lock(idempotency_key: str):
+    """Cross-process exclusive create lock for one idempotency key."""
+    path = _delivery_ledger_path(idempotency_key).with_suffix(".lock")
+    fd = None
+    for _ in range(200):
+        try:
+            fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            break
+        except FileExistsError:
+            time.sleep(0.01)
+    if fd is None:
+        raise TimeoutError("delivery idempotency lock timed out")
+    try:
+        yield
+    finally:
+        try:
+            os.close(fd)
+        finally:
+            _unlink_dm_file(str(path))
+
+
+def _write_delivery_receipt(
+    dm_file: str, *, origin_session_id: str, origin_reason: str, route_reason: str, label: str, idempotency_key: str
+) -> dict[str, str]:
+    """Persist the accepted-state receipt before spawning a child process.
+
+    A terminal PID only proves that the Desktop accepted a spawn request.  The
+    sidecar is intentionally content-free and gives retries a stable delivery
+    identity tied to the originating Bot Chat session.  The child updates this
+    same record to a terminal state in :func:`_run_delivery`.
+    """
+    ledger = _delivery_ledger_path(idempotency_key)
+    with _delivery_ledger_lock(idempotency_key):
+        try:
+            existing = json.loads(ledger.read_text(encoding="utf-8"))
+            if isinstance(existing, dict) and existing.get("idempotency_key") == idempotency_key:
+                existing["duplicate"] = True
+                Path(dm_file + ".receipt.json").write_text(
+                    json.dumps(existing, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+                )
+                return existing
+        except (OSError, ValueError, TypeError):
+            pass
+        delivery_id = str(uuid.uuid4())
+        record = {
+            "schema": "hermes.delivery/v1", "delivery_id": delivery_id,
+            "origin_session_id": str(origin_session_id or ""),
+            "origin_reason": origin_reason, "route_reason": route_reason, "target": label,
+            "idempotency_key": idempotency_key, "state": "accepted",
+            "accepted_at": str(int(time.time())),
+        }
+        path = Path(dm_file + ".receipt.json")
+        fd, temporary = tempfile.mkstemp(prefix="receipt-", suffix=".json", dir=str(path.parent), text=True)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(record, stream, sort_keys=True, separators=(",", ":"))
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, path)
+            ledger_tmp = ledger.with_suffix(".tmp")
+            ledger_tmp.write_text(json.dumps(record, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+            os.chmod(ledger_tmp, 0o600)
+            os.replace(ledger_tmp, ledger)
+        except BaseException:
+            _unlink_dm_file(temporary)
+            raise
+        return record
+
+
+def _update_delivery_receipt(dm_file: str, state: str) -> None:
+    path = Path(dm_file + ".receipt.json")
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record["state"] = state
+        record["updated_at"] = str(int(time.time()))
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(record, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+        idempotency_key = str(record.get("idempotency_key") or "")
+        if idempotency_key:
+            ledger = _delivery_ledger_path(idempotency_key)
+            ledger_tmp = ledger.with_suffix(".tmp")
+            ledger_tmp.write_text(json.dumps(record, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+            os.chmod(ledger_tmp, 0o600)
+            os.replace(ledger_tmp, ledger)
+        _emit_delivery_shadow_receipt(record, state)
+    except (OSError, ValueError, TypeError):
+        logger.debug("delivery receipt update failed", exc_info=True)
+
+
+def _emit_delivery_shadow_receipt(record: dict[str, Any], state: str) -> None:
+    """Observe a terminal DM effect only with an upstream-validated fence."""
+    if os.environ.get("HERMES_KERNEL_SHADOW_PRODUCER_ENABLED", "0") != "1":
+        return
+    if os.environ.get("HERMES_KERNEL_FENCE_VALIDATED", "0") != "1":
+        return
+    if state not in {"delivered", "failed"}:
+        return
+    try:
+        from gateway.turn_context import write_kernel_shadow_receipt
+
+        work_id = os.environ["HERMES_KERNEL_WORK_ID"]
+        authority_version = int(os.environ["HERMES_KERNEL_AUTHORITY_VERSION"])
+        tenant = os.environ["HERMES_KERNEL_TENANT"]
+        profile = os.environ["HERMES_KERNEL_PROFILE"]
+        attempt_id = os.environ["HERMES_KERNEL_ATTEMPT_ID"]
+        lease_epoch = int(os.environ["HERMES_KERNEL_LEASE_EPOCH"])
+        delivery_id = str(record["delivery_id"])
+        origin = str(record["origin_session_id"])
+        source_event_id = str(record["idempotency_key"])
+        adapter_hash = hashlib.sha256(
+            (delivery_id + "\0" + source_event_id + "\0" + state).encode("utf-8")
+        ).hexdigest()
+        event_id = "agent-delivery-" + hashlib.sha256(
+            (work_id + "\0" + delivery_id + "\0" + state).encode("utf-8")
+        ).hexdigest()
+        write_kernel_shadow_receipt({
+            "schema": "hermes.kernel-shadow-event/v1",
+            "event_id": event_id,
+            "work_id": work_id,
+            "authority_version": authority_version,
+            "tenant": tenant,
+            "profile": profile,
+            "origin_session_id": origin,
+            "source_event_id": source_event_id,
+            "attempt_id": attempt_id,
+            "lease_epoch": lease_epoch,
+            "action": "delivery",
+            "delivery_id": delivery_id,
+            "question_id": "",
+            "outcome": state,
+            "adapter_receipt_sha256": adapter_hash,
+            "observed_at": int(time.time()),
+            "fence_valid": True,
+            "material": False,
+            "waiting_for_human": False,
+            "terminal": True,
+        })
+    except (KeyError, TypeError, ValueError, OSError):
+        logger.debug("kernel shadow delivery receipt skipped", exc_info=True)
+
+
+def _release_unspawned_delivery(dm_file: Optional[str]) -> None:
+    """Remove a pre-spawn claim so the same idempotency key may retry."""
+    if not dm_file:
+        return
+    path = Path(dm_file + ".receipt.json")
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+        key = str(record.get("idempotency_key") or "")
+        if key:
+            _unlink_dm_file(str(_delivery_ledger_path(key)))
+    except (OSError, ValueError, TypeError):
+        pass
+    _unlink_dm_file(str(path))
+
+
 def _unlink_dm_file(path: str) -> None:
     try:
         os.unlink(path)
@@ -562,13 +761,15 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool) -> int:
     failures never retry. Peer transports (stdin mode) retry on their own
     gateway's deliver path, not here.
     """
+    returncode = 1
     try:
         with _delivery_lock(argv, stdin_file=stdin_file):
             if stdin_file:
                 # Keep the file open until the transport exits; cleanup occurs
                 # after subprocess.run returns, not merely after stdin reaches EOF.
                 with open(dm_file, "r", encoding="utf-8") as stream:
-                    return subprocess.run(argv, stdin=stream, check=False).returncode
+                    returncode = subprocess.run(argv, stdin=stream, check=False).returncode
+                    return returncode
             proc = subprocess.run(
                 [*argv, "--query-file", dm_file],
                 check=False,
@@ -598,8 +799,10 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool) -> int:
             if proc.stderr:
                 sys.stderr.write(proc.stderr)
                 sys.stderr.flush()
-            return proc.returncode
+            returncode = proc.returncode
+            return returncode
     finally:
+        _update_delivery_receipt(dm_file, "delivered" if returncode == 0 else "failed")
         _unlink_dm_file(dm_file)
 
 
@@ -630,18 +833,47 @@ def _start_delivery(
     stdin_file: bool,
     task_id: Optional[str],
     agent: Any,
+    origin_session_id: Optional[str] = None,
+    route_reason: str = "canonical_title_fallback",
 ) -> str:
     """Create a DM file and transfer its cleanup ownership to the runner."""
     dm_file = _write_dm_file(content)
     try:
+        origin = str(origin_session_id or getattr(agent, "session_id", "") or "")
+        origin_reason = "explicit" if origin_session_id else "agent_session_fallback"
+        if not origin:
+            _unlink_dm_file(dm_file)
+            return _err("Delivery requires origin_session_id; no fallback session is available.")
+        # The durable ledger is shared by all profile processes on one Hermes
+        # install.  Scope idempotency to that install so unrelated test or
+        # tenant homes that happen to reuse a session id never suppress a send.
+        ledger_scope = str(_hermes_root(Path(_agent_home(agent))))
+        idempotency_key = hashlib.sha256(
+            (ledger_scope + "\0" + origin + "\0" + label + "\0" + content).encode("utf-8")
+        ).hexdigest()
+        receipt = _write_delivery_receipt(
+            dm_file,
+            origin_session_id=origin,
+            origin_reason=origin_reason,
+            route_reason=route_reason,
+            label=label,
+            idempotency_key=idempotency_key,
+        )
+        if receipt.get("duplicate"):
+            _unlink_dm_file(dm_file)
+            _unlink_dm_file(dm_file + ".receipt.json")
+            return json.dumps({"status": "accepted", "to": label, "delivery": receipt,
+                               "detail": "Delivery already accepted for this exact origin; no duplicate spawn."})
         command = _delivery_command(argv, dm_file, stdin_file=stdin_file)
     except BaseException:
         _unlink_dm_file(dm_file)
+        _unlink_dm_file(dm_file + ".receipt.json")
         raise
     return _spawn_delivery(
         command,
         label,
         dm_file=dm_file,
+        receipt=receipt,
         task_id=task_id,
         agent=agent,
     )
@@ -652,6 +884,7 @@ def _spawn_delivery(
     label: str,
     *,
     dm_file: Optional[str] = None,
+    receipt: Optional[dict[str, str]] = None,
     task_id: Optional[str],
     agent: Any,
 ) -> str:
@@ -679,15 +912,17 @@ def _spawn_delivery(
             parsed = {}
         proc_id = parsed.get("session_id") or ""
         if parsed.get("error"):
+            _release_unspawned_delivery(dm_file)
             return _err(f"Delivery to {label} failed to start: {parsed['error']}")
         if not proc_id:
+            _release_unspawned_delivery(dm_file)
             return _err(f"Delivery to {label} failed to start: no process id returned")
         # From this point the background runner owns the file and removes it
         # only after the local query-file or peer stdin consumer has finished.
         transferred = True
         return json.dumps(
             {
-                "status": "sent",
+                "status": "accepted",
                 "to": label,
                 "detail": (
                     f"Message dispatched to {label}. This is asynchronous — do NOT wait "
@@ -696,10 +931,12 @@ def _spawn_delivery(
                     "that agent."
                 ),
                 **({"process_id": proc_id} if proc_id else {}),
+                **({"delivery": receipt} if receipt else {}),
                 "sent_at": int(time.time()),
             }
         )
     except Exception as exc:
+        _release_unspawned_delivery(dm_file)
         logger.error("message_agent delivery spawn failed: %s", exc, exc_info=True)
         return _err(f"Delivery to {label} could not be started: {exc}")
     finally:
