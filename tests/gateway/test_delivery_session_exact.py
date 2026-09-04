@@ -107,3 +107,30 @@ def test_failed_pre_spawn_releases_claim_for_real_retry(monkeypatch, tmp_path):
         route_reason="origin_exact", label="@researcher", idempotency_key=key,
     )
     assert retry.get("duplicate") is not True
+
+
+def test_terminal_delivery_emits_content_free_shadow_receipt(monkeypatch, tmp_path):
+    dm_file = tmp_path / "payload.txt"
+    dm_file.write_text("private message")
+    monkeypatch.setenv("HERMES_KERNEL_SHADOW_PRODUCER_ENABLED", "1")
+    monkeypatch.setenv("HERMES_KERNEL_SHADOW_RECEIPT_DIR", str(tmp_path / "shadow"))
+    monkeypatch.setenv("HERMES_KERNEL_WORK_ID", "01a06c45-68ef-7d98-92cb-7225914a3437")
+    monkeypatch.setenv("HERMES_KERNEL_AUTHORITY_VERSION", "4")
+    monkeypatch.setenv("HERMES_KERNEL_TENANT", "personal")
+    monkeypatch.setenv("HERMES_KERNEL_PROFILE", "kindra")
+    monkeypatch.setenv("HERMES_KERNEL_ATTEMPT_ID", "01a06c46-68ef-7d98-92cb-7225914a3437")
+    monkeypatch.setenv("HERMES_KERNEL_LEASE_EPOCH", "8")
+    monkeypatch.setenv("HERMES_KERNEL_FENCE_VALIDATED", "1")
+    receipt = bot_mode_dm._write_delivery_receipt(
+        str(dm_file), origin_session_id="origin-exact", origin_reason="explicit",
+        route_reason="origin_exact", label="@researcher",
+        idempotency_key=hashlib.sha256(str(tmp_path).encode()).hexdigest(),
+    )
+    bot_mode_dm._update_delivery_receipt(str(dm_file), "delivered")
+    events = list((tmp_path / "shadow").glob("*.json"))
+    assert len(events) == 1
+    event = json.loads(events[0].read_text())
+    assert event["delivery_id"] == receipt["delivery_id"]
+    assert event["fence_valid"] is True
+    serialized = json.dumps(event)
+    assert "private message" not in serialized and "message" not in event

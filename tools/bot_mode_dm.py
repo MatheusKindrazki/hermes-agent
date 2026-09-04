@@ -638,8 +638,61 @@ def _update_delivery_receipt(dm_file: str, state: str) -> None:
             ledger_tmp.write_text(json.dumps(record, sort_keys=True, separators=(",", ":")), encoding="utf-8")
             os.chmod(ledger_tmp, 0o600)
             os.replace(ledger_tmp, ledger)
+        _emit_delivery_shadow_receipt(record, state)
     except (OSError, ValueError, TypeError):
         logger.debug("delivery receipt update failed", exc_info=True)
+
+
+def _emit_delivery_shadow_receipt(record: dict[str, Any], state: str) -> None:
+    """Observe a terminal DM effect only with an upstream-validated fence."""
+    if os.environ.get("HERMES_KERNEL_SHADOW_PRODUCER_ENABLED", "0") != "1":
+        return
+    if os.environ.get("HERMES_KERNEL_FENCE_VALIDATED", "0") != "1":
+        return
+    if state not in {"delivered", "failed"}:
+        return
+    try:
+        from gateway.turn_context import write_kernel_shadow_receipt
+
+        work_id = os.environ["HERMES_KERNEL_WORK_ID"]
+        authority_version = int(os.environ["HERMES_KERNEL_AUTHORITY_VERSION"])
+        tenant = os.environ["HERMES_KERNEL_TENANT"]
+        profile = os.environ["HERMES_KERNEL_PROFILE"]
+        attempt_id = os.environ["HERMES_KERNEL_ATTEMPT_ID"]
+        lease_epoch = int(os.environ["HERMES_KERNEL_LEASE_EPOCH"])
+        delivery_id = str(record["delivery_id"])
+        origin = str(record["origin_session_id"])
+        source_event_id = str(record["idempotency_key"])
+        adapter_hash = hashlib.sha256(
+            (delivery_id + "\0" + source_event_id + "\0" + state).encode("utf-8")
+        ).hexdigest()
+        event_id = "agent-delivery-" + hashlib.sha256(
+            (work_id + "\0" + delivery_id + "\0" + state).encode("utf-8")
+        ).hexdigest()
+        write_kernel_shadow_receipt({
+            "schema": "hermes.kernel-shadow-event/v1",
+            "event_id": event_id,
+            "work_id": work_id,
+            "authority_version": authority_version,
+            "tenant": tenant,
+            "profile": profile,
+            "origin_session_id": origin,
+            "source_event_id": source_event_id,
+            "attempt_id": attempt_id,
+            "lease_epoch": lease_epoch,
+            "action": "delivery",
+            "delivery_id": delivery_id,
+            "question_id": "",
+            "outcome": state,
+            "adapter_receipt_sha256": adapter_hash,
+            "observed_at": int(time.time()),
+            "fence_valid": True,
+            "material": False,
+            "waiting_for_human": False,
+            "terminal": True,
+        })
+    except (KeyError, TypeError, ValueError, OSError):
+        logger.debug("kernel shadow delivery receipt skipped", exc_info=True)
 
 
 def _release_unspawned_delivery(dm_file: Optional[str]) -> None:

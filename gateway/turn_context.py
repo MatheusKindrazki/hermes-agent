@@ -28,7 +28,11 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+import json
+import os
 from pathlib import Path
+import re
+import tempfile
 from typing import Any, Callable, List, Optional
 
 
@@ -50,6 +54,82 @@ class RequestContext:
 _REQUEST_CONTEXT: ContextVar[Optional[RequestContext]] = ContextVar(
     "HERMES_REQUEST_CONTEXT_V2", default=None
 )
+
+KERNEL_SHADOW_SCHEMA = "hermes.kernel-shadow-event/v1"
+KERNEL_SHADOW_FIELDS = frozenset({
+    "schema", "event_id", "work_id", "authority_version", "tenant", "profile",
+    "origin_session_id", "source_event_id", "attempt_id", "lease_epoch", "action",
+    "delivery_id", "question_id", "outcome", "adapter_receipt_sha256", "observed_at",
+    "fence_valid", "material", "waiting_for_human", "terminal",
+})
+_SHADOW_ID = re.compile(r"^[A-Za-z0-9._:@/-]{1,200}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _validate_kernel_shadow_event(event: dict[str, Any]) -> None:
+    """Validate the deliberately content-free live-shadow envelope."""
+    if not isinstance(event, dict) or set(event) != KERNEL_SHADOW_FIELDS:
+        raise ValueError("kernel_shadow_event_fields_invalid")
+    if event["schema"] != KERNEL_SHADOW_SCHEMA:
+        raise ValueError("kernel_shadow_event_schema_invalid")
+    for field_name in (
+        "event_id", "work_id", "tenant", "profile", "origin_session_id",
+        "source_event_id", "attempt_id", "action", "outcome",
+    ):
+        if not isinstance(event[field_name], str) or _SHADOW_ID.fullmatch(event[field_name]) is None:
+            raise ValueError("kernel_shadow_event_identity_invalid")
+    for optional_identity in ("delivery_id", "question_id"):
+        value = event[optional_identity]
+        if not isinstance(value, str) or (value and _SHADOW_ID.fullmatch(value) is None):
+            raise ValueError("kernel_shadow_event_identity_invalid")
+    for integer_name in ("authority_version", "lease_epoch", "observed_at"):
+        value = event[integer_name]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError("kernel_shadow_event_integer_invalid")
+    if _SHA256.fullmatch(event["adapter_receipt_sha256"]) is None:
+        raise ValueError("kernel_shadow_event_receipt_invalid")
+    for boolean_name in ("fence_valid", "material", "waiting_for_human", "terminal"):
+        if not isinstance(event[boolean_name], bool):
+            raise ValueError("kernel_shadow_event_boolean_invalid")
+
+
+def write_kernel_shadow_receipt(event: dict[str, Any]) -> Optional[Path]:
+    """Atomically spool one metadata-only receipt when its producer gate is on."""
+    if os.environ.get("HERMES_KERNEL_SHADOW_PRODUCER_ENABLED", "0") != "1":
+        return None
+    _validate_kernel_shadow_event(event)
+    configured = os.environ.get("HERMES_KERNEL_SHADOW_RECEIPT_DIR", "")
+    spool = Path(configured)
+    if not configured or not spool.is_absolute() or spool.is_symlink():
+        raise ValueError("kernel_shadow_receipt_dir_invalid")
+    spool.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if spool.is_symlink() or not spool.is_dir():
+        raise ValueError("kernel_shadow_receipt_dir_invalid")
+    spool.chmod(0o700)
+    target = spool / (event["event_id"] + ".json")
+    if target.exists():
+        persisted = json.loads(target.read_text(encoding="utf-8"))
+        if persisted != event:
+            raise ValueError("kernel_shadow_event_conflict")
+        return target
+    descriptor, temporary = tempfile.mkstemp(
+        prefix="." + event["event_id"] + ".tmp.", dir=str(spool), text=True
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(event, stream, sort_keys=True, separators=(",", ":"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, target)
+        target.chmod(0o600)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    return target
 
 
 def _mapping(value: Any) -> dict:
