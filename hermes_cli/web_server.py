@@ -59,6 +59,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from hermes_cli import __version__, __release_date__
+from hermes_cli.work_control_projection import (
+    SCHEMA as _WORK_CONTROL_SCHEMA,
+    ProjectionUnavailable as _WorkControlProjectionUnavailable,
+    work_control_projection,
+)
 from hermes_cli.config import (
     build_cron_model_impact,
     cfg_get,
@@ -529,6 +534,23 @@ app = FastAPI(title="Hermes Agent", version=__version__, lifespan=_lifespan)
 from hermes_cli.memory_oauth import router as _memory_oauth_router  # noqa: E402
 
 app.include_router(_memory_oauth_router)
+
+
+@app.get("/api/work-control/projection")
+def get_work_control_projection():
+    """Return the sanitized Jarvis projection; never expose its credential."""
+    try:
+        return work_control_projection.get()
+    except _WorkControlProjectionUnavailable:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "schema_version": _WORK_CONTROL_SCHEMA,
+                "records": [],
+                "stale": True,
+                "source": "unavailable",
+            },
+        )
 
 # ---------------------------------------------------------------------------
 # Session token for protecting sensitive endpoints (reveal).
