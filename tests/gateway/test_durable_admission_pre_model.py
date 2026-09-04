@@ -26,7 +26,7 @@ from agent import durable_admission
 
 K7_ROOT = Path(
     "/Users/matheuskindrazki/development/personal/.worktrees/"
-    "hermes-personal-os/hermes-kernel-v1-k7-kernel-20260902"
+    "hermes-personal-os/hermes-kernel-turn-identity-20260904"
 )
 K7_BIN = K7_ROOT / "control" / "kernel" / "admit_cli.py"
 K7_SCHEMA = K7_ROOT / "control" / "schemas" / "work-envelope.schema.json"
@@ -397,6 +397,83 @@ def _outcome(tag: str):
         model_may_run=True,
         signal_persisted=True,
     )
+
+
+def _turn_identity():
+    return {
+        "schema_version": "hermes.kernel-turn-identity.v1",
+        "work_id": "01a061a7-cea0-7503-b308-1f4029d450c8",
+        "authority_version": 4,
+        "tenant": "personal",
+        "profile": "default",
+        "source": "default",
+        "origin_session_id": "origin-session",
+        "origin_machine": "mac-mini",
+        "source_event_id": "evt-4242",
+        "source_event_observed_at": 1,
+        "request_key": "request-key-4242",
+        "attempt_id": "01a061a7-cea0-7503-b308-1f4029d450c9",
+        "generation": 7,
+        "authority_source": "remote",
+        "authority_root_id": "a" * 32,
+        "attestation": {
+            "alg": "hmac-sha256",
+            "version": "hermes-kernel-turn-identity-attestation.v1",
+            "key_id": "b" * 16,
+            "value": "c" * 64,
+        },
+    }
+
+
+def test_turn_identity_is_bound_to_the_one_shot_carrier_and_revalidated(monkeypatch):
+    identity = _turn_identity()
+    outcome = durable_admission.AdmissionOutcome(
+        state="admitted", reason_code="structured_execution", work_id=identity["work_id"],
+        request_key=identity["request_key"], event_id=identity["source_event_id"],
+        session_id=identity["origin_session_id"], model_may_run=True,
+        authority_pin_matched=True, signal_persisted=True, authority_version=4,
+        turn_identity=identity, turn_identity_seal=durable_admission._turn_identity_seal(identity),
+    )
+    carrier = durable_admission.publish_pre_admission(outcome)
+    taken = durable_admission.consume_pre_admission(carrier)
+    durable_admission.bind_admitted_turn(taken)
+    calls = []
+    monkeypatch.setattr(
+        durable_admission,
+        "_run_turn_identity_revalidation",
+        lambda candidate: calls.append(candidate) or {
+            "schema_version": "hermes.kernel-turn-fence.v1", "fence_valid": True,
+            "work_id": identity["work_id"], "attempt_id": identity["attempt_id"],
+            "generation": 7, "identity_sha256": durable_admission.turn_identity_sha256(identity),
+            "checked_at": 100,
+        },
+    )
+
+    verified, fence = durable_admission.revalidate_current_turn_identity()
+
+    assert verified == identity and fence["fence_valid"] is True
+    assert calls == [identity]
+    assert durable_admission.consume_pre_admission(carrier) is None
+
+
+@pytest.mark.parametrize("field,value", [
+    ("origin_session_id", "other"), ("request_key", "other-key"),
+    ("attempt_id", "01a061a7-cea0-7503-b308-1f4029d450ca"), ("generation", 8),
+])
+def test_turn_identity_rebind_is_rejected(field, value):
+    identity = _turn_identity()
+    changed = dict(identity)
+    changed[field] = value
+    outcome = durable_admission.AdmissionOutcome(
+        state="admitted", reason_code="structured_execution", work_id=identity["work_id"],
+        request_key=identity["request_key"], event_id=identity["source_event_id"],
+        session_id=identity["origin_session_id"], model_may_run=True,
+        authority_pin_matched=True, signal_persisted=True, authority_version=4,
+        turn_identity=changed, turn_identity_seal=durable_admission._turn_identity_seal(identity),
+    )
+    durable_admission.bind_admitted_turn(outcome)
+    with pytest.raises(durable_admission.TurnIdentityError):
+        durable_admission.revalidate_current_turn_identity()
 
 
 def test_red_carrier_survives_the_executor_boundary(monkeypatch):

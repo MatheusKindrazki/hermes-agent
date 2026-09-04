@@ -7,8 +7,36 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import sys
 import types
+from types import SimpleNamespace
+
+import pytest
 
 from tools import bot_mode_dm
+
+
+def _identity():
+    return {
+        "schema_version": "hermes.kernel-turn-identity.v1",
+        "work_id": "01a061a7-cea0-7503-b308-1f4029d450c8", "authority_version": 4,
+        "tenant": "personal", "profile": "default", "source": "default",
+        "origin_session_id": "origin-exact", "origin_machine": "mac-mini",
+        "source_event_id": "evt-4242", "source_event_observed_at": 1,
+        "request_key": "request-key-4242",
+        "attempt_id": "01a061a7-cea0-7503-b308-1f4029d450c9", "generation": 7,
+        "authority_source": "remote", "authority_root_id": "a" * 32,
+        "attestation": {"alg": "hmac-sha256", "version": "hermes-kernel-turn-identity-attestation.v1",
+                        "key_id": "b" * 16, "value": "c" * 64},
+    }
+
+
+def _ack(delivery_id, request_key, identity_sha):
+    return {
+        "schema": "hermes.delivery-ack.v1", "delivery_id": delivery_id,
+        "request_key": request_key, "turn_identity_sha256": identity_sha,
+        "target_session_id": "target-session", "target_message_id": 42,
+        "adapter": "cli", "state": "persisted", "accepted_at": 10,
+        "persisted_at": 11,
+    }
 
 
 def test_delivery_receipt_binds_origin_session_and_reaches_terminal_state(tmp_path):
@@ -109,7 +137,7 @@ def test_failed_pre_spawn_releases_claim_for_real_retry(monkeypatch, tmp_path):
     assert retry.get("duplicate") is not True
 
 
-def test_terminal_delivery_emits_content_free_shadow_receipt(monkeypatch, tmp_path):
+def test_global_environment_and_exit_code_cannot_emit_shadow_receipt(monkeypatch, tmp_path):
     dm_file = tmp_path / "payload.txt"
     dm_file.write_text("private message")
     monkeypatch.setenv("HERMES_KERNEL_SHADOW_PRODUCER_ENABLED", "1")
@@ -127,10 +155,92 @@ def test_terminal_delivery_emits_content_free_shadow_receipt(monkeypatch, tmp_pa
         idempotency_key=hashlib.sha256(str(tmp_path).encode()).hexdigest(),
     )
     bot_mode_dm._update_delivery_receipt(str(dm_file), "delivered")
-    events = list((tmp_path / "shadow").glob("*.json"))
-    assert len(events) == 1
-    event = json.loads(events[0].read_text())
-    assert event["delivery_id"] == receipt["delivery_id"]
-    assert event["fence_valid"] is True
-    serialized = json.dumps(event)
-    assert "private message" not in serialized and "message" not in event
+    assert list((tmp_path / "shadow").glob("*.json")) == []
+
+
+def test_structured_ack_not_exit_code_releases_delivery_shadow(monkeypatch, tmp_path):
+    dm_file = tmp_path / "payload.txt"
+    dm_file.write_text("private message")
+    identity = _identity()
+    fence = {"schema_version": "hermes.kernel-turn-fence.v1", "fence_valid": True,
+             "work_id": identity["work_id"], "attempt_id": identity["attempt_id"],
+             "generation": 7, "identity_sha256": bot_mode_dm._canonical_sha256(identity),
+             "checked_at": 10}
+    monkeypatch.setattr(bot_mode_dm, "_delivery_ledger_path", lambda key: tmp_path / (key + ".json"))
+    receipt = bot_mode_dm._write_delivery_receipt(
+        str(dm_file), origin_session_id="origin-exact", origin_reason="explicit",
+        route_reason="origin_exact", label="@researcher", idempotency_key="d" * 64,
+        turn_identity=identity, fence=fence,
+    )
+    ack = _ack(receipt["delivery_id"], identity["request_key"], fence["identity_sha256"])
+    ack["accepted_at"] = receipt["accepted_at"]
+    proc = SimpleNamespace(returncode=0, stdout=json.dumps({"reply": "ok", "delivery_ack": ack}), stderr="")
+    monkeypatch.setattr(bot_mode_dm.subprocess, "run", lambda *a, **k: proc)
+    monkeypatch.setattr(bot_mode_dm, "_revalidate_delivery_identity", lambda record: fence)
+    emitted = []
+    monkeypatch.setattr(bot_mode_dm, "_emit_delivery_shadow_receipt", lambda record, state, ack_bytes=None: emitted.append((record, state, ack_bytes)))
+
+    assert bot_mode_dm._run_delivery(["hermes", "-p", "researcher", "chat"], str(dm_file), stdin_file=False) == 0
+    assert emitted and emitted[0][1] == "delivered"
+    assert json.loads(emitted[0][2])["target_message_id"] == 42
+
+
+@pytest.mark.parametrize("payload", [{}, {"delivery_ack": {"schema": "wrong"}}])
+def test_missing_or_malformed_ack_never_marks_delivered(monkeypatch, tmp_path, payload):
+    dm_file = tmp_path / "payload.txt"
+    dm_file.write_text("private message")
+    identity = _identity()
+    fence = {"schema_version": "hermes.kernel-turn-fence.v1", "fence_valid": True,
+             "work_id": identity["work_id"], "attempt_id": identity["attempt_id"],
+             "generation": 7, "identity_sha256": bot_mode_dm._canonical_sha256(identity), "checked_at": 10}
+    monkeypatch.setattr(bot_mode_dm, "_delivery_ledger_path", lambda key: tmp_path / (key + ".json"))
+    bot_mode_dm._write_delivery_receipt(
+        str(dm_file), origin_session_id="origin-exact", origin_reason="explicit",
+        route_reason="origin_exact", label="@researcher", idempotency_key="e" * 64,
+        turn_identity=identity, fence=fence,
+    )
+    monkeypatch.setattr(bot_mode_dm, "_revalidate_delivery_identity", lambda record: fence)
+    monkeypatch.setattr(bot_mode_dm.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr=""))
+    monkeypatch.setattr(bot_mode_dm, "_emit_delivery_shadow_receipt", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no shadow")))
+    assert bot_mode_dm._run_delivery(["hermes"], str(dm_file), stdin_file=False) != 0
+
+
+def test_stale_fence_stops_before_transport(monkeypatch, tmp_path):
+    dm_file = tmp_path / "payload.txt"
+    dm_file.write_text("private message")
+    identity = _identity()
+    fence = {"schema_version": "hermes.kernel-turn-fence.v1", "fence_valid": True,
+             "work_id": identity["work_id"], "attempt_id": identity["attempt_id"],
+             "generation": 7, "identity_sha256": bot_mode_dm._canonical_sha256(identity), "checked_at": 10}
+    monkeypatch.setattr(bot_mode_dm, "_delivery_ledger_path", lambda key: tmp_path / (key + ".json"))
+    bot_mode_dm._write_delivery_receipt(
+        str(dm_file), origin_session_id="origin-exact", origin_reason="explicit",
+        route_reason="origin_exact", label="@researcher", idempotency_key="f" * 64,
+        turn_identity=identity, fence=fence,
+    )
+    monkeypatch.setattr(bot_mode_dm, "_revalidate_delivery_identity", lambda record: (_ for _ in ()).throw(RuntimeError("stale")))
+    monkeypatch.setattr(bot_mode_dm.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("transport ran")))
+    assert bot_mode_dm._run_delivery(["hermes"], str(dm_file), stdin_file=False) == 1
+
+
+def test_local_receiver_uses_real_sessiondb_row_for_idempotent_ack(tmp_path):
+    import cli
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db")
+    session_id = db.create_session("target", "cli")
+    envelope = {"schema": "hermes.delivery-envelope.v1", "delivery_id": "delivery-local-1",
+                "request_key": "request-local-1", "turn_identity_sha256": "a" * 64,
+                "accepted_at": 10}
+    encoded = bot_mode_dm._encode_delivery_query(envelope, "private")
+    message, decoded = cli._decode_delivery_query(encoded)
+    assert message == "private" and decoded == envelope
+    row_id = db.append_message(
+        session_id, "user", message, display_kind="bot_delivery",
+        display_metadata=cli._delivery_display_metadata(decoded),
+    )
+    first = cli._delivery_ack(db, session_id, decoded, adapter="cli")
+    second = cli._delivery_ack(db, session_id, decoded, adapter="cli")
+    assert first == second
+    assert first["target_message_id"] == row_id
+    assert first["target_session_id"] == session_id

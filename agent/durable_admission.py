@@ -97,8 +97,14 @@ ENV_SCHEMA_PATH = "HERMES_KERNEL_SCHEMA_PATH"
 ENV_SCHEMA_SHA256 = "HERMES_KERNEL_SCHEMA_SHA256"
 
 # The exact K7 build this consumer was approved against.
+# Retained for the explicitly gated offline fixture suite. Production accepts
+# only TURN_IDENTITY_ADMITTER_SHA256 below.
 ADMITTER_SHA256 = "9110be8580acdaf0acee3b3fd0df149523b9f189c3a0c0898f5b90510c6c2a99"
+TURN_IDENTITY_ADMITTER_SHA256 = "6fbf78d17e0b45d0894ac061657c95273a88fa84fb23c134af40d03e9a8cf653"
 SCHEMA_SHA256 = "92ce749bf6bfecf3528b83da9a5ef716f4ac6f7795342e2bf70e094eff306a3b"
+TURN_IDENTITY_SCHEMA_VERSION = "hermes.kernel-turn-identity.v1"
+TURN_FENCE_SCHEMA_VERSION = "hermes.kernel-turn-fence.v1"
+TURN_IDENTITY_ATTESTATION_VERSION = "hermes-kernel-turn-identity-attestation.v1"
 
 # K7's own gate for its scripted offline transport. Forwarded only when the
 # operator already set it. It grants nothing: K7 refuses the fixture without it,
@@ -170,6 +176,8 @@ _REQUEST_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9-]{2,119}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _ROOT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _KEY_ID_RE = re.compile(r"^[0-9a-f]{16}$")
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+_UUID7_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 
 CONFIG_SECTION = ("agent", "durable_admission")
 
@@ -257,6 +265,14 @@ def _seal_for(core: Mapping[str, Any]) -> str:
     return hmac.new(_SEAL_KEY, _canonical(dict(core)).encode("utf-8"), hashlib.sha256).hexdigest()
 
 
+def _turn_identity_seal(identity: Mapping[str, Any]) -> str:
+    return hmac.new(
+        _SEAL_KEY,
+        (TURN_IDENTITY_SCHEMA_VERSION + "\0" + _canonical(dict(identity))).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
 def _mint_receipt(_token: object, **core: Any) -> WorkReceipt:
     if _token is not _MINT:  # pragma: no cover - defensive
         raise RuntimeError("WorkReceipt may only be minted by durable admission")
@@ -325,6 +341,7 @@ class AdmissionOutcome:
     detail: str = ""
     seam: str = SEAM_NONE
     work_id: Optional[str] = None
+    authority_version: Optional[int] = None
     idempotency_key: Optional[str] = None
     content_sha256: Optional[str] = None
     request_key: Optional[str] = None
@@ -341,6 +358,8 @@ class AdmissionOutcome:
     mode_off: bool = False
     admitted_at: int = 0
     receipt: Optional[Dict[str, Any]] = field(default=None, repr=False)
+    turn_identity: Optional[Dict[str, Any]] = field(default=None, repr=False)
+    turn_identity_seal: Optional[str] = field(default=None, repr=False)
 
     @property
     def blocked(self) -> bool:
@@ -481,6 +500,54 @@ class ModeError(RuntimeError):
     """The mode setting is not one this build understands."""
 
     reason_code = "kernel_mode_invalid"
+
+
+class TurnIdentityError(RuntimeError):
+    """The request-scoped K7 identity or its fresh fence is not authoritative."""
+
+
+_TURN_IDENTITY_FIELDS = frozenset({
+    "schema_version", "work_id", "authority_version", "tenant", "profile", "source",
+    "origin_session_id", "origin_machine", "source_event_id", "source_event_observed_at",
+    "request_key", "attempt_id", "generation", "authority_source", "authority_root_id",
+    "attestation",
+})
+
+
+def _validate_turn_identity(document: Any) -> Dict[str, Any]:
+    if not isinstance(document, Mapping) or set(document) != _TURN_IDENTITY_FIELDS:
+        raise TurnIdentityError("turn_identity_fields_invalid")
+    identity = dict(document)
+    if identity["schema_version"] != TURN_IDENTITY_SCHEMA_VERSION:
+        raise TurnIdentityError("turn_identity_schema_invalid")
+    if not _UUID_RE.fullmatch(str(identity["work_id"])) or not _UUID7_RE.fullmatch(str(identity["attempt_id"])):
+        raise TurnIdentityError("turn_identity_work_attempt_invalid")
+    if identity["tenant"] != "personal" or identity["profile"] != "default" or identity["source"] != "default":
+        raise TurnIdentityError("turn_identity_scope_invalid")
+    if identity["authority_source"] != AUTHORITY_REMOTE or not _ROOT_ID_RE.fullmatch(str(identity["authority_root_id"])):
+        raise TurnIdentityError("turn_identity_authority_invalid")
+    for name in ("authority_version", "source_event_observed_at", "generation"):
+        value = identity[name]
+        minimum = 1 if name in ("authority_version", "generation") else 0
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            raise TurnIdentityError("turn_identity_integer_invalid")
+    for name, pattern in (("origin_session_id", _SESSION_ID_RE), ("origin_machine", _MACHINE_RE),
+                          ("source_event_id", _EVENT_ID_RE), ("request_key", _REQUEST_KEY_RE)):
+        if not pattern.fullmatch(str(identity[name])):
+            raise TurnIdentityError("turn_identity_binding_invalid")
+    seal = identity["attestation"]
+    if not isinstance(seal, Mapping) or set(seal) != {"alg", "version", "key_id", "value"}:
+        raise TurnIdentityError("turn_identity_attestation_invalid")
+    if (seal.get("alg") != ATTESTATION_ALG or seal.get("version") != TURN_IDENTITY_ATTESTATION_VERSION
+            or not _KEY_ID_RE.fullmatch(str(seal.get("key_id") or ""))
+            or not _SHA256_RE.fullmatch(str(seal.get("value") or ""))):
+        raise TurnIdentityError("turn_identity_attestation_invalid")
+    return identity
+
+
+def turn_identity_sha256(document: Mapping[str, Any]) -> str:
+    identity = _validate_turn_identity(document)
+    return hashlib.sha256(_canonical(identity).encode("utf-8")).hexdigest()
 
 
 def resolve_mode(environ: Optional[Mapping[str, str]] = None) -> bool:
@@ -693,13 +760,16 @@ def _resolve_trust_roots(environ: Optional[Mapping[str, str]] = None) -> _TrustR
             "%s is not an executable file: %s" % (ENV_ADMITTER_BIN, bin_path),
         )
     actual_bin = _sha256_file(bin_path)
-    if actual_bin != ADMITTER_SHA256:
+    fixture_legacy = (
+        env.get(ENV_K7_TEST_FIXTURE) == "1" and actual_bin == ADMITTER_SHA256
+    )
+    if actual_bin != TURN_IDENTITY_ADMITTER_SHA256 and not fixture_legacy:
         # A different kernel binary is a different kernel, whatever the path
         # says. Refuse before executing it, not after reading its answer.
         raise _TrustRootError(
             "admitter_hash_mismatch",
             "%s hashes to %s; this consumer is pinned to %s"
-            % (bin_path, actual_bin, ADMITTER_SHA256),
+            % (bin_path, actual_bin, TURN_IDENTITY_ADMITTER_SHA256),
         )
 
     declared = (env.get(ENV_SCHEMA_SHA256) or "").strip().lower()
@@ -972,6 +1042,72 @@ def _argv(roots: _TrustRoots, settings: Mapping[str, Any], seam: str, now: int) 
     return argv
 
 
+def _run_turn_identity_revalidation(identity: Mapping[str, Any]) -> Dict[str, Any]:
+    """Ask the pinned K7 binary for a fresh exact-current fence."""
+    roots = _resolve_trust_roots()
+    settings = _settings()
+    base_url = str(settings.get("jarvis_base_url") or "").strip()
+    secret_ref = str(settings.get("secret_ref") or "").strip()
+    if not base_url or not secret_ref or settings.get("transport_fixture"):
+        raise TurnIdentityError("turn_identity_requires_remote")
+    argv = [
+        roots.admitter_bin, "revalidate-turn-identity", "--stdin", "--now",
+        str(int(time.time())), "--jarvis-base-url", base_url, "--secret-ref", secret_ref,
+    ]
+    try:
+        completed = subprocess.run(
+            argv, input=_canonical(dict(identity)), capture_output=True, text=True,
+            timeout=TIMEOUT_SECONDS, cwd=roots.root_dir, env=_child_env(settings), shell=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise TurnIdentityError("turn_identity_revalidation_unavailable") from exc
+    if completed.returncode != EXIT_OK:
+        raise TurnIdentityError("turn_identity_stale")
+    try:
+        fence = json.loads(completed.stdout or "")
+    except (TypeError, ValueError) as exc:
+        raise TurnIdentityError("turn_identity_fence_unreadable") from exc
+    expected_sha = turn_identity_sha256(identity)
+    required = {
+        "schema_version": TURN_FENCE_SCHEMA_VERSION,
+        "fence_valid": True,
+        "work_id": identity["work_id"],
+        "attempt_id": identity["attempt_id"],
+        "generation": identity["generation"],
+        "identity_sha256": expected_sha,
+    }
+    if not isinstance(fence, dict) or any(fence.get(k) != v for k, v in required.items()):
+        raise TurnIdentityError("turn_identity_fence_rebind")
+    checked_at = fence.get("checked_at")
+    if isinstance(checked_at, bool) or not isinstance(checked_at, int) or checked_at < 1:
+        raise TurnIdentityError("turn_identity_fence_invalid")
+    return dict(fence)
+
+
+def revalidate_current_turn_identity() -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Return this turn's verified identity and a fresh remote fence, or stop."""
+    outcome = current_admitted_turn()
+    if outcome is None or outcome.state != STATE_ADMITTED:
+        raise TurnIdentityError("turn_identity_not_admitted")
+    identity = _validate_turn_identity(outcome.turn_identity)
+    expected_seal = _turn_identity_seal(identity)
+    if not isinstance(outcome.turn_identity_seal, str) or not hmac.compare_digest(
+        outcome.turn_identity_seal, expected_seal
+    ):
+        raise TurnIdentityError("turn_identity_carrier_invalid")
+    expected = {
+        "work_id": outcome.work_id,
+        "authority_version": outcome.authority_version,
+        "origin_session_id": outcome.session_id,
+        "source_event_id": outcome.event_id,
+        "request_key": outcome.request_key,
+    }
+    if any(identity.get(key) != value for key, value in expected.items()):
+        raise TurnIdentityError("turn_identity_rebind")
+    fence = _run_turn_identity_revalidation(identity)
+    return identity, fence
+
+
 def _verify_receipt(
     document: Any, *, envelope: Mapping[str, Any], seam: str, exit_code: int
 ) -> Optional[str]:
@@ -1022,6 +1158,29 @@ def _verify_receipt(
         return "receipt_envelope_mismatch"
     if not isinstance(document.get("idempotency_key"), str):
         return "receipt_incoherent"
+    identity = document.get("turn_identity")
+    if identity is not None:
+        try:
+            identity = _validate_turn_identity(identity)
+        except TurnIdentityError:
+            return "turn_identity_invalid"
+        expected_identity = {
+            "work_id": document.get("work_id"),
+            "authority_version": document.get("authority_version"),
+            "tenant": envelope["tenant"],
+            "profile": envelope["profile"],
+            "origin_session_id": origin["session_id"],
+            "origin_machine": origin["machine"],
+            "source_event_id": event["event_id"],
+            "source_event_observed_at": event["observed_at"],
+            "request_key": envelope["binding"]["request_key"],
+            "authority_source": document.get("authority_source"),
+            "authority_root_id": document.get("authority_root_id"),
+        }
+        if any(identity.get(key) != expected for key, expected in expected_identity.items()):
+            return "turn_identity_rebind"
+    if document.get("turn_identity_required") and identity is None:
+        return "turn_identity_missing"
     return None
 
 
@@ -1181,12 +1340,15 @@ def _run_admission(
         )
 
     work_id = document.get("work_id")
+    turn_identity = document.get("turn_identity")
     return _remember(
         AdmissionOutcome(
             state=state,
             reason_code=str(document.get("reason_code") or ""),
             detail=str(document.get("detail") or ""),
             work_id=work_id if isinstance(work_id, str) and work_id.strip() else None,
+            authority_version=(document.get("authority_version")
+                               if isinstance(document.get("authority_version"), int) else None),
             idempotency_key=document.get("idempotency_key"),
             model_may_run=bool(document.get("model_may_run")),
             kernel_effects_allowed=bool(document.get("effects_allowed")),
@@ -1195,6 +1357,9 @@ def _run_admission(
             replayed=bool(document.get("replayed")),
             admitted_at=int(now),
             receipt=document,
+            turn_identity=(dict(turn_identity) if isinstance(turn_identity, dict) else None),
+            turn_identity_seal=(_turn_identity_seal(turn_identity)
+                                if isinstance(turn_identity, dict) else None),
             **common,
         )
     )
@@ -1411,7 +1576,7 @@ EXPORTED_CONTRACT: Dict[str, Any] = {
     "kernel_version": KERNEL_VERSION,
     "admission_schema_version": ADMISSION_SCHEMA_VERSION,
     "envelope_schema_version": ENVELOPE_SCHEMA_VERSION,
-    "admitter_sha256": ADMITTER_SHA256,
+    "admitter_sha256": TURN_IDENTITY_ADMITTER_SHA256,
     "schema_sha256": SCHEMA_SHA256,
     "outer_timeout_seconds": TIMEOUT_SECONDS,
     "arming": "%s in %s" % (ENV_MODE, sorted(_ARMING_MODES)),

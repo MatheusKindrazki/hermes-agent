@@ -55,6 +55,12 @@ def peer_gateway(tmp_path, monkeypatch):
     adapter._session_db = db
 
     async def fake_run_agent(user_message, **kwargs):
+        if kwargs.get("delivery_metadata"):
+            db.append_message(
+                kwargs.get("session_id"), "user", user_message,
+                display_kind="bot_delivery",
+                display_metadata=kwargs["delivery_metadata"],
+            )
         return (
             {
                 "final_response": f"e2e reply to: {user_message}",
@@ -141,3 +147,27 @@ def test_hidden_lookup_requires_title_filter_e2e(peer_gateway):
     ids = [s["id"] for s in listing["data"]]
     assert peer_gateway.hidden_id not in ids
     assert "ordinary_1" in ids
+
+
+def test_peer_delivery_returns_same_durable_ack_without_second_inbound(peer_gateway, monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(peer_cmd, "_load_peers", lambda: {"spark": {"url": peer_gateway.url}})
+    monkeypatch.setattr(peer_cmd, "_peer_secret", lambda name: API_KEY)
+    envelope = {
+        "schema": "hermes.delivery-envelope.v1", "delivery_id": "delivery-peer-1",
+        "request_key": "request-peer-1", "turn_identity_sha256": "a" * 64,
+        "accepted_at": 10,
+    }
+    envelope_file = tmp_path / "delivery.json"
+    envelope_file.write_text(json.dumps(envelope), encoding="utf-8")
+    envelope_file.chmod(0o600)
+    args = SimpleNamespace(peer_action="dm", target="spark", message="once", json=True,
+                           delivery_envelope_file=str(envelope_file))
+
+    assert peer_cmd.cmd_peer(args) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert peer_cmd.cmd_peer(args) == 0
+    second = json.loads(capsys.readouterr().out)
+
+    assert first["delivery_ack"] == second["delivery_ack"]
+    rows = peer_gateway.db.get_messages(peer_gateway.hidden_id)
+    assert sum(1 for row in rows if row.get("role") == "user" and row.get("content") == "once") == 1
