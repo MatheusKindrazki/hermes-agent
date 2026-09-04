@@ -3,10 +3,12 @@
 from fastapi.testclient import TestClient
 
 from hermes_cli import web_server
+from hermes_cli import work_control_projection as projection_module
 from hermes_cli.work_control_projection import (
     ProjectionUnavailable,
     WorkControlProjection,
 )
+from urllib.request import Request
 
 
 def _payload(version: int = 1) -> dict:
@@ -103,6 +105,44 @@ def test_projection_refuses_authority_version_regression(monkeypatch):
     assert stale["stale"] is True
     assert stale["source"] == "authority_version_regression"
     assert stale["records"][0]["authority_version"] == 7
+
+
+def test_remote_projection_rejects_http_before_building_authenticated_request(monkeypatch):
+    monkeypatch.setenv("HERMES_WORK_CONTROL_PROJECTION_URL", "http://jarvis.example.test/projection")
+    monkeypatch.setenv("HERMES_WORK_CONTROL_READ_TOKEN", "must-not-leave")
+    monkeypatch.setattr(
+        projection_module,
+        "Request",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("request must not be built")),
+    )
+
+    try:
+        WorkControlProjection()._fetch_remote()
+    except ProjectionUnavailable as exc:
+        assert str(exc) == "work-control authority must use https"
+    else:
+        raise AssertionError("http authority must fail closed")
+
+
+def test_remote_projection_redirect_handler_never_builds_forward_request():
+    original = Request(
+        "https://jarvis.example.test/projection",
+        headers={"X-API-Key": "must-not-be-forwarded"},
+    )
+
+    try:
+        projection_module._RejectRedirects().redirect_request(
+            original,
+            None,
+            302,
+            "Found",
+            {},
+            "https://attacker.example.test/collect",
+        )
+    except ProjectionUnavailable as exc:
+        assert str(exc) == "work-control authority redirects are forbidden"
+    else:
+        raise AssertionError("redirect must fail before a new request is created")
 
 
 def test_local_get_is_read_only_and_returns_sanitized_projection(monkeypatch):
