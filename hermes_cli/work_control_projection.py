@@ -101,7 +101,11 @@ class WorkControlProjection:
             raise ProjectionUnavailable("work-control authority must use https")
         request = Request(
             endpoint,
-            headers={"X-API-Key": token, "Accept": "application/json"},
+            headers={
+                "X-API-Key": token,
+                "Accept": "application/json",
+                "User-Agent": "Hermes-Kernel/1.0",
+            },
             method="GET",
         )
         try:

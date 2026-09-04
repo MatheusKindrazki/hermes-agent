@@ -1,5 +1,8 @@
 """Contract tests for the Desktop's read-only Work Control projection."""
 
+from urllib.error import URLError
+from urllib.request import Request
+
 from fastapi.testclient import TestClient
 
 from hermes_cli import web_server
@@ -8,7 +11,6 @@ from hermes_cli.work_control_projection import (
     ProjectionUnavailable,
     WorkControlProjection,
 )
-from urllib.request import Request
 
 
 def _payload(version: int = 1) -> dict:
@@ -122,6 +124,34 @@ def test_remote_projection_rejects_http_before_building_authenticated_request(mo
         assert str(exc) == "work-control authority must use https"
     else:
         raise AssertionError("http authority must fail closed")
+
+
+def test_remote_projection_identifies_itself_to_cloudflare_like_authority(monkeypatch):
+    monkeypatch.setenv("HERMES_WORK_CONTROL_PROJECTION_URL", "https://jarvis.example.test/projection")
+    monkeypatch.setenv("HERMES_WORK_CONTROL_READ_TOKEN", "must-not-leak")
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return projection_module.json.dumps(_payload()).encode("utf-8")
+
+    class CloudflareLikeOpener:
+        def open(self, request, *, timeout):
+            assert timeout == projection_module.TIMEOUT_SECONDS
+            if request.get_header("User-agent") != "Hermes-Kernel/1.0":
+                raise URLError("HTTP Error 403: Cloudflare code 1010")
+            return Response()
+
+    monkeypatch.setattr(projection_module, "build_opener", lambda *_handlers: CloudflareLikeOpener())
+
+    assert WorkControlProjection()._fetch_remote() == _payload()
 
 
 def test_remote_projection_redirect_handler_never_builds_forward_request():
