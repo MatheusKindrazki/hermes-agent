@@ -17,6 +17,7 @@ import asyncio
 import json
 import os
 import threading
+import shutil
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -474,6 +475,28 @@ def test_turn_identity_rebind_is_rejected(field, value):
     durable_admission.bind_admitted_turn(outcome)
     with pytest.raises(durable_admission.TurnIdentityError):
         durable_admission.revalidate_current_turn_identity()
+
+
+@pytest.mark.parametrize("relative", [
+    "control/kernel/admit_cli.py", "control/kernel/contracts.py", "control/kernel/admitter.py",
+    "control/kernel/client.py", "control/kernel/inbox.py", "control/kernel/projector.py",
+    "control/kernel/store.py", "control/schemas/work-envelope.schema.json",
+    "control/schemas/kernel-turn-identity.schema.json",
+])
+def test_every_executed_k7_bundle_file_is_pinned_before_subprocess(monkeypatch, tmp_path, relative):
+    root = tmp_path / "k7"
+    shutil.copytree(K7_ROOT / "control", root / "control")
+    binary = root / "control/kernel/admit_cli.py"
+    binary.chmod(0o700)
+    target = root / relative
+    target.write_bytes(target.read_bytes() + b"\n# drift\n")
+    monkeypatch.setenv("HERMES_KERNEL_ADMITTER_BIN", str(binary))
+    monkeypatch.setenv("HERMES_KERNEL_SCHEMA_PATH", str(root / "control/schemas/work-envelope.schema.json"))
+    monkeypatch.setenv("HERMES_KERNEL_SCHEMA_SHA256", durable_admission.SCHEMA_SHA256)
+    monkeypatch.delenv("HERMES_KERNEL_TEST_FIXTURE", raising=False)
+    monkeypatch.setattr(durable_admission.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("spawned")))
+    with pytest.raises(durable_admission._TrustRootError):
+        durable_admission._resolve_trust_roots()
 
 
 def test_red_carrier_survives_the_executor_boundary(monkeypatch):

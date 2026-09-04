@@ -105,6 +105,17 @@ SCHEMA_SHA256 = "92ce749bf6bfecf3528b83da9a5ef716f4ac6f7795342e2bf70e094eff306a3
 TURN_IDENTITY_SCHEMA_VERSION = "hermes.kernel-turn-identity.v1"
 TURN_FENCE_SCHEMA_VERSION = "hermes.kernel-turn-fence.v1"
 TURN_IDENTITY_ATTESTATION_VERSION = "hermes-kernel-turn-identity-attestation.v1"
+K7_BUNDLE_SHA256 = {
+    "control/kernel/admit_cli.py": TURN_IDENTITY_ADMITTER_SHA256,
+    "control/kernel/contracts.py": "18c9a313003c54c60487e0d3f6cb0f3d7691e6f1c3f049813628718efd444d8f",
+    "control/kernel/admitter.py": "cb6b64774381eb2a85746d48756d885be1d7afc69def1319b30e5a19213558c2",
+    "control/kernel/client.py": "e3bf56cbda28e43dcd6c7860244d00824e51df03e3ecf19dfe49c35e1b393524",
+    "control/kernel/inbox.py": "cf906a4f30285958a7aff3d3509eaa6b845c2ac68c5ef8136c8e47f4805df23f",
+    "control/kernel/projector.py": "292f64cae244b90b56ec649e58b1487155c3dac5eab4af4f4b91c50a30806315",
+    "control/kernel/store.py": "141577fce9456173b981ea33e2414af679fee4d574330040515abb8295c69af1",
+    "control/schemas/work-envelope.schema.json": SCHEMA_SHA256,
+    "control/schemas/kernel-turn-identity.schema.json": "020d2b1bf93a19ccdf01e5f2cbd562f6c8b8a8a61fa88905c8131c5bad99329b",
+}
 
 # K7's own gate for its scripted offline transport. Forwarded only when the
 # operator already set it. It grants nothing: K7 refuses the fixture without it,
@@ -800,7 +811,20 @@ def _resolve_trust_roots(environ: Optional[Mapping[str, str]] = None) -> _TrustR
             "%s hashes to %s, pinned %s" % (schema_path, actual_schema, SCHEMA_SHA256),
         )
 
-    return _TrustRoots(str(bin_path), str(schema_path), str(bin_path.resolve().parents[2]))
+    root_dir = bin_path.resolve().parents[2]
+    if not fixture_legacy:
+        for relative, expected in K7_BUNDLE_SHA256.items():
+            member = root_dir / relative
+            if member.is_symlink() or not member.is_file():
+                raise _TrustRootError("k7_bundle_member_invalid", relative)
+            actual = _sha256_file(member)
+            if actual != expected:
+                raise _TrustRootError(
+                    "k7_bundle_hash_mismatch",
+                    "%s hashes to %s; pinned %s" % (relative, actual, expected),
+                )
+
+    return _TrustRoots(str(bin_path), str(schema_path), str(root_dir))
 
 
 # --------------------------------------------------------------------------- #

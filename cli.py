@@ -53,6 +53,10 @@ _DELIVERY_ENVELOPE_FIELDS = frozenset({
 _DELIVERY_QUERY_PREFIX = "HERMES_DELIVERY_V1\n"
 
 
+class DeliveryRebindError(ValueError):
+    pass
+
+
 def _load_delivery_envelope(path_value: Optional[str]) -> Optional[Dict[str, Any]]:
     if not path_value:
         return None
@@ -116,12 +120,31 @@ def _find_persisted_delivery(session_db: Any, session_id: str, envelope: Mapping
             candidates.append(tip)
     except Exception:
         pass
+    offset = 0
+    while True:
+        try:
+            rows = session_db.list_sessions_rich(
+                limit=200, offset=offset, include_children=True,
+                project_compression_tips=False, include_hidden=True, include_archived=True,
+            )
+        except Exception:
+            rows = []
+        for session in rows:
+            candidate = str(session.get("id") or "") if isinstance(session, dict) else ""
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+        if len(rows) < 200:
+            break
+        offset += len(rows)
     for candidate in candidates:
         for row in session_db.get_messages(candidate, include_inactive=True):
             metadata = row.get("display_metadata")
             carried = metadata.get("hermes_delivery") if isinstance(metadata, dict) else None
-            if carried == dict(envelope) and row.get("role") == "user":
-                return candidate, row
+            if not isinstance(carried, dict) or carried.get("delivery_id") != envelope["delivery_id"]:
+                continue
+            if carried != dict(envelope) or row.get("role") != "user":
+                raise DeliveryRebindError("delivery_id_rebind")
+            return candidate, row
     return None
 
 
@@ -21863,12 +21886,17 @@ def main(
                         if _delivery_envelope is not None and _delivery_db is None:
                             print("Delivery ACK unavailable: SessionDB is not open", file=sys.stderr)
                             raise SystemExit(1)
-                        _existing_delivery_ack = (
-                            _delivery_ack(_delivery_db, cli.session_id, _delivery_envelope, adapter="cli")
-                            if _delivery_envelope is not None else None
-                        )
+                        try:
+                            _existing_delivery_ack = (
+                                _delivery_ack(_delivery_db, cli.session_id, _delivery_envelope, adapter="cli")
+                                if _delivery_envelope is not None else None
+                            )
+                        except DeliveryRebindError as exc:
+                            print(f"Delivery refused: {exc}", file=sys.stderr)
+                            raise SystemExit(2)
                         if _existing_delivery_ack is not None:
-                            print(json.dumps({"reply": "", "delivery_ack": _existing_delivery_ack},
+                            print(json.dumps({"reply": "", "session_id": _existing_delivery_ack["target_session_id"],
+                                             "delivery_ack": _existing_delivery_ack},
                                              sort_keys=True, separators=(",", ":")))
                             print(f"\nsession_id: {_existing_delivery_ack['target_session_id']}", file=sys.stderr)
                             return
@@ -21937,13 +21965,18 @@ def main(
                             print(response)
 
                         if _delivery_envelope is not None:
-                            _persisted_ack = _delivery_ack(
-                                _delivery_db, cli.session_id, _delivery_envelope, adapter="cli"
-                            )
+                            try:
+                                _persisted_ack = _delivery_ack(
+                                    _delivery_db, cli.session_id, _delivery_envelope, adapter="cli"
+                                )
+                            except DeliveryRebindError as exc:
+                                print(f"Delivery refused after persistence: {exc}", file=sys.stderr)
+                                raise SystemExit(1)
                             if _persisted_ack is None:
                                 print("Delivery ACK unavailable after turn persistence", file=sys.stderr)
                                 raise SystemExit(1)
-                            print(json.dumps({"reply": response, "delivery_ack": _persisted_ack},
+                            print(json.dumps({"reply": response, "session_id": _persisted_ack["target_session_id"],
+                                             "delivery_ack": _persisted_ack},
                                              sort_keys=True, separators=(",", ":")))
 
                         # Kanban goal-loop mode: a worker spawned for a

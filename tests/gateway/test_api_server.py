@@ -399,6 +399,34 @@ class TestAgentExecution:
         assert sum(1 for row in db.get_messages(session_id) if row.get("role") == "user") == 1
 
     @pytest.mark.asyncio
+    async def test_delivery_id_rebind_conflicts_without_second_inbound(self, adapter, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(tmp_path / "state.db")
+        session_id = db.create_session("delivery-target", "api_server")
+        adapter._session_db = db
+        calls = []
+
+        async def fake_run_agent(user_message, **kwargs):
+            calls.append(user_message)
+            db.append_message(session_id, "user", user_message, display_kind="bot_delivery",
+                              display_metadata=kwargs["delivery_metadata"])
+            return ({"final_response": "handled", "session_id": session_id}, {})
+
+        adapter._run_agent = fake_run_agent
+        first = {"schema": "hermes.delivery-envelope.v1", "delivery_id": "delivery-rebind",
+                 "request_key": "request-a", "turn_identity_sha256": "a" * 64, "accepted_at": 10}
+        changed = dict(first, request_key="request-b")
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            ok = await cli.post(f"/api/sessions/{session_id}/chat", json={"message": "one", "delivery": first})
+            conflict = await cli.post(f"/api/sessions/{session_id}/chat", json={"message": "two", "delivery": changed})
+        assert ok.status == 200
+        assert conflict.status == 409
+        assert calls == ["one"]
+        assert sum(1 for row in db.get_messages(session_id) if row.get("role") == "user") == 1
+
+    @pytest.mark.asyncio
     async def test_delivery_handler_fails_closed_when_persistence_is_missing(self, adapter, tmp_path):
         from hermes_state import SessionDB
 

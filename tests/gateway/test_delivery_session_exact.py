@@ -8,6 +8,7 @@ import hashlib
 import sys
 import types
 from types import SimpleNamespace
+from pathlib import Path
 
 import pytest
 
@@ -174,9 +175,10 @@ def test_structured_ack_not_exit_code_releases_delivery_shadow(monkeypatch, tmp_
     )
     ack = _ack(receipt["delivery_id"], identity["request_key"], fence["identity_sha256"])
     ack["accepted_at"] = receipt["accepted_at"]
-    proc = SimpleNamespace(returncode=0, stdout=json.dumps({"reply": "ok", "delivery_ack": ack}), stderr="")
+    proc = SimpleNamespace(returncode=0, stdout=json.dumps({"reply": "ok", "session_id": "target-session", "delivery_ack": ack}), stderr="")
     monkeypatch.setattr(bot_mode_dm.subprocess, "run", lambda *a, **k: proc)
     monkeypatch.setattr(bot_mode_dm, "_revalidate_delivery_identity", lambda record: fence)
+    monkeypatch.setattr(bot_mode_dm, "_validate_local_ack_against_destination", lambda *a, **k: None)
     emitted = []
     monkeypatch.setattr(bot_mode_dm, "_emit_delivery_shadow_receipt", lambda record, state, ack_bytes=None: emitted.append((record, state, ack_bytes)))
 
@@ -229,8 +231,9 @@ def test_local_receiver_uses_real_sessiondb_row_for_idempotent_ack(tmp_path):
 
     db = SessionDB(tmp_path / "state.db")
     session_id = db.create_session("target", "cli")
+    identity = dict(_identity(), request_key="request-local-1")
     envelope = {"schema": "hermes.delivery-envelope.v1", "delivery_id": "delivery-local-1",
-                "request_key": "request-local-1", "turn_identity_sha256": "a" * 64,
+                "request_key": "request-local-1", "turn_identity_sha256": bot_mode_dm._canonical_sha256(identity),
                 "accepted_at": 10}
     encoded = bot_mode_dm._encode_delivery_query(envelope, "private")
     message, decoded = cli._decode_delivery_query(encoded)
@@ -244,3 +247,59 @@ def test_local_receiver_uses_real_sessiondb_row_for_idempotent_ack(tmp_path):
     assert first == second
     assert first["target_message_id"] == row_id
     assert first["target_session_id"] == session_id
+    bot_mode_dm._validate_local_ack_row(
+        db, first,
+        {"delivery_id": envelope["delivery_id"], "accepted_at": 10, "turn_identity": identity},
+    )
+    with pytest.raises(cli.DeliveryRebindError):
+        cli._delivery_ack(
+            db, session_id, dict(envelope, request_key="request-local-rebound"), adapter="cli"
+        )
+    assert sum(1 for row in db.get_messages(session_id) if row.get("role") == "user") == 1
+
+
+def test_sender_rejects_ack_rebound_to_response_session():
+    identity = _identity()
+    record = {"delivery_id": "delivery-1", "accepted_at": 10, "turn_identity": identity}
+    ack = _ack("delivery-1", identity["request_key"], bot_mode_dm._canonical_sha256(identity))
+    payload = {"session_id": "different-session", "delivery_ack": ack}
+    with pytest.raises(ValueError, match="session"):
+        bot_mode_dm._validated_delivery_ack(payload, record)
+
+
+def test_sender_rejects_nonexistent_local_target_message(tmp_path):
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db")
+    session_id = db.create_session("target", "cli")
+    identity = _identity()
+    record = {"delivery_id": "delivery-1", "accepted_at": 10, "turn_identity": identity}
+    ack = _ack("delivery-1", identity["request_key"], bot_mode_dm._canonical_sha256(identity))
+    ack.update({"target_session_id": session_id, "target_message_id": 999})
+    with pytest.raises(ValueError, match="message"):
+        bot_mode_dm._validate_local_ack_row(db, ack, record)
+
+
+def test_truncated_ledger_fails_closed_without_new_delivery_id(monkeypatch, tmp_path):
+    ledger = tmp_path / "ledger.json"
+    ledger.write_text("{truncated", encoding="utf-8")
+    ledger.chmod(0o600)
+    monkeypatch.setattr(bot_mode_dm, "_delivery_ledger_path", lambda _key: ledger)
+    dm_file = tmp_path / "message.txt"
+    dm_file.write_text("one", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="ledger"):
+        bot_mode_dm._write_delivery_receipt(
+            str(dm_file), origin_session_id="origin", origin_reason="explicit",
+            route_reason="origin_exact", label="@target", idempotency_key="a" * 64,
+        )
+    assert not Path(str(dm_file) + ".receipt.json").exists()
+
+
+def test_orphaned_lock_file_is_recoverable(monkeypatch, tmp_path):
+    ledger = tmp_path / "ledger.json"
+    lock = ledger.with_suffix(".lock")
+    lock.write_text("orphan", encoding="utf-8")
+    lock.chmod(0o600)
+    monkeypatch.setattr(bot_mode_dm, "_delivery_ledger_path", lambda _key: ledger)
+    with bot_mode_dm._delivery_ledger_lock("a" * 64):
+        assert lock.exists()

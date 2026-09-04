@@ -56,6 +56,11 @@ import uuid
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback below
+    fcntl = None
+
 logger = logging.getLogger(__name__)
 
 MESSAGE_AGENT_TOOL_NAME = "message_agent"
@@ -246,6 +251,23 @@ def _resolve_local_name(target: str, roster: list[str]) -> Optional[str]:
     return None
 
 
+def _relay_enforce_refusal() -> Optional[str]:
+    """Desktop relay has enqueue only, so enforced delivery cannot use it."""
+    try:
+        from agent.durable_admission import (
+            admission_enabled,
+            revalidate_current_turn_identity,
+        )
+        if not admission_enabled():
+            return None
+        revalidate_current_turn_identity()
+    except Exception as exc:
+        return _err(f"Desktop relay authority refused: {type(exc).__name__}: {exc}")
+    return _err(
+        "Desktop relay has no durable destination ACK; delivery is disabled under enforce."
+    )
+
+
 # ── the tool ─────────────────────────────────────────────────────────────────
 
 
@@ -345,6 +367,9 @@ def message_agent_tool(
         # Every gateway connected to the user's Desktop is reachable: the
         # relay roster lists agents on the other connections; delivery rides
         # the Desktop's own persistent socket to that gateway.
+        relay_refusal = _relay_enforce_refusal()
+        if relay_refusal is not None:
+            return relay_refusal
         relayed = _try_relay_delivery(
             root, raw_target, body, me, sender_handle, task_id=task_id, agent=agent
         )
@@ -361,6 +386,9 @@ def message_agent_tool(
         # Same-name target on ANOTHER connection (e.g. this gateway's
         # 'default' messaging the cloud 'default') — try the relay before
         # calling it a self-message.
+        relay_refusal = _relay_enforce_refusal()
+        if relay_refusal is not None:
+            return relay_refusal
         relayed = _try_relay_delivery(
             root, raw_target, body, me, sender_handle, task_id=task_id, agent=agent
         )
@@ -597,24 +625,73 @@ def _atomic_json(path: Path, document: Mapping[str, Any]) -> None:
 
 @contextlib.contextmanager
 def _delivery_ledger_lock(idempotency_key: str):
-    """Cross-process exclusive create lock for one idempotency key."""
+    """Cross-process lock whose ownership dies with the process, not the file."""
     path = _delivery_ledger_path(idempotency_key).with_suffix(".lock")
-    fd = None
-    for _ in range(200):
-        try:
-            fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            break
-        except FileExistsError:
-            time.sleep(0.01)
-    if fd is None:
-        raise TimeoutError("delivery idempotency lock timed out")
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(str(path), flags, 0o600)
     try:
+        info = os.fstat(fd)
+        uid = getattr(os, "getuid", lambda: info.st_uid)()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != uid
+                or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600):
+            raise RuntimeError("delivery_lock_unsafe")
+        if fcntl is None:
+            import msvcrt  # pragma: no cover - Windows
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+        else:
+            deadline = time.monotonic() + 2.0
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("delivery idempotency lock busy")
+                    time.sleep(0.01)
         yield
     finally:
         try:
-            os.close(fd)
+            if fcntl is None:
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)  # type: ignore[name-defined]  # pragma: no cover
+                except Exception:
+                    pass
+            else:
+                fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
-            _unlink_dm_file(str(path))
+            os.close(fd)
+
+
+def _read_delivery_ledger(path: Path, idempotency_key: str) -> Optional[dict[str, Any]]:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(str(path), flags)
+    except FileNotFoundError:
+        return None
+    try:
+        info = os.fstat(fd)
+        uid = getattr(os, "getuid", lambda: info.st_uid)()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != uid
+                or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600):
+            raise RuntimeError("delivery_ledger_unsafe")
+        try:
+            with os.fdopen(fd, "r", encoding="utf-8") as stream:
+                fd = -1
+                document = json.load(stream)
+        except (OSError, ValueError, TypeError) as exc:
+            raise RuntimeError("delivery_ledger_unreadable") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if not isinstance(document, dict) or document.get("idempotency_key") != idempotency_key:
+        raise RuntimeError("delivery_ledger_rebind")
+    if not isinstance(document.get("delivery_id"), str) or not document["delivery_id"]:
+        raise RuntimeError("delivery_ledger_invalid")
+    return document
 
 
 def _write_delivery_receipt(
@@ -631,10 +708,7 @@ def _write_delivery_receipt(
     """
     ledger = _delivery_ledger_path(idempotency_key)
     with _delivery_ledger_lock(idempotency_key):
-        try:
-            existing = json.loads(ledger.read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError):
-            existing = None
+        existing = _read_delivery_ledger(ledger, idempotency_key)
         if isinstance(existing, dict) and existing.get("idempotency_key") == idempotency_key:
             existing["duplicate"] = True
             _atomic_json(Path(dm_file + ".receipt.json"), existing)
@@ -752,7 +826,9 @@ def _revalidate_delivery_identity(record: Mapping[str, Any]) -> dict[str, Any]:
     return _run_turn_identity_revalidation(identity)
 
 
-def _validated_delivery_ack(payload: Any, record: Mapping[str, Any]) -> dict[str, Any]:
+def _validated_delivery_ack(
+    payload: Any, record: Mapping[str, Any], *, expected_adapter: Optional[str] = None
+) -> dict[str, Any]:
     ack = payload.get("delivery_ack") if isinstance(payload, Mapping) else None
     identity = record.get("turn_identity")
     if not isinstance(ack, Mapping) or not isinstance(identity, Mapping):
@@ -775,13 +851,61 @@ def _validated_delivery_ack(payload: Any, record: Mapping[str, Any]) -> dict[str
         raise ValueError("delivery_ack_rebind")
     if ack.get("adapter") not in {"cli", "api_server"}:
         raise ValueError("delivery_ack_adapter_invalid")
+    if expected_adapter is not None and ack.get("adapter") != expected_adapter:
+        raise ValueError("delivery_ack_adapter_rebind")
     if not isinstance(ack.get("target_session_id"), str) or not ack["target_session_id"]:
         raise ValueError("delivery_ack_session_invalid")
     if isinstance(ack.get("target_message_id"), bool) or not isinstance(ack.get("target_message_id"), int) or ack["target_message_id"] < 1:
         raise ValueError("delivery_ack_message_invalid")
     if isinstance(ack.get("persisted_at"), bool) or not isinstance(ack.get("persisted_at"), int) or ack["persisted_at"] < 1:
         raise ValueError("delivery_ack_timestamp_invalid")
+    response_session = payload.get("session_id") if isinstance(payload, Mapping) else None
+    if response_session != ack["target_session_id"]:
+        raise ValueError("delivery_ack_session_rebind")
     return dict(ack)
+
+
+def _delivery_envelope_from_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    identity = record["turn_identity"]
+    return {
+        "schema": DELIVERY_ENVELOPE_SCHEMA,
+        "delivery_id": record["delivery_id"],
+        "request_key": identity["request_key"],
+        "turn_identity_sha256": _canonical_sha256(identity),
+        "accepted_at": int(record["accepted_at"]),
+    }
+
+
+def _validate_local_ack_row(db: Any, ack: Mapping[str, Any], record: Mapping[str, Any]) -> None:
+    around = db.get_messages_around(
+        ack["target_session_id"], int(ack["target_message_id"]), window=0
+    )
+    rows = around.get("window") if isinstance(around, Mapping) else None
+    if not isinstance(rows, list) or len(rows) != 1:
+        raise ValueError("delivery_ack_target_message_missing")
+    row = rows[0]
+    metadata = row.get("display_metadata") if isinstance(row, Mapping) else None
+    if (not isinstance(metadata, Mapping)
+            or metadata.get("hermes_delivery") != _delivery_envelope_from_record(record)
+            or row.get("role") != "user"):
+        raise ValueError("delivery_ack_target_message_rebind")
+
+
+def _validate_local_ack_against_destination(
+    ack: Mapping[str, Any], record: Mapping[str, Any], argv: list[str]
+) -> None:
+    try:
+        profile = argv[argv.index("-p") + 1]
+    except (ValueError, IndexError) as exc:
+        raise ValueError("delivery_ack_target_profile_missing") from exc
+    from hermes_cli.profiles import get_profile_dir
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=get_profile_dir(profile) / "state.db")
+    try:
+        _validate_local_ack_row(db, ack, record)
+    finally:
+        db.close()
 
 
 def _release_unspawned_delivery(dm_file: Optional[str]) -> None:
@@ -923,7 +1047,12 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool) -> int:
             if structured and proc.returncode == 0:
                 try:
                     payload = json.loads(proc.stdout or "")
-                    ack = _validated_delivery_ack(payload, record)
+                    ack = _validated_delivery_ack(
+                        payload, record,
+                        expected_adapter="api_server" if stdin_file else "cli",
+                    )
+                    if not stdin_file:
+                        _validate_local_ack_against_destination(ack, record, argv)
                     reply = str(payload.get("reply") or "")
                 except (TypeError, ValueError):
                     returncode = 1
