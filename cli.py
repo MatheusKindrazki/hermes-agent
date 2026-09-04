@@ -47,6 +47,132 @@ from typing import List, Dict, Any, Optional, Mapping
 
 logger = logging.getLogger(__name__)
 
+_DELIVERY_ENVELOPE_FIELDS = frozenset({
+    "schema", "delivery_id", "request_key", "turn_identity_sha256", "accepted_at",
+})
+_DELIVERY_QUERY_PREFIX = "HERMES_DELIVERY_V1\n"
+
+
+class DeliveryRebindError(ValueError):
+    pass
+
+
+def _load_delivery_envelope(path_value: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not path_value:
+        return None
+    path = Path(path_value)
+    if not path.is_absolute() or path.is_symlink() or not path.is_file():
+        raise ValueError("delivery_envelope_path_invalid")
+    info = path.stat()
+    if info.st_uid != getattr(os, "getuid", lambda: info.st_uid)() or (info.st_mode & 0o077):
+        raise ValueError("delivery_envelope_permissions_invalid")
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(document, dict) or set(document) != _DELIVERY_ENVELOPE_FIELDS:
+        raise ValueError("delivery_envelope_fields_invalid")
+    if document.get("schema") != "hermes.delivery-envelope.v1":
+        raise ValueError("delivery_envelope_schema_invalid")
+    for name in ("delivery_id", "request_key"):
+        if not isinstance(document.get(name), str) or not document[name]:
+            raise ValueError("delivery_envelope_identity_invalid")
+    if re.fullmatch(r"[0-9a-f]{64}", str(document.get("turn_identity_sha256") or "")) is None:
+        raise ValueError("delivery_envelope_identity_invalid")
+    accepted_at = document.get("accepted_at")
+    if isinstance(accepted_at, bool) or not isinstance(accepted_at, int) or accepted_at < 1:
+        raise ValueError("delivery_envelope_timestamp_invalid")
+    return document
+
+
+def _decode_delivery_query(query: Any) -> tuple[Any, Optional[Dict[str, Any]]]:
+    if not isinstance(query, str) or not query.startswith(_DELIVERY_QUERY_PREFIX):
+        return query, None
+    wrapper = json.loads(query[len(_DELIVERY_QUERY_PREFIX):])
+    if not isinstance(wrapper, dict) or set(wrapper) != {"delivery", "message"}:
+        raise ValueError("delivery_query_fields_invalid")
+    message = wrapper.get("message")
+    if not isinstance(message, str) or not message.strip():
+        raise ValueError("delivery_query_message_invalid")
+    # Reuse the exact envelope validator without trusting a caller-controlled
+    # path: validate the closed fields inline.
+    document = wrapper.get("delivery")
+    if not isinstance(document, dict) or set(document) != _DELIVERY_ENVELOPE_FIELDS:
+        raise ValueError("delivery_envelope_fields_invalid")
+    if document.get("schema") != "hermes.delivery-envelope.v1":
+        raise ValueError("delivery_envelope_schema_invalid")
+    if not all(isinstance(document.get(k), str) and document[k] for k in ("delivery_id", "request_key")):
+        raise ValueError("delivery_envelope_identity_invalid")
+    if re.fullmatch(r"[0-9a-f]{64}", str(document.get("turn_identity_sha256") or "")) is None:
+        raise ValueError("delivery_envelope_identity_invalid")
+    accepted_at = document.get("accepted_at")
+    if isinstance(accepted_at, bool) or not isinstance(accepted_at, int) or accepted_at < 1:
+        raise ValueError("delivery_envelope_timestamp_invalid")
+    return message, dict(document)
+
+
+def _delivery_display_metadata(envelope: Mapping[str, Any]) -> Dict[str, Any]:
+    return {"hermes_delivery": dict(envelope)}
+
+
+def _find_persisted_delivery(session_db: Any, session_id: str, envelope: Mapping[str, Any]):
+    candidates = [session_id]
+    try:
+        tip = session_db.get_compression_tip(session_id)
+        if tip and tip not in candidates:
+            candidates.append(tip)
+    except Exception:
+        pass
+    offset = 0
+    while True:
+        try:
+            rows = session_db.list_sessions_rich(
+                limit=200, offset=offset, include_children=True,
+                project_compression_tips=False, include_hidden=True, include_archived=True,
+            )
+        except Exception:
+            rows = []
+        for session in rows:
+            candidate = str(session.get("id") or "") if isinstance(session, dict) else ""
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+        if len(rows) < 200:
+            break
+        offset += len(rows)
+    for candidate in candidates:
+        for row in session_db.get_messages(candidate, include_inactive=True):
+            metadata = row.get("display_metadata")
+            carried = metadata.get("hermes_delivery") if isinstance(metadata, dict) else None
+            if not isinstance(carried, dict) or carried.get("delivery_id") != envelope["delivery_id"]:
+                continue
+            if carried != dict(envelope) or row.get("role") != "user":
+                raise DeliveryRebindError("delivery_id_rebind")
+            return candidate, row
+    return None
+
+
+def _delivery_ack(session_db: Any, session_id: str, envelope: Mapping[str, Any], *, adapter: str) -> Optional[Dict[str, Any]]:
+    found = _find_persisted_delivery(session_db, session_id, envelope)
+    if found is None:
+        return None
+    target_session_id, row = found
+    message_id = row.get("id")
+    if isinstance(message_id, bool) or not isinstance(message_id, int) or message_id < 1:
+        return None
+    try:
+        persisted_at = max(1, int(float(row.get("timestamp") or 0)))
+    except (TypeError, ValueError):
+        return None
+    return {
+        "schema": "hermes.delivery-ack.v1",
+        "delivery_id": envelope["delivery_id"],
+        "request_key": envelope["request_key"],
+        "turn_identity_sha256": envelope["turn_identity_sha256"],
+        "target_session_id": target_session_id,
+        "target_message_id": message_id,
+        "adapter": adapter,
+        "state": "persisted",
+        "accepted_at": envelope["accepted_at"],
+        "persisted_at": persisted_at,
+    }
+
 # Suppress startup messages for clean CLI experience
 os.environ["HERMES_QUIET"] = "1"  # Our own modules
 
@@ -21265,6 +21391,7 @@ def main(
     pass_session_id: bool = False,
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
+    delivery_envelope_file: str = None,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -21409,6 +21536,11 @@ def main(
     
     # Handle query shorthand
     query = query or q
+    try:
+        query, _query_delivery_envelope = _decode_delivery_query(query)
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        print(f"Delivery query refused: {exc}", file=sys.stderr)
+        raise SystemExit(2)
     
     # Parse toolsets - handle both string and tuple/list inputs
     # Default to hermes-cli toolset which includes cronjob management tools
@@ -21442,6 +21574,12 @@ def main(
             toolsets_list = sorted(_get_platform_tools(CLI_CONFIG, "cli"))
     
     parsed_skills = _parse_skills_argument(skills)
+
+    try:
+        _delivery_envelope = _load_delivery_envelope(delivery_envelope_file) or _query_delivery_envelope
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        print(f"Delivery envelope refused: {exc}", file=sys.stderr)
+        raise SystemExit(2)
 
     # Create CLI instance
     cli = HermesCLI(
@@ -21744,6 +21882,24 @@ def main(
                         runtime_override=turn_route["runtime"],
                         request_overrides=turn_route.get("request_overrides"),
                     ):
+                        _delivery_db = getattr(cli.agent, "_session_db", None)
+                        if _delivery_envelope is not None and _delivery_db is None:
+                            print("Delivery ACK unavailable: SessionDB is not open", file=sys.stderr)
+                            raise SystemExit(1)
+                        try:
+                            _existing_delivery_ack = (
+                                _delivery_ack(_delivery_db, cli.session_id, _delivery_envelope, adapter="cli")
+                                if _delivery_envelope is not None else None
+                            )
+                        except DeliveryRebindError as exc:
+                            print(f"Delivery refused: {exc}", file=sys.stderr)
+                            raise SystemExit(2)
+                        if _existing_delivery_ack is not None:
+                            print(json.dumps({"reply": "", "session_id": _existing_delivery_ack["target_session_id"],
+                                             "delivery_ack": _existing_delivery_ack},
+                                             sort_keys=True, separators=(",", ":")))
+                            print(f"\nsession_id: {_existing_delivery_ack['target_session_id']}", file=sys.stderr)
+                            return
                         cli.agent.quiet_mode = True
                         cli.agent.suppress_status_output = True
                         # Suppress streaming display callbacks so stdout stays
@@ -21768,10 +21924,18 @@ def main(
                         # from display.tool_progress at construction).
                         cli.agent.tool_progress_mode = "off"
                         try:
-                            result = cli.agent.run_conversation(
-                                user_message=effective_query,
-                                conversation_history=cli.conversation_history,
-                            )
+                            _run_kwargs = {
+                                "user_message": effective_query,
+                                "conversation_history": cli.conversation_history,
+                            }
+                            if _delivery_envelope is not None:
+                                _run_kwargs.update({
+                                    "persist_user_display_kind": "bot_delivery",
+                                    "persist_user_display_metadata": _delivery_display_metadata(
+                                        _delivery_envelope
+                                    ),
+                                })
+                            result = cli.agent.run_conversation(**_run_kwargs)
                         except KeyboardInterrupt:
                             _emit_interrupted_session_end(cli, reason="keyboard_interrupt")
                             print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
@@ -21797,8 +21961,23 @@ def main(
                             and (result.get("failed") or result.get("partial"))
                         ):
                             print(f"Error: {result['error']}", file=sys.stderr)
-                        elif response:
+                        elif response and _delivery_envelope is None:
                             print(response)
+
+                        if _delivery_envelope is not None:
+                            try:
+                                _persisted_ack = _delivery_ack(
+                                    _delivery_db, cli.session_id, _delivery_envelope, adapter="cli"
+                                )
+                            except DeliveryRebindError as exc:
+                                print(f"Delivery refused after persistence: {exc}", file=sys.stderr)
+                                raise SystemExit(1)
+                            if _persisted_ack is None:
+                                print("Delivery ACK unavailable after turn persistence", file=sys.stderr)
+                                raise SystemExit(1)
+                            print(json.dumps({"reply": response, "session_id": _persisted_ack["target_session_id"],
+                                             "delivery_ack": _persisted_ack},
+                                             sort_keys=True, separators=(",", ":")))
 
                         # Kanban goal-loop mode: a worker spawned for a
                         # goal_mode card keeps working in THIS session until an

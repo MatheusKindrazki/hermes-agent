@@ -58,6 +58,7 @@ import sys
 import threading
 import time
 import uuid
+import weakref
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -939,6 +940,82 @@ def _session_chat_user_message(body: Dict[str, Any], *, param: str = "message") 
         return _normalize_multimodal_content(user_message), None
     except ValueError as exc:
         return None, _multimodal_validation_error(exc, param=param)
+
+
+_DELIVERY_ENVELOPE_FIELDS = frozenset({
+    "schema", "delivery_id", "request_key", "turn_identity_sha256", "accepted_at",
+})
+
+
+class _DeliveryRebindError(ValueError):
+    pass
+
+
+def _session_delivery_envelope(body: Dict[str, Any]) -> tuple[Optional[Dict[str, Any]], Optional["web.Response"]]:
+    document = body.get("delivery")
+    if document is None:
+        return None, None
+    valid = isinstance(document, dict) and set(document) == _DELIVERY_ENVELOPE_FIELDS
+    valid = valid and document.get("schema") == "hermes.delivery-envelope.v1"
+    valid = valid and all(isinstance(document.get(k), str) and document[k] for k in ("delivery_id", "request_key"))
+    valid = valid and re.fullmatch(r"[0-9a-f]{64}", str(document.get("turn_identity_sha256") or "")) is not None
+    accepted_at = document.get("accepted_at") if isinstance(document, dict) else None
+    valid = valid and isinstance(accepted_at, int) and not isinstance(accepted_at, bool) and accepted_at >= 1
+    if not valid:
+        return None, web.json_response(
+            _openai_error("Invalid delivery envelope", code="delivery_envelope_invalid"), status=400
+        )
+    return dict(document), None
+
+
+def _persisted_delivery_ack(db: Any, session_id: str, envelope: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    candidates = [session_id]
+    try:
+        tip = db.get_compression_tip(session_id)
+        if tip and tip not in candidates:
+            candidates.append(tip)
+    except Exception:
+        pass
+    offset = 0
+    while True:
+        try:
+            sessions = db.list_sessions_rich(
+                limit=200, offset=offset, include_children=True,
+                project_compression_tips=False, include_hidden=True, include_archived=True,
+            )
+        except Exception:
+            sessions = []
+        for session in sessions:
+            candidate = str(session.get("id") or "") if isinstance(session, dict) else ""
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+        if len(sessions) < 200:
+            break
+        offset += len(sessions)
+    for candidate in candidates:
+        for row in db.get_messages(candidate, include_inactive=True):
+            metadata = row.get("display_metadata")
+            carried = metadata.get("hermes_delivery") if isinstance(metadata, dict) else None
+            if not isinstance(carried, dict) or carried.get("delivery_id") != envelope["delivery_id"]:
+                continue
+            if carried != envelope:
+                raise _DeliveryRebindError("delivery_id_rebind")
+            message_id = row.get("id")
+            if row.get("role") != "user" or isinstance(message_id, bool) or not isinstance(message_id, int) or message_id < 1:
+                raise _DeliveryRebindError("delivery_id_row_invalid")
+            try:
+                persisted_at = max(1, int(float(row.get("timestamp") or 0)))
+            except (TypeError, ValueError):
+                continue
+            return {
+                "schema": "hermes.delivery-ack.v1", "delivery_id": envelope["delivery_id"],
+                "request_key": envelope["request_key"],
+                "turn_identity_sha256": envelope["turn_identity_sha256"],
+                "target_session_id": candidate, "target_message_id": message_id,
+                "adapter": "api_server", "state": "persisted",
+                "accepted_at": envelope["accepted_at"], "persisted_at": persisted_at,
+            }
+    return None
 
 
 def check_api_server_requirements() -> bool:
@@ -4623,6 +4700,25 @@ class APIServerAdapter(BasePlatformAdapter):
 
     @_admit_api_agent_request
     async def _handle_session_chat(self, request: "web.Request") -> "web.Response":
+        """Serialize one delivery_id through check, persist, and ACK emission."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = None
+        delivery = body.get("delivery") if isinstance(body, dict) else None
+        delivery_id = delivery.get("delivery_id") if isinstance(delivery, dict) else None
+        if not isinstance(delivery_id, str) or not delivery_id:
+            return await self._handle_session_chat_once(request)
+        locks = getattr(self, "_delivery_request_locks", None)
+        if not isinstance(locks, weakref.WeakValueDictionary):
+            locks = weakref.WeakValueDictionary()
+            self._delivery_request_locks = locks
+        scope = (_api_request_profile.get() or "default", delivery_id)
+        lock = locks.setdefault(scope, asyncio.Lock())
+        async with lock:
+            return await self._handle_session_chat_once(request)
+
+    async def _handle_session_chat_once(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/chat — one synchronous agent turn."""
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
@@ -4634,9 +4730,36 @@ class APIServerAdapter(BasePlatformAdapter):
         body, err = await self._read_json_body(request)
         if err:
             return err
+        delivery, err = _session_delivery_envelope(body)
+        if err:
+            return err
         user_message, err = _session_chat_user_message(body)
         if err is not None:
             return err
+        delivery_db = None
+        if delivery is not None:
+            delivery_db = await self._ensure_session_db_async()
+            if delivery_db is None:
+                return web.json_response(
+                    _openai_error("Session database unavailable", code="delivery_persistence_unavailable"),
+                    status=503,
+                )
+            try:
+                existing_ack = await asyncio.to_thread(
+                    _persisted_delivery_ack, delivery_db, session_id, delivery
+                )
+            except _DeliveryRebindError:
+                return web.json_response(
+                    _openai_error("delivery_id is already bound to another inbound",
+                                  code="delivery_id_rebind"), status=409,
+                )
+            if existing_ack is not None:
+                return web.json_response({
+                    "object": "hermes.session.chat.completion",
+                    "session_id": existing_ack["target_session_id"],
+                    "message": {"role": "assistant", "content": ""},
+                    "usage": {}, "runtime": {}, "delivery_ack": existing_ack,
+                })
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
@@ -4703,6 +4826,9 @@ class APIServerAdapter(BasePlatformAdapter):
             requested_runtime=runtime_request.get("requested") or {},
             route_source=runtime_request.get("route_source") or "global",
             confirmed_runtime_lock=lock_active,
+            delivery_metadata=(
+                {"hermes_delivery": delivery} if delivery is not None else None
+            ),
             **agent_overrides,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
@@ -4727,6 +4853,28 @@ class APIServerAdapter(BasePlatformAdapter):
                 else ""
             ),
         )
+        delivery_ack = None
+        if delivery is not None:
+            try:
+                delivery_ack = await asyncio.to_thread(
+                    _persisted_delivery_ack,
+                    delivery_db,
+                    effective_session_id or session_id,
+                    delivery,
+                )
+            except _DeliveryRebindError:
+                return web.json_response(
+                    _openai_error("delivery_id rebound during persistence",
+                                  code="delivery_id_rebind"), status=409,
+                )
+            if delivery_ack is None:
+                return web.json_response(
+                    _openai_error(
+                        "Destination did not durably persist the delivery inbound",
+                        code="delivery_persistence_failed",
+                    ),
+                    status=500,
+                )
         return web.json_response(
             {
                 "object": "hermes.session.chat.completion",
@@ -4734,6 +4882,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "message": {"role": "assistant", "content": final_response},
                 "usage": usage,
                 "runtime": runtime,
+                **({"delivery_ack": delivery_ack} if delivery_ack is not None else {}),
             },
             headers=headers,
         )
@@ -7263,6 +7412,7 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        delivery_metadata: Optional[Dict[str, Any]] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -7353,11 +7503,17 @@ class APIServerAdapter(BasePlatformAdapter):
                     # ``agent_ref``, and only /v1/runs has a run_id, so neither
                     # is a usable hook for the rest.
                     self._shutdown_interruptible_agents[id(agent)] = agent
-                    result = agent.run_conversation(
-                        user_message=user_message,
-                        conversation_history=conversation_history,
-                        task_id=effective_task_id,
-                    )
+                    run_kwargs = {
+                        "user_message": user_message,
+                        "conversation_history": conversation_history,
+                        "task_id": effective_task_id,
+                    }
+                    if delivery_metadata:
+                        run_kwargs.update({
+                            "persist_user_display_kind": "bot_delivery",
+                            "persist_user_display_metadata": delivery_metadata,
+                        })
+                    result = agent.run_conversation(**run_kwargs)
                     usage = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                         "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,

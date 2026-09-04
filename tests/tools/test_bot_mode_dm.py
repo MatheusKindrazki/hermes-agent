@@ -163,6 +163,25 @@ def test_unknown_target_lists_roster(tmp_path):
     assert set(result["teammates"]) == {"researcher", "coder"}
 
 
+def test_desktop_relay_is_fail_closed_under_enforce(monkeypatch, tmp_path):
+    home = _managed_home(tmp_path, teammates=("researcher",))
+    agent = _FakeAgent(home, title="Bot Chat")
+    monkeypatch.setattr(bot_mode_dm, "_resolve_local_name", lambda *_: None)
+    monkeypatch.setattr("agent.durable_admission.admission_enabled", lambda: True)
+    revalidated = []
+    monkeypatch.setattr(
+        "agent.durable_admission.revalidate_current_turn_identity",
+        lambda: revalidated.append(True) or ({"request_key": "request-key"}, {"fence_valid": True}),
+    )
+    monkeypatch.setattr(
+        bot_mode_dm, "_try_relay_delivery",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("relay enqueued")),
+    )
+    result = json.loads(bot_mode_dm.message_agent_tool(target="remote@desktop", message="hi", agent=agent))
+    assert "error" in result and "ack" in result["error"].lower()
+    assert revalidated == [True]
+
+
 def test_cannot_message_self(tmp_path):
     home = _managed_home(tmp_path)
     agent = _FakeAgent(home, title="Bot Chat")  # default profile

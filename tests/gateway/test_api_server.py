@@ -357,6 +357,94 @@ def auth_adapter():
 
 class TestAgentExecution:
     @pytest.mark.asyncio
+    async def test_delivery_handler_persists_real_inbound_and_deduplicates(self, adapter, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(tmp_path / "state.db")
+        session_id = db.create_session("delivery-target", "api_server")
+        adapter._session_db = db
+        calls = []
+
+        async def fake_run_agent(user_message, **kwargs):
+            calls.append(user_message)
+            await asyncio.sleep(0.03)
+            db.append_message(
+                session_id, "user", user_message,
+                display_kind="bot_delivery",
+                display_metadata=kwargs["delivery_metadata"],
+            )
+            return ({"final_response": "handled", "session_id": session_id}, {})
+
+        adapter._run_agent = fake_run_agent
+        envelope = {
+            "schema": "hermes.delivery-envelope.v1", "delivery_id": "delivery-1",
+            "request_key": "request-key-1", "turn_identity_sha256": "a" * 64,
+            "accepted_at": 10,
+        }
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            first, second = await asyncio.gather(
+                cli.post(f"/api/sessions/{session_id}/chat", json={"message": "secret", "delivery": envelope}),
+                cli.post(f"/api/sessions/{session_id}/chat", json={"message": "secret", "delivery": envelope}),
+            )
+            first_body = await first.json()
+            second_body = await second.json()
+        assert first.status == second.status == 200
+        first_ack = first_body["delivery_ack"]
+        second_ack = second_body["delivery_ack"]
+        assert first_ack == second_ack
+        assert first_ack["target_session_id"] == session_id
+        assert isinstance(first_ack["target_message_id"], int)
+        assert calls == ["secret"]
+        assert sum(1 for row in db.get_messages(session_id) if row.get("role") == "user") == 1
+
+    @pytest.mark.asyncio
+    async def test_delivery_id_rebind_conflicts_without_second_inbound(self, adapter, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(tmp_path / "state.db")
+        session_id = db.create_session("delivery-target", "api_server")
+        adapter._session_db = db
+        calls = []
+
+        async def fake_run_agent(user_message, **kwargs):
+            calls.append(user_message)
+            db.append_message(session_id, "user", user_message, display_kind="bot_delivery",
+                              display_metadata=kwargs["delivery_metadata"])
+            return ({"final_response": "handled", "session_id": session_id}, {})
+
+        adapter._run_agent = fake_run_agent
+        first = {"schema": "hermes.delivery-envelope.v1", "delivery_id": "delivery-rebind",
+                 "request_key": "request-a", "turn_identity_sha256": "a" * 64, "accepted_at": 10}
+        changed = dict(first, request_key="request-b")
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            ok = await cli.post(f"/api/sessions/{session_id}/chat", json={"message": "one", "delivery": first})
+            conflict = await cli.post(f"/api/sessions/{session_id}/chat", json={"message": "two", "delivery": changed})
+        assert ok.status == 200
+        assert conflict.status == 409
+        assert calls == ["one"]
+        assert sum(1 for row in db.get_messages(session_id) if row.get("role") == "user") == 1
+
+    @pytest.mark.asyncio
+    async def test_delivery_handler_fails_closed_when_persistence_is_missing(self, adapter, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(tmp_path / "state.db")
+        session_id = db.create_session("delivery-target", "api_server")
+        adapter._session_db = db
+        adapter._run_agent = AsyncMock(return_value=({"final_response": "not persisted", "session_id": session_id}, {}))
+        envelope = {"schema": "hermes.delivery-envelope.v1", "delivery_id": "delivery-2",
+                    "request_key": "request-key-2", "turn_identity_sha256": "b" * 64,
+                    "accepted_at": 10}
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(f"/api/sessions/{session_id}/chat", json={"message": "secret", "delivery": envelope})
+            body = await response.json()
+        assert response.status == 500
+        assert body["error"]["code"] == "delivery_persistence_failed"
+
+    @pytest.mark.asyncio
     async def test_run_agent_uses_session_id_as_task_id(self, adapter):
         mock_agent = MagicMock()
         mock_agent.run_conversation.return_value = {"final_response": "ok"}

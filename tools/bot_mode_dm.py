@@ -54,7 +54,12 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback below
+    fcntl = None
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +77,26 @@ _DM_STALE_SECONDS = 24 * 60 * 60
 
 _PEER_TARGET_RE = re.compile(r"^([a-z0-9][a-z0-9_-]{0,63})/([a-zA-Z0-9][a-zA-Z0-9_-]{0,63})$")
 _LOCAL_TARGET_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
+DELIVERY_ACK_SCHEMA = "hermes.delivery-ack.v1"
+DELIVERY_ENVELOPE_SCHEMA = "hermes.delivery-envelope.v1"
+_DELIVERY_QUERY_PREFIX = "HERMES_DELIVERY_V1\n"
+
+
+def _canonical(document: Any) -> str:
+    return json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _canonical_sha256(document: Any) -> str:
+    return hashlib.sha256(_canonical(document).encode("utf-8")).hexdigest()
+
+
+def _encode_delivery_query(envelope: Mapping[str, Any], message: str) -> str:
+    return _DELIVERY_QUERY_PREFIX + _canonical({"delivery": dict(envelope), "message": message})
+
+
+def _public_delivery_receipt(record: dict[str, Any]) -> dict[str, Any]:
+    hidden = {"turn_identity", "fence", "adapter_ack"}
+    return {key: value for key, value in record.items() if key not in hidden}
 
 
 def message_agent_tool_schema() -> dict:
@@ -226,6 +251,23 @@ def _resolve_local_name(target: str, roster: list[str]) -> Optional[str]:
     return None
 
 
+def _relay_enforce_refusal() -> Optional[str]:
+    """Desktop relay has enqueue only, so enforced delivery cannot use it."""
+    try:
+        from agent.durable_admission import (
+            admission_enabled,
+            revalidate_current_turn_identity,
+        )
+        if not admission_enabled():
+            return None
+        revalidate_current_turn_identity()
+    except Exception as exc:
+        return _err(f"Desktop relay authority refused: {type(exc).__name__}: {exc}")
+    return _err(
+        "Desktop relay has no durable destination ACK; delivery is disabled under enforce."
+    )
+
+
 # ── the tool ─────────────────────────────────────────────────────────────────
 
 
@@ -325,6 +367,9 @@ def message_agent_tool(
         # Every gateway connected to the user's Desktop is reachable: the
         # relay roster lists agents on the other connections; delivery rides
         # the Desktop's own persistent socket to that gateway.
+        relay_refusal = _relay_enforce_refusal()
+        if relay_refusal is not None:
+            return relay_refusal
         relayed = _try_relay_delivery(
             root, raw_target, body, me, sender_handle, task_id=task_id, agent=agent
         )
@@ -341,6 +386,9 @@ def message_agent_tool(
         # Same-name target on ANOTHER connection (e.g. this gateway's
         # 'default' messaging the cloud 'default') — try the relay before
         # calling it a self-message.
+        relay_refusal = _relay_enforce_refusal()
+        if relay_refusal is not None:
+            return relay_refusal
         relayed = _try_relay_delivery(
             root, raw_target, body, me, sender_handle, task_id=task_id, agent=agent
         )
@@ -552,31 +600,105 @@ def _delivery_ledger_path(idempotency_key: str) -> Path:
     return _dm_dir() / ("delivery-" + idempotency_key + ".json")
 
 
+def _delivery_envelope_path(dm_file: str) -> Path:
+    return Path(dm_file + ".delivery.json")
+
+
+def _atomic_json(path: Path, document: Mapping[str, Any]) -> None:
+    fd, temporary = tempfile.mkstemp(prefix="." + path.name + ".", dir=str(path.parent), text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(_canonical(document))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+        directory_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except BaseException:
+        _unlink_dm_file(temporary)
+        raise
+
+
 @contextlib.contextmanager
 def _delivery_ledger_lock(idempotency_key: str):
-    """Cross-process exclusive create lock for one idempotency key."""
+    """Cross-process lock whose ownership dies with the process, not the file."""
     path = _delivery_ledger_path(idempotency_key).with_suffix(".lock")
-    fd = None
-    for _ in range(200):
-        try:
-            fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            break
-        except FileExistsError:
-            time.sleep(0.01)
-    if fd is None:
-        raise TimeoutError("delivery idempotency lock timed out")
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(str(path), flags, 0o600)
     try:
+        info = os.fstat(fd)
+        uid = getattr(os, "getuid", lambda: info.st_uid)()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != uid
+                or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600):
+            raise RuntimeError("delivery_lock_unsafe")
+        if fcntl is None:
+            import msvcrt  # pragma: no cover - Windows
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+        else:
+            deadline = time.monotonic() + 2.0
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("delivery idempotency lock busy")
+                    time.sleep(0.01)
         yield
     finally:
         try:
-            os.close(fd)
+            if fcntl is None:
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)  # type: ignore[name-defined]  # pragma: no cover
+                except Exception:
+                    pass
+            else:
+                fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
-            _unlink_dm_file(str(path))
+            os.close(fd)
+
+
+def _read_delivery_ledger(path: Path, idempotency_key: str) -> Optional[dict[str, Any]]:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(str(path), flags)
+    except FileNotFoundError:
+        return None
+    try:
+        info = os.fstat(fd)
+        uid = getattr(os, "getuid", lambda: info.st_uid)()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != uid
+                or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600):
+            raise RuntimeError("delivery_ledger_unsafe")
+        try:
+            with os.fdopen(fd, "r", encoding="utf-8") as stream:
+                fd = -1
+                document = json.load(stream)
+        except (OSError, ValueError, TypeError) as exc:
+            raise RuntimeError("delivery_ledger_unreadable") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if not isinstance(document, dict) or document.get("idempotency_key") != idempotency_key:
+        raise RuntimeError("delivery_ledger_rebind")
+    if not isinstance(document.get("delivery_id"), str) or not document["delivery_id"]:
+        raise RuntimeError("delivery_ledger_invalid")
+    return document
 
 
 def _write_delivery_receipt(
-    dm_file: str, *, origin_session_id: str, origin_reason: str, route_reason: str, label: str, idempotency_key: str
-) -> dict[str, str]:
+    dm_file: str, *, origin_session_id: str, origin_reason: str, route_reason: str,
+    label: str, idempotency_key: str, turn_identity: Optional[Mapping[str, Any]] = None,
+    fence: Optional[Mapping[str, Any]] = None,
+) -> dict[str, Any]:
     """Persist the accepted-state receipt before spawning a child process.
 
     A terminal PID only proves that the Desktop accepted a spawn request.  The
@@ -586,86 +708,86 @@ def _write_delivery_receipt(
     """
     ledger = _delivery_ledger_path(idempotency_key)
     with _delivery_ledger_lock(idempotency_key):
-        try:
-            existing = json.loads(ledger.read_text(encoding="utf-8"))
-            if isinstance(existing, dict) and existing.get("idempotency_key") == idempotency_key:
-                existing["duplicate"] = True
-                Path(dm_file + ".receipt.json").write_text(
-                    json.dumps(existing, sort_keys=True, separators=(",", ":")), encoding="utf-8"
-                )
-                return existing
-        except (OSError, ValueError, TypeError):
-            pass
+        existing = _read_delivery_ledger(ledger, idempotency_key)
+        if isinstance(existing, dict) and existing.get("idempotency_key") == idempotency_key:
+            existing["duplicate"] = True
+            _atomic_json(Path(dm_file + ".receipt.json"), existing)
+            if isinstance(existing.get("turn_identity"), dict):
+                _atomic_json(_delivery_envelope_path(dm_file), {
+                    "schema": DELIVERY_ENVELOPE_SCHEMA,
+                    "delivery_id": existing["delivery_id"],
+                    "request_key": existing["turn_identity"]["request_key"],
+                    "turn_identity_sha256": _canonical_sha256(existing["turn_identity"]),
+                    "accepted_at": int(existing["accepted_at"]),
+                })
+            return existing
         delivery_id = str(uuid.uuid4())
         record = {
             "schema": "hermes.delivery/v1", "delivery_id": delivery_id,
             "origin_session_id": str(origin_session_id or ""),
             "origin_reason": origin_reason, "route_reason": route_reason, "target": label,
             "idempotency_key": idempotency_key, "state": "accepted",
-            "accepted_at": str(int(time.time())),
+            "accepted_at": int(time.time()),
         }
+        if turn_identity is not None:
+            record["turn_identity"] = dict(turn_identity)
+            record["fence"] = dict(fence or {})
         path = Path(dm_file + ".receipt.json")
-        fd, temporary = tempfile.mkstemp(prefix="receipt-", suffix=".json", dir=str(path.parent), text=True)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                json.dump(record, stream, sort_keys=True, separators=(",", ":"))
-            os.chmod(temporary, 0o600)
-            os.replace(temporary, path)
-            ledger_tmp = ledger.with_suffix(".tmp")
-            ledger_tmp.write_text(json.dumps(record, sort_keys=True, separators=(",", ":")), encoding="utf-8")
-            os.chmod(ledger_tmp, 0o600)
-            os.replace(ledger_tmp, ledger)
-        except BaseException:
-            _unlink_dm_file(temporary)
-            raise
+        _atomic_json(path, record)
+        _atomic_json(ledger, record)
+        if turn_identity is not None:
+            _atomic_json(_delivery_envelope_path(dm_file), {
+                "schema": DELIVERY_ENVELOPE_SCHEMA,
+                "delivery_id": delivery_id,
+                "request_key": turn_identity["request_key"],
+                "turn_identity_sha256": _canonical_sha256(turn_identity),
+                "accepted_at": record["accepted_at"],
+            })
         return record
 
 
-def _update_delivery_receipt(dm_file: str, state: str) -> None:
+def _update_delivery_receipt(dm_file: str, state: str, *, ack: Optional[dict[str, Any]] = None) -> None:
     path = Path(dm_file + ".receipt.json")
     try:
         record = json.loads(path.read_text(encoding="utf-8"))
         record["state"] = state
-        record["updated_at"] = str(int(time.time()))
-        temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(record, sort_keys=True, separators=(",", ":")), encoding="utf-8")
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, path)
+        record["updated_at"] = int(time.time())
+        if ack is not None:
+            record["adapter_ack"] = dict(ack)
+            record["adapter_receipt_sha256"] = _canonical_sha256(ack)
+        _atomic_json(path, record)
         idempotency_key = str(record.get("idempotency_key") or "")
         if idempotency_key:
             ledger = _delivery_ledger_path(idempotency_key)
-            ledger_tmp = ledger.with_suffix(".tmp")
-            ledger_tmp.write_text(json.dumps(record, sort_keys=True, separators=(",", ":")), encoding="utf-8")
-            os.chmod(ledger_tmp, 0o600)
-            os.replace(ledger_tmp, ledger)
-        _emit_delivery_shadow_receipt(record, state)
+            _atomic_json(ledger, record)
+        if ack is not None and state == "delivered":
+            _emit_delivery_shadow_receipt(record, state, ack_bytes=_canonical(ack))
     except (OSError, ValueError, TypeError):
         logger.debug("delivery receipt update failed", exc_info=True)
 
 
-def _emit_delivery_shadow_receipt(record: dict[str, Any], state: str) -> None:
+def _emit_delivery_shadow_receipt(
+    record: dict[str, Any], state: str, *, ack_bytes: Optional[str] = None
+) -> None:
     """Observe a terminal DM effect only with an upstream-validated fence."""
     if os.environ.get("HERMES_KERNEL_SHADOW_PRODUCER_ENABLED", "0") != "1":
         return
-    if os.environ.get("HERMES_KERNEL_FENCE_VALIDATED", "0") != "1":
-        return
-    if state not in {"delivered", "failed"}:
+    if state != "delivered" or not ack_bytes:
         return
     try:
         from gateway.turn_context import write_kernel_shadow_receipt
-
-        work_id = os.environ["HERMES_KERNEL_WORK_ID"]
-        authority_version = int(os.environ["HERMES_KERNEL_AUTHORITY_VERSION"])
-        tenant = os.environ["HERMES_KERNEL_TENANT"]
-        profile = os.environ["HERMES_KERNEL_PROFILE"]
-        attempt_id = os.environ["HERMES_KERNEL_ATTEMPT_ID"]
-        lease_epoch = int(os.environ["HERMES_KERNEL_LEASE_EPOCH"])
+        identity = record["turn_identity"]
+        fence = _revalidate_delivery_identity(record)
+        work_id = identity["work_id"]
+        authority_version = identity["authority_version"]
+        tenant = identity["tenant"]
+        profile = identity["profile"]
+        attempt_id = identity["attempt_id"]
+        lease_epoch = identity["generation"]
         delivery_id = str(record["delivery_id"])
         origin = str(record["origin_session_id"])
-        source_event_id = str(record["idempotency_key"])
-        adapter_hash = hashlib.sha256(
-            (delivery_id + "\0" + source_event_id + "\0" + state).encode("utf-8")
-        ).hexdigest()
+        source_event_id = str(identity["source_event_id"])
+        adapter_hash = hashlib.sha256(ack_bytes.encode("utf-8")).hexdigest()
         event_id = "agent-delivery-" + hashlib.sha256(
             (work_id + "\0" + delivery_id + "\0" + state).encode("utf-8")
         ).hexdigest()
@@ -686,13 +808,104 @@ def _emit_delivery_shadow_receipt(record: dict[str, Any], state: str) -> None:
             "outcome": state,
             "adapter_receipt_sha256": adapter_hash,
             "observed_at": int(time.time()),
-            "fence_valid": True,
+            "fence_valid": bool(fence["fence_valid"]),
             "material": False,
             "waiting_for_human": False,
             "terminal": True,
         })
-    except (KeyError, TypeError, ValueError, OSError):
+    except (KeyError, TypeError, ValueError, OSError, RuntimeError):
         logger.debug("kernel shadow delivery receipt skipped", exc_info=True)
+
+
+def _revalidate_delivery_identity(record: Mapping[str, Any]) -> dict[str, Any]:
+    from agent.durable_admission import _run_turn_identity_revalidation
+
+    identity = record.get("turn_identity")
+    if not isinstance(identity, Mapping):
+        raise RuntimeError("delivery_turn_identity_missing")
+    return _run_turn_identity_revalidation(identity)
+
+
+def _validated_delivery_ack(
+    payload: Any, record: Mapping[str, Any], *, expected_adapter: Optional[str] = None
+) -> dict[str, Any]:
+    ack = payload.get("delivery_ack") if isinstance(payload, Mapping) else None
+    identity = record.get("turn_identity")
+    if not isinstance(ack, Mapping) or not isinstance(identity, Mapping):
+        raise ValueError("delivery_ack_missing")
+    required = {
+        "schema", "delivery_id", "request_key", "turn_identity_sha256",
+        "target_session_id", "target_message_id", "adapter", "state",
+        "accepted_at", "persisted_at",
+    }
+    if set(ack) != required or ack.get("schema") != DELIVERY_ACK_SCHEMA:
+        raise ValueError("delivery_ack_fields_invalid")
+    expected = {
+        "delivery_id": record.get("delivery_id"),
+        "request_key": identity.get("request_key"),
+        "turn_identity_sha256": _canonical_sha256(identity),
+        "accepted_at": record.get("accepted_at"),
+        "state": "persisted",
+    }
+    if any(ack.get(key) != value for key, value in expected.items()):
+        raise ValueError("delivery_ack_rebind")
+    if ack.get("adapter") not in {"cli", "api_server"}:
+        raise ValueError("delivery_ack_adapter_invalid")
+    if expected_adapter is not None and ack.get("adapter") != expected_adapter:
+        raise ValueError("delivery_ack_adapter_rebind")
+    if not isinstance(ack.get("target_session_id"), str) or not ack["target_session_id"]:
+        raise ValueError("delivery_ack_session_invalid")
+    if isinstance(ack.get("target_message_id"), bool) or not isinstance(ack.get("target_message_id"), int) or ack["target_message_id"] < 1:
+        raise ValueError("delivery_ack_message_invalid")
+    if isinstance(ack.get("persisted_at"), bool) or not isinstance(ack.get("persisted_at"), int) or ack["persisted_at"] < 1:
+        raise ValueError("delivery_ack_timestamp_invalid")
+    response_session = payload.get("session_id") if isinstance(payload, Mapping) else None
+    if response_session != ack["target_session_id"]:
+        raise ValueError("delivery_ack_session_rebind")
+    return dict(ack)
+
+
+def _delivery_envelope_from_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    identity = record["turn_identity"]
+    return {
+        "schema": DELIVERY_ENVELOPE_SCHEMA,
+        "delivery_id": record["delivery_id"],
+        "request_key": identity["request_key"],
+        "turn_identity_sha256": _canonical_sha256(identity),
+        "accepted_at": int(record["accepted_at"]),
+    }
+
+
+def _validate_local_ack_row(db: Any, ack: Mapping[str, Any], record: Mapping[str, Any]) -> None:
+    around = db.get_messages_around(
+        ack["target_session_id"], int(ack["target_message_id"]), window=0
+    )
+    rows = around.get("window") if isinstance(around, Mapping) else None
+    if not isinstance(rows, list) or len(rows) != 1:
+        raise ValueError("delivery_ack_target_message_missing")
+    row = rows[0]
+    metadata = row.get("display_metadata") if isinstance(row, Mapping) else None
+    if (not isinstance(metadata, Mapping)
+            or metadata.get("hermes_delivery") != _delivery_envelope_from_record(record)
+            or row.get("role") != "user"):
+        raise ValueError("delivery_ack_target_message_rebind")
+
+
+def _validate_local_ack_against_destination(
+    ack: Mapping[str, Any], record: Mapping[str, Any], argv: list[str]
+) -> None:
+    try:
+        profile = argv[argv.index("-p") + 1]
+    except (ValueError, IndexError) as exc:
+        raise ValueError("delivery_ack_target_profile_missing") from exc
+    from hermes_cli.profiles import get_profile_dir
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=get_profile_dir(profile) / "state.db")
+    try:
+        _validate_local_ack_row(db, ack, record)
+    finally:
+        db.close()
 
 
 def _release_unspawned_delivery(dm_file: Optional[str]) -> None:
@@ -708,6 +921,7 @@ def _release_unspawned_delivery(dm_file: Optional[str]) -> None:
     except (OSError, ValueError, TypeError):
         pass
     _unlink_dm_file(str(path))
+    _unlink_dm_file(str(_delivery_envelope_path(dm_file)))
 
 
 def _unlink_dm_file(path: str) -> None:
@@ -762,21 +976,57 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool) -> int:
     gateway's deliver path, not here.
     """
     returncode = 1
+    structured = False
+    ack: Optional[dict[str, Any]] = None
     try:
+        receipt_path = Path(dm_file + ".receipt.json")
+        try:
+            record = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            record = {}
+        structured = isinstance(record.get("turn_identity"), dict)
+        transport_argv = list(argv)
+        if structured:
+            try:
+                fresh_fence = _revalidate_delivery_identity(record)
+                if (
+                    fresh_fence.get("fence_valid") is not True
+                    or fresh_fence.get("identity_sha256") != _canonical_sha256(record["turn_identity"])
+                ):
+                    return 1
+            except Exception:
+                return 1
+            if stdin_file:
+                transport_argv += ["--delivery-envelope-file", str(_delivery_envelope_path(dm_file))]
+                transport_argv.append("--json")
+            else:
+                message = Path(dm_file).read_text(encoding="utf-8")
+                Path(dm_file).write_text(
+                    _encode_delivery_query(
+                        json.loads(_delivery_envelope_path(dm_file).read_text(encoding="utf-8")),
+                        message,
+                    ),
+                    encoding="utf-8",
+                )
+                os.chmod(dm_file, 0o600)
         with _delivery_lock(argv, stdin_file=stdin_file):
             if stdin_file:
                 # Keep the file open until the transport exits; cleanup occurs
                 # after subprocess.run returns, not merely after stdin reaches EOF.
                 with open(dm_file, "r", encoding="utf-8") as stream:
-                    returncode = subprocess.run(argv, stdin=stream, check=False).returncode
-                    return returncode
-            proc = subprocess.run(
-                [*argv, "--query-file", dm_file],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            if proc.returncode != 0:
+                    proc = subprocess.run(
+                        transport_argv, stdin=stream, check=False, capture_output=True, text=True
+                    )
+                returncode = proc.returncode
+            else:
+                proc = subprocess.run(
+                    [*transport_argv, "--query-file", dm_file],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                returncode = proc.returncode
+            if proc.returncode != 0 and not stdin_file:
                 from tools.bot_failure_reasons import (
                     RETRY_NONE,
                     classify_agent_error,
@@ -786,24 +1036,42 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool) -> int:
                 detail = (proc.stderr or proc.stdout or "").strip()[-500:]
                 if retry_action(classify_agent_error(detail)) != RETRY_NONE:
                     proc = subprocess.run(
-                        [*argv, "--query-file", dm_file],
+                        [*transport_argv, "--query-file", dm_file],
                         check=False,
                         capture_output=True,
                         text=True,
                     )
+                    returncode = proc.returncode
             # Re-emit the transport's streams: stdout is the reply text the
             # completion notification carries back to the sending agent.
-            if proc.stdout:
+            if structured and proc.returncode == 0:
+                try:
+                    payload = json.loads(proc.stdout or "")
+                    ack = _validated_delivery_ack(
+                        payload, record,
+                        expected_adapter="api_server" if stdin_file else "cli",
+                    )
+                    if not stdin_file:
+                        _validate_local_ack_against_destination(ack, record, argv)
+                    reply = str(payload.get("reply") or "")
+                except (TypeError, ValueError):
+                    returncode = 1
+                    reply = ""
+                if reply:
+                    sys.stdout.write(reply)
+                    sys.stdout.flush()
+            elif proc.stdout:
                 sys.stdout.write(proc.stdout)
                 sys.stdout.flush()
             if proc.stderr:
                 sys.stderr.write(proc.stderr)
                 sys.stderr.flush()
-            returncode = proc.returncode
             return returncode
     finally:
-        _update_delivery_receipt(dm_file, "delivered" if returncode == 0 else "failed")
+        state = "delivered" if returncode == 0 and (ack is not None or not structured) else "failed"
+        _update_delivery_receipt(dm_file, state, ack=ack)
         _unlink_dm_file(dm_file)
+        _unlink_dm_file(str(_delivery_envelope_path(dm_file)))
 
 
 def _delivery_command(argv: list[str], dm_file: str, *, stdin_file: bool) -> str:
@@ -837,6 +1105,18 @@ def _start_delivery(
     route_reason: str = "canonical_title_fallback",
 ) -> str:
     """Create a DM file and transfer its cleanup ownership to the runner."""
+    turn_identity = None
+    fence = None
+    try:
+        from agent.durable_admission import (
+            admission_enabled,
+            revalidate_current_turn_identity,
+        )
+
+        if admission_enabled():
+            turn_identity, fence = revalidate_current_turn_identity()
+    except Exception as exc:
+        return _err(f"Delivery authority refused: {type(exc).__name__}: {exc}")
     dm_file = _write_dm_file(content)
     try:
         origin = str(origin_session_id or getattr(agent, "session_id", "") or "")
@@ -844,12 +1124,16 @@ def _start_delivery(
         if not origin:
             _unlink_dm_file(dm_file)
             return _err("Delivery requires origin_session_id; no fallback session is available.")
+        if turn_identity is not None and origin != turn_identity.get("origin_session_id"):
+            _unlink_dm_file(dm_file)
+            return _err("Delivery authority refused: origin session rebind.")
         # The durable ledger is shared by all profile processes on one Hermes
         # install.  Scope idempotency to that install so unrelated test or
         # tenant homes that happen to reuse a session id never suppress a send.
         ledger_scope = str(_hermes_root(Path(_agent_home(agent))))
+        authority_request = str((turn_identity or {}).get("request_key") or "")
         idempotency_key = hashlib.sha256(
-            (ledger_scope + "\0" + origin + "\0" + label + "\0" + content).encode("utf-8")
+            (ledger_scope + "\0" + origin + "\0" + authority_request + "\0" + label + "\0" + content).encode("utf-8")
         ).hexdigest()
         receipt = _write_delivery_receipt(
             dm_file,
@@ -858,12 +1142,16 @@ def _start_delivery(
             route_reason=route_reason,
             label=label,
             idempotency_key=idempotency_key,
+            turn_identity=turn_identity,
+            fence=fence,
         )
-        if receipt.get("duplicate"):
+        if receipt.get("duplicate") and receipt.get("state") == "delivered":
             _unlink_dm_file(dm_file)
             _unlink_dm_file(dm_file + ".receipt.json")
-            return json.dumps({"status": "accepted", "to": label, "delivery": receipt,
-                               "detail": "Delivery already accepted for this exact origin; no duplicate spawn."})
+            _unlink_dm_file(str(_delivery_envelope_path(dm_file)))
+            return json.dumps({"status": "delivered", "to": label,
+                               "delivery": _public_delivery_receipt(receipt),
+                               "detail": "Delivery already persisted for this exact request; no duplicate spawn."})
         command = _delivery_command(argv, dm_file, stdin_file=stdin_file)
     except BaseException:
         _unlink_dm_file(dm_file)
@@ -931,7 +1219,7 @@ def _spawn_delivery(
                     "that agent."
                 ),
                 **({"process_id": proc_id} if proc_id else {}),
-                **({"delivery": receipt} if receipt else {}),
+                **({"delivery": _public_delivery_receipt(receipt)} if receipt else {}),
                 "sent_at": int(time.time()),
             }
         )
