@@ -35,9 +35,12 @@ from agent.conversation_compression import (
     PRE_API_COMPRESSION_STATUS_TEMPLATE,
     compression_skipped_due_to_lock,
     conversation_history_after_compression,
+    ensure_compression_turn_identity,
+    spool_deferred_compression_turn,
 )
 from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
+from agent.durable_admission import admit_turn_or_block
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.message_metadata import append_message
 from agent.turn_context import (
@@ -1468,6 +1471,8 @@ def _compression_deferred_result(
     agent,
     messages: List[Dict],
     api_call_count: int,
+    *,
+    token_count: int = 0,
 ) -> Dict[str, Any]:
     """Build the soft turn result for a lock-contended compression defer.
 
@@ -1491,24 +1496,45 @@ def _compression_deferred_result(
         agent.session_id or "none",
         holder if isinstance(holder, str) else "unconfirmed",
     )
+    receipt = None
+    spool_error = None
+    try:
+        receipt = spool_deferred_compression_turn(
+            agent.session_id or "",
+            messages,
+            token_count=int(token_count or 0),
+        )
+    except Exception as exc:
+        spool_error = type(exc).__name__
+        logger.warning("compression turn durable handoff failed: %s", exc)
     try:
         agent._flush_status_buffer()
     except Exception:
         pass
-    _final = (
-        "Context compression is already running for this session. "
-        "Please retry in a moment — your next message will be processed "
-        "once the concurrent compression finishes."
-    )
+    accepted = bool(receipt and receipt.get("durable"))
+    if accepted:
+        _final = (
+            "Your turn was durably accepted while context compression finishes. "
+            "It will resume automatically on the live continuation."
+        )
+    else:
+        _final = (
+            "Context compression is still in progress. This turn was not "
+            "accepted for automatic handoff; please retry shortly."
+        )
     return {
         "final_response": _final,
         "messages": messages,
         "completed": False,
         "api_calls": api_call_count,
-        "error": _final,
+        "error": None if accepted else _final,
         "partial": True,
         "failed": False,
         "compression_deferred": True,
+        "compression_handoff_accepted": accepted,
+        "compression_spool_turn_id": receipt.get("turn_id") if accepted else None,
+        "compression_spool_error": spool_error,
+        "retryable": True,
         "session_id": agent.session_id,
     }
 
@@ -1884,6 +1910,65 @@ def run_conversation(
                     persist_user_message = _decoded_message
         except Exception:
             pass
+
+    # ── Durable admission (K8) ──
+    # Nothing model-facing may run before the kernel has durably recorded this
+    # input. The seam sits HERE — after the MoA decode, so what is admitted is
+    # the text the user actually wrote rather than the transport envelope, and
+    # before ``build_turn_context``, which runs preflight compression, the
+    # oversized-resume rebuild and the ``pre_llm_call`` hook. The Codex
+    # app-server runtime branches further down, after that call, so it is
+    # covered by this one gate.
+    #
+    # On a gateway turn the Signal was already recorded at ingress, before
+    # vision/STT/compression rewrote this text; that verified outcome is
+    # consumed here rather than re-admitted, so one inbound message is one
+    # Signal and never two. Nothing about the request is altered either way:
+    # no synthetic turn, no system-prompt or history edit, no toolset change.
+    #
+    # Unarmed, this is a single environment read and a ``None``, so the pre-K8
+    # turn is preserved exactly: no config file is opened, no subprocess exists,
+    # and no database is touched.
+    _admission_block = admit_turn_or_block(
+        agent, user_message, conversation_history=conversation_history
+    )
+    if _admission_block is not None:
+        return _admission_block
+
+    # Bind a durable, per-input identity before build_turn_context performs
+    # its crash-resilience append. The staged mapping is the same object the
+    # turn prologue adopts, so the ID reaches both SessionDB display metadata
+    # and a later compression spool without changing provider-visible content.
+    _expected_persist_content = (
+        persist_user_message if persist_user_message is not None else user_message
+    )
+    _staged_user = getattr(agent, "_pending_cli_user_message", None)
+    if not (
+        isinstance(_staged_user, dict)
+        and _staged_user.get("content") == _expected_persist_content
+    ):
+        _staged_user = {"role": "user", "content": _expected_persist_content}
+        if persist_user_timestamp is not None:
+            _staged_user["timestamp"] = persist_user_timestamp
+        agent._pending_cli_user_message = _staged_user
+    _typed_metadata = (
+        dict(persist_user_display_metadata)
+        if isinstance(persist_user_display_metadata, dict)
+        else {}
+    )
+    _typed_metadata.pop("_compression_turn_id", None)
+    _staged_metadata = _staged_user.get("display_metadata")
+    if not isinstance(_staged_metadata, dict):
+        _staged_metadata = {}
+    else:
+        _staged_metadata = dict(_staged_metadata)
+    _staged_metadata.update(_typed_metadata)
+    _staged_user["display_metadata"] = _staged_metadata
+    ensure_compression_turn_identity(_staged_user)
+    if persist_user_display_kind:
+        # turn_context applies typed metadata after adopting this staged dict;
+        # pass the merged mapping so that assignment retains the internal ID.
+        persist_user_display_metadata = _staged_user["display_metadata"]
 
     # The gateway caches agents across user turns.  Compression state is
     # per-turn: carrying a prior in-place boundary forward would make a later
@@ -5740,7 +5825,10 @@ def run_conversation(
                         compression_attempts -= 1
                         agent._persist_session(messages, conversation_history)
                         return _compression_deferred_result(
-                            agent, messages, api_call_count
+                            agent,
+                            messages,
+                            api_call_count,
+                            token_count=approx_tokens,
                         )
                     conversation_history = conversation_history_after_compression(
                         agent, messages, conversation_history
@@ -5898,7 +5986,10 @@ def run_conversation(
                                 compression_attempts -= 1
                                 agent._persist_session(messages, conversation_history)
                                 return _compression_deferred_result(
-                                    agent, messages, api_call_count
+                                    agent,
+                                    messages,
+                                    api_call_count,
+                                    token_count=request_input_estimate,
                                 )
                             conversation_history = conversation_history_after_compression(
                                 agent, messages, conversation_history
@@ -6058,7 +6149,10 @@ def run_conversation(
                         compression_attempts -= 1
                         agent._persist_session(messages, conversation_history)
                         return _compression_deferred_result(
-                            agent, messages, api_call_count
+                            agent,
+                            messages,
+                            api_call_count,
+                            token_count=approx_tokens,
                         )
                     conversation_history = conversation_history_after_compression(
                         agent, messages, conversation_history

@@ -8,12 +8,16 @@ successful transcript flush — not silently discarded (#78182, #82616).
 """
 import json
 import logging
+import os
+import stat
+import builtins
 import threading
 
 import pytest
 
 from gateway import shutdown_flush
 from gateway.session import SessionStore
+from agent.conversation_compression import DurableCompressionTurnSpool
 
 
 def _make_store(db):
@@ -221,3 +225,93 @@ class TestSpoolPrimitives:
         assert remaining == 0
         assert seen == ["c0", "c1", "c2"]
         assert _spool_files(spool_home) == []
+
+    def test_compression_spool_ack_is_durable_before_return(self, spool_home):
+        spool = DurableCompressionTurnSpool(spool_home / "compression_turn_spool")
+        receipt = spool.enqueue(
+            "session-over-ceiling",
+            {"role": "user", "content": "queued"},
+            token_count=1_000_001,
+            client_turn_id="turn-durable",
+        )
+        assert receipt["accepted"] is True
+        assert receipt["durable"] is True
+        assert receipt["path"].exists()
+        payload = json.loads(receipt["path"].read_text(encoding="utf-8"))
+        assert payload["client_turn_id"] == "turn-durable"
+
+    def test_flock_failure_prevents_ack(self, spool_home, monkeypatch):
+        import fcntl
+
+        monkeypatch.setattr(
+            fcntl, "flock", lambda *_a, **_k: (_ for _ in ()).throw(OSError("flock"))
+        )
+        spool = DurableCompressionTurnSpool(spool_home / "compression_turn_spool")
+        with pytest.raises(OSError, match="flock"):
+            spool.enqueue("s", {"role": "user", "content": "x"}, token_count=1)
+
+    def test_fcntl_unavailable_prevents_ack(self, spool_home, monkeypatch):
+        real_import = builtins.__import__
+
+        def import_without_fcntl(name, *args, **kwargs):
+            if name == "fcntl":
+                raise ImportError("fcntl unavailable")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", import_without_fcntl)
+        spool = DurableCompressionTurnSpool(spool_home / "compression_turn_spool")
+        with pytest.raises(RuntimeError, match="requires fcntl"):
+            spool.enqueue("s", {"role": "user", "content": "x"}, token_count=1)
+
+    @pytest.mark.parametrize("fail_call", [1, 2, 3, 4])
+    def test_file_or_directory_fsync_failure_prevents_ack(
+        self, spool_home, monkeypatch, fail_call
+    ):
+        real_fsync = os.fsync
+        calls = 0
+
+        def fail_selected(fd):
+            nonlocal calls
+            calls += 1
+            if calls == fail_call:
+                raise OSError("fsync failed")
+            return real_fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", fail_selected)
+        spool = DurableCompressionTurnSpool(spool_home / "compression_turn_spool")
+        with pytest.raises(OSError, match="fsync failed"):
+            spool.enqueue("s", {"role": "user", "content": "x"}, token_count=1)
+
+    def test_visible_record_is_revalidated_before_retry_ack(
+        self, spool_home, monkeypatch
+    ):
+        spool = DurableCompressionTurnSpool(spool_home / "compression_turn_spool")
+        # Establish global metadata so the injected directory failure lands
+        # after the record replace has made the turn visible.
+        spool.enqueue(
+            "seed", {"role": "user", "content": "seed"},
+            token_count=1, client_turn_id="seed",
+        )
+        real_fsync = os.fsync
+        directory_calls = 0
+
+        def reject_directory(fd):
+            nonlocal directory_calls
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                directory_calls += 1
+                if directory_calls >= 3:
+                    raise OSError("directory fsync failed")
+            return real_fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", reject_directory)
+        message = {"role": "user", "content": "retry me"}
+        with pytest.raises(OSError, match="directory fsync failed"):
+            spool.enqueue("s", message, token_count=1, client_turn_id="retry-id")
+        # The replace is visible, but that is not durable evidence. A retry
+        # under the same fault must not ACK the visible record.
+        with pytest.raises(OSError, match="directory fsync failed"):
+            spool.enqueue("s", message, token_count=1, client_turn_id="retry-id")
+
+        monkeypatch.setattr(os, "fsync", real_fsync)
+        receipt = spool.enqueue("s", message, token_count=1, client_turn_id="retry-id")
+        assert receipt["durable"] is True

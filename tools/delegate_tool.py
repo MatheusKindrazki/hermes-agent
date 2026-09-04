@@ -3818,6 +3818,118 @@ def delegate_task(
             return tool_error(f"Task {i} output_schema invalid: {schema_err}")
         task_schemas.append(coerced_schema)
 
+    # ── Durable admission (K8) ──
+    # Two different questions, and conflating them is what the first design of
+    # this gate got wrong.
+    #
+    # A LONG / background / promised execution does not run here at all, even
+    # holding a valid Work receipt. The async registry it used to be dispatched
+    # into is session-bound: it dies with this process, so an ACK from it is a
+    # promise nobody can keep, and a killed owner leaves an execution nobody can
+    # name. Such a request returns a typed handoff naming the external Work
+    # dispatcher — no child, no thread, no ledger row, no "dispatched" ACK.
+    #
+    # A SYNCHRONOUS subtask may run locally only while it is fully consumed by
+    # the current admitted turn, and only under an admission this call tree
+    # already inherited. It never opens a second Work for one execution, and it
+    # never mutates: it is a read-only fan-out whose results return in-turn.
+    from agent.durable_admission import ModeError, resolve_mode
+
+    try:
+        _k8_armed = resolve_mode()
+    except ModeError as exc:
+        return json.dumps(
+            {
+                "status": "admission_required",
+                "reason": ModeError.reason_code,
+                "retryable": False,
+                "error": "Nothing was started. %s" % exc,
+            },
+            ensure_ascii=False,
+        )
+
+    _inherited_turn = None
+    if _k8_armed:
+        from agent.durable_admission import (
+            EXTERNAL_WORK_DISPATCHER,
+            ExecutionHandoff,
+            admit_execution,
+            current_admitted_turn,
+            execution_event_id,
+        )
+
+        # The request is canonicalised WHOLE, so the same goal with a different
+        # context, role or output schema is a different execution and cannot
+        # collapse onto the first one's Work.
+        _request = {
+            "goals": [
+                {
+                    "goal": str(t.get("goal") or ""),
+                    "context": t.get("context"),
+                    "role": _normalize_role(t.get("role") or top_role),
+                    "output_schema": task_schemas[_i],
+                }
+                for _i, t in enumerate(task_list)
+            ],
+            "top_role": top_role,
+            "background": bool(background),
+        }
+        _session_id = str(getattr(parent_agent, "session_id", "") or "")
+
+        if background:
+            _admission = admit_execution(
+                session_id=_session_id,
+                request=_request,
+                event_id=execution_event_id(_session_id, _request),
+            )
+            logger.info(
+                "delegate_task: long execution handed off to %s (%s)",
+                EXTERNAL_WORK_DISPATCHER,
+                _admission.reason_code,
+            )
+            _handoff = ExecutionHandoff(
+                reason_code=_admission.reason_code or "long_execution_not_local",
+                detail=(
+                    "This is long-running work, so it was NOT started here. A "
+                    "session-bound background subagent dies with this process, "
+                    f"so it is handed to {EXTERNAL_WORK_DISPATCHER}, which owns "
+                    "durable execution. No subagent was spawned, no background "
+                    "task exists, and there is nothing to poll or wait for."
+                ),
+                work_id=_admission.work_id,
+                request_key=_admission.request_key,
+                retryable=_admission.retryable,
+                authority_pin_matched=_admission.authority_pin_matched,
+            )
+            _payload = _handoff.payload()
+            _payload["count"] = len(task_list)
+            _payload["goals"] = [str(t.get("goal") or "") for t in task_list]
+            return json.dumps(_payload, ensure_ascii=False)
+
+        # Synchronous: require the admission this call tree already holds. It
+        # is the TURN's admission, not a Work — a read-only subtask consumed
+        # inside the turn is that turn's execution, and minting a Work for it
+        # would be the duplicate this gate exists to prevent.
+        _inherited_turn = current_admitted_turn()
+        if _inherited_turn is None:
+            logger.warning(
+                "delegate_task: refusing a synchronous fan-out with no inherited "
+                "admission (session=%s)", _session_id,
+            )
+            return json.dumps(
+                {
+                    "status": "admission_required",
+                    "reason": "no_inherited_admission",
+                    "retryable": False,
+                    "error": (
+                        "Nothing was started. A synchronous delegation may only "
+                        "run inside an execution the work ledger already "
+                        "admitted, and this call tree holds none."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+
     overall_start = time.monotonic()
     results = []
 
