@@ -1137,6 +1137,11 @@ def revalidate_current_turn_identity() -> tuple[Dict[str, Any], Dict[str, Any]]:
     }
     if any(identity.get(key) != value for key, value in expected.items()):
         raise TurnIdentityError("turn_identity_rebind")
+    # The remote seal authorizes one profile, not every profile sharing the
+    # same Work Control credential.  Bind it again at the local execution seam
+    # so a valid identity from another Hermes profile cannot be replayed here.
+    if identity["profile"] != _active_profile() or identity["source"] != _active_profile():
+        raise TurnIdentityError("turn_identity_profile_rebind")
     fence = _run_turn_identity_revalidation(identity)
     return identity, fence
 

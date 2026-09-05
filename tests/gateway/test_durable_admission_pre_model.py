@@ -476,6 +476,27 @@ def test_turn_identity_is_bound_to_the_one_shot_carrier_and_revalidated(monkeypa
     assert durable_admission.consume_pre_admission(carrier) is None
 
 
+def test_turn_identity_from_another_profile_is_refused_at_execution_seam(monkeypatch):
+    identity = _turn_identity()
+    identity.update({"profile": "projetospessoais", "source": "projetospessoais"})
+    outcome = durable_admission.AdmissionOutcome(
+        state="admitted", reason_code="structured_execution", work_id=identity["work_id"],
+        request_key=identity["request_key"], event_id=identity["source_event_id"],
+        session_id=identity["origin_session_id"], model_may_run=True,
+        authority_pin_matched=True, signal_persisted=True, authority_version=4,
+        turn_identity=identity, turn_identity_seal=durable_admission._turn_identity_seal(identity),
+    )
+    durable_admission.bind_admitted_turn(outcome)
+    monkeypatch.setattr(durable_admission, "_active_profile", lambda: "default")
+    monkeypatch.setattr(
+        durable_admission, "_run_turn_identity_revalidation",
+        lambda _identity: pytest.fail("cross-profile identity reached remote fence"),
+    )
+
+    with pytest.raises(durable_admission.TurnIdentityError, match="profile_rebind"):
+        durable_admission.revalidate_current_turn_identity()
+
+
 @pytest.mark.parametrize("field,value", [
     ("origin_session_id", "other"), ("request_key", "other-key"),
     ("attempt_id", "01a061a7-cea0-7503-b308-1f4029d450ca"), ("generation", 8),
