@@ -236,10 +236,101 @@ def _runner_parts(command):
     return parts[marker + 1], parts[marker + 2], parts[marker + 3 :]
 
 
-def test_local_delivery_command_and_ack(tmp_path, monkeypatch):
+def _control_sender_cli(tmp_path, monkeypatch, scenario):
+    from tools import bot_relay
+
+    runtime = tmp_path / "controlled runtime with spaces"
+    python = runtime / "python3.12"
+    monkeypatch.setattr(sys, "executable", str(python))
+    monkeypatch.setattr(bot_relay.shutil, "which", lambda _name: None)
+    if scenario == "sibling":
+        runtime.mkdir()
+        python.write_text("", encoding="utf-8")
+        sibling = runtime / "hermes"
+        sibling.write_text("", encoding="utf-8")
+        sibling.chmod(0o700)
+        return str(sibling)
+    return "hermes"
+
+
+@pytest.mark.parametrize(
+    ("target_profile", "sender_profile"),
+    [("default", "sender"), ("researcher", None), ("openai", None)],
+)
+def test_public_local_delivery_resolves_sibling_cli_with_empty_path(
+    tmp_path, monkeypatch, target_profile, sender_profile
+):
+    calls = _capture_spawn(monkeypatch)
+    teammates = tuple(
+        name for name in (target_profile, sender_profile) if name != "default" and name
+    )
+    home = _managed_home(tmp_path, teammates=teammates)
+    agent_home = home / "profiles" / sender_profile if sender_profile else home
+    agent = _FakeAgent(agent_home, title="Bot Chat")
+    runtime = tmp_path / "runtime with spaces"
+    runtime.mkdir()
+    python = runtime / "python3.12"
+    python.write_text("", encoding="utf-8")
+    sibling = runtime / "hermes"
+    sibling.write_text("#!/bin/sh\n", encoding="utf-8")
+    sibling.chmod(0o700)
+    monkeypatch.setattr(sys, "executable", str(python))
+    monkeypatch.setenv("PATH", "")
+
+    target = "hermes" if target_profile == "default" else target_profile
+    result = json.loads(
+        bot_mode_dm.message_agent_tool(target=target, message="ping", agent=agent)
+    )
+
+    assert result["status"] == "accepted"
+    _mode, _dm_file, transport_argv = _runner_parts(calls[0]["command"])
+    assert transport_argv[0] == str(sibling)
+    assert transport_argv[1:] == [
+        "-p",
+        target_profile,
+        "chat",
+        "--in",
+        "~",
+        "-c",
+        "Bot Chat",
+        "--create-if-missing",
+        "-Q",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("which_result", "expected"),
+    [("/resolved path/hermes", "/resolved path/hermes"), (None, "hermes")],
+)
+def test_public_peer_delivery_uses_which_then_bare_fallback(
+    tmp_path, monkeypatch, which_result, expected
+):
+    from tools import bot_relay
+
+    calls = _capture_spawn(monkeypatch)
+    home = _managed_home(tmp_path, peers=("spark",))
+    agent = _FakeAgent(home, title="Bot Chat")
+    monkeypatch.setattr(sys, "executable", str(tmp_path / "missing runtime" / "python"))
+    monkeypatch.setattr(bot_relay.shutil, "which", lambda name: which_result)
+
+    result = json.loads(
+        bot_mode_dm.message_agent_tool(
+            target="spark/researcher", message="ping", agent=agent
+        )
+    )
+
+    assert result["status"] == "accepted"
+    mode, _dm_file, transport_argv = _runner_parts(calls[0]["command"])
+    assert mode == "stdin"
+    assert transport_argv == [expected, "peer", "dm", "spark/researcher"]
+
+
+@pytest.mark.parametrize("cli_scenario", ["bare", "sibling"])
+def test_local_delivery_command_and_ack(tmp_path, monkeypatch, cli_scenario):
     calls = _capture_spawn(monkeypatch)
     home = _managed_home(tmp_path, teammates=("researcher",))
     agent = _FakeAgent(home, title="Bot Chat")
+    expected_cli = _control_sender_cli(tmp_path, monkeypatch, cli_scenario)
 
     result = json.loads(
         bot_mode_dm.message_agent_tool(
@@ -262,8 +353,8 @@ def test_local_delivery_command_and_ack(tmp_path, monkeypatch):
     command = call["command"]
     mode, dm_file, transport_argv = _runner_parts(command)
     assert mode == "query-file"
-    assert transport_argv == [
-        "hermes",
+    assert transport_argv[0] == expected_cli
+    assert transport_argv[1:] == [
         "-p",
         "researcher",
         "chat",
@@ -284,10 +375,12 @@ def test_local_delivery_command_and_ack(tmp_path, monkeypatch):
     assert '$(and this is not shell)' in content
 
 
-def test_peer_delivery_command(tmp_path, monkeypatch):
+@pytest.mark.parametrize("cli_scenario", ["bare", "sibling"])
+def test_peer_delivery_command(tmp_path, monkeypatch, cli_scenario):
     calls = _capture_spawn(monkeypatch)
     home = _managed_home(tmp_path, peers=("spark",))
     agent = _FakeAgent(home, title="Bot Chat")
+    expected_cli = _control_sender_cli(tmp_path, monkeypatch, cli_scenario)
 
     result = json.loads(
         bot_mode_dm.message_agent_tool(target="spark/researcher", message="ping", agent=agent)
@@ -296,7 +389,8 @@ def test_peer_delivery_command(tmp_path, monkeypatch):
     assert "spark" in result["to"]
     mode, _dm_file, transport_argv = _runner_parts(calls[0]["command"])
     assert mode == "stdin"
-    assert transport_argv == ["hermes", "peer", "dm", "spark/researcher"]
+    assert transport_argv[0] == expected_cli
+    assert transport_argv[1:] == ["peer", "dm", "spark/researcher"]
 
     # bare peer name targets the peer's main agent
     result2 = json.loads(
@@ -305,7 +399,8 @@ def test_peer_delivery_command(tmp_path, monkeypatch):
     assert result2["status"] == "accepted"
     mode, _dm_file, transport_argv = _runner_parts(calls[1]["command"])
     assert mode == "stdin"
-    assert transport_argv == ["hermes", "peer", "dm", "spark"]
+    assert transport_argv[0] == expected_cli
+    assert transport_argv[1:] == ["peer", "dm", "spark"]
 
 
 def test_named_profile_sender_prefix(tmp_path, monkeypatch):

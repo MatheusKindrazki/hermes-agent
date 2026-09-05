@@ -333,6 +333,16 @@ def message_agent_tool(
     if not raw_target:
         return _err("target is required.", roster=teammates, peers=peers)
 
+    hermes_cli: Optional[str] = None
+
+    def resolved_hermes_cli() -> str:
+        nonlocal hermes_cli
+        if hermes_cli is None:
+            from tools.bot_relay import _hermes_cli
+
+            hermes_cli = _hermes_cli()
+        return hermes_cli
+
     sender_handle = _handle(me)
     prefix = f"Message from 🤖 {sender_handle} (@{sender_handle}): "
 
@@ -349,7 +359,7 @@ def message_agent_tool(
         dm_target = f"{peer_name}/{peer_profile}" if peer_profile else peer_name
         label = f"@{peer_profile or peer_name} on peer '{peer_name}'"
         return _start_delivery(
-            ["hermes", "peer", "dm", dm_target],
+            [resolved_hermes_cli(), "peer", "dm", dm_target],
             prefix + body,
             label,
             stdin_file=True,
@@ -404,7 +414,7 @@ def message_agent_tool(
             f"Delivery origin session {origin_session_id!r} is not an eligible Bot Chat "
             f"for profile '{resolved}' ({route_reason}); refusing title fallback."
         )
-    route_argv = ["hermes", "-p", resolved]
+    route_argv = [resolved_hermes_cli(), "-p", resolved]
     if exact_session:
         # Top-level --resume reaches the exact session (or its compression
         # continuation), before the chat subcommand can inspect a title.
