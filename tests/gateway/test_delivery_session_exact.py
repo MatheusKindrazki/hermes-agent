@@ -159,6 +159,48 @@ def test_global_environment_and_exit_code_cannot_emit_shadow_receipt(monkeypatch
     assert list((tmp_path / "shadow").glob("*.json")) == []
 
 
+def test_delivery_shadow_receipt_uses_authenticated_identity_source(monkeypatch, tmp_path):
+    identity = _identity()
+    record = {
+        "delivery_id": "delivery-source-1",
+        "origin_session_id": identity["origin_session_id"],
+        "turn_identity": identity,
+    }
+    fence = {"fence_valid": True}
+    spool = tmp_path / "shadow"
+    monkeypatch.setenv("HERMES_KERNEL_SHADOW_PRODUCER_ENABLED", "1")
+    monkeypatch.setenv("HERMES_KERNEL_SHADOW_RECEIPT_DIR", str(spool))
+    monkeypatch.setenv("HERMES_KERNEL_SOURCE", "environment-must-not-win")
+    monkeypatch.setattr(bot_mode_dm, "_revalidate_delivery_identity", lambda _record: fence)
+
+    bot_mode_dm._emit_delivery_shadow_receipt(record, "delivered", ack_bytes="{}")
+
+    persisted = json.loads(next(spool.glob("*.json")).read_text(encoding="utf-8"))
+    assert persisted["source"] == identity["source"]
+
+
+def test_delivery_shadow_receipt_without_identity_source_is_not_published(monkeypatch, tmp_path):
+    identity = _identity()
+    identity.pop("source")
+    record = {
+        "delivery_id": "delivery-source-missing",
+        "origin_session_id": identity["origin_session_id"],
+        "turn_identity": identity,
+    }
+    spool = tmp_path / "shadow"
+    monkeypatch.setenv("HERMES_KERNEL_SHADOW_PRODUCER_ENABLED", "1")
+    monkeypatch.setenv("HERMES_KERNEL_SHADOW_RECEIPT_DIR", str(spool))
+    monkeypatch.setattr(
+        bot_mode_dm,
+        "_revalidate_delivery_identity",
+        lambda _record: {"fence_valid": True},
+    )
+
+    bot_mode_dm._emit_delivery_shadow_receipt(record, "delivered", ack_bytes="{}")
+
+    assert not list(spool.glob("*.json"))
+
+
 def test_structured_ack_not_exit_code_releases_delivery_shadow(monkeypatch, tmp_path):
     dm_file = tmp_path / "payload.txt"
     dm_file.write_text("private message")

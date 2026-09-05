@@ -409,6 +409,78 @@ def test_delivery_runner_preserves_child_failure_and_unlinks(tmp_path):
     assert not dm_file.exists()
 
 
+def test_unknown_toolset_warning_does_not_break_structured_delivery_ack(
+    tmp_path, monkeypatch, capsys
+):
+    import cli
+
+    dm_file = tmp_path / "message.txt"
+    dm_file.write_text("private", encoding="utf-8")
+    identity = {"request_key": "request-quiet-1", "source": "default"}
+    identity_sha = bot_mode_dm._canonical_sha256(identity)
+    monkeypatch.setattr(
+        bot_mode_dm, "_delivery_ledger_path", lambda _key: tmp_path / "ledger.json"
+    )
+    receipt = bot_mode_dm._write_delivery_receipt(
+        str(dm_file),
+        origin_session_id="origin-exact",
+        origin_reason="explicit",
+        route_reason="origin_exact",
+        label="@researcher",
+        idempotency_key="a" * 64,
+        turn_identity=identity,
+        fence={"fence_valid": True},
+    )
+    ack = {
+        "schema": bot_mode_dm.DELIVERY_ACK_SCHEMA,
+        "delivery_id": receipt["delivery_id"],
+        "request_key": identity["request_key"],
+        "turn_identity_sha256": identity_sha,
+        "target_session_id": "target-session",
+        "target_message_id": 42,
+        "adapter": "cli",
+        "state": "persisted",
+        "accepted_at": receipt["accepted_at"],
+        "persisted_at": receipt["accepted_at"] + 1,
+    }
+    payload = {"reply": "ok", "session_id": "target-session", "delivery_ack": ack}
+
+    cli_instance = cli.HermesCLI(toolsets=["a2a"])
+    print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+    startup = capsys.readouterr()
+    session_db = getattr(cli_instance, "_session_db", None)
+    if session_db is not None:
+        session_db.close()
+
+    monkeypatch.setattr(
+        bot_mode_dm,
+        "_revalidate_delivery_identity",
+        lambda _record: {"fence_valid": True, "identity_sha256": identity_sha},
+    )
+    monkeypatch.setattr(
+        bot_mode_dm, "_validate_local_ack_against_destination", lambda *_args: None
+    )
+    monkeypatch.setattr(
+        bot_mode_dm.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=startup.out, stderr=startup.err
+        ),
+    )
+
+    assert (
+        bot_mode_dm._run_delivery(
+            ["hermes", "-p", "researcher", "chat"],
+            str(dm_file),
+            stdin_file=False,
+        )
+        == 0
+    )
+    delivered = capsys.readouterr()
+    assert delivered.out == "ok"
+    assert "Warning: Unknown toolsets: a2a" in delivered.err
+
+
 @pytest.mark.parametrize("args", [[], ["--run-delivery"], ["--run-delivery", "bad", "x"]])
 def test_delivery_main_rejects_invalid_cli(args):
     assert bot_mode_dm._delivery_main(args) == 2
