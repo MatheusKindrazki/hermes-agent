@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import sys
@@ -199,6 +200,153 @@ def test_delivery_shadow_receipt_without_identity_source_is_not_published(monkey
     bot_mode_dm._emit_delivery_shadow_receipt(record, "delivered", ack_bytes="{}")
 
     assert not list(spool.glob("*.json"))
+
+
+def test_real_sender_converges_receiver_ack_sidecar_and_one_shadow_delivery(monkeypatch, tmp_path):
+    """The rollout harness must execute the sender, not stop at receiver ACK."""
+    import cli
+    from hermes_state import SessionDB
+
+    identity = _identity()
+    fence = {
+        "schema_version": "hermes.kernel-turn-fence.v1",
+        "fence_valid": True,
+        "work_id": identity["work_id"],
+        "attempt_id": identity["attempt_id"],
+        "generation": identity["generation"],
+        "identity_sha256": bot_mode_dm._canonical_sha256(identity),
+        "checked_at": 10,
+    }
+    spool = tmp_path / "shadow"
+    ledger = tmp_path / "ledger.json"
+    receiver = SessionDB(tmp_path / "receiver.db")
+    target_session = receiver.create_session("sender-harness-target", "cli")
+    transport_calls = 0
+    issued_acks = []
+
+    monkeypatch.setenv("HERMES_KERNEL_SHADOW_PRODUCER_ENABLED", "1")
+    monkeypatch.setenv("HERMES_KERNEL_SHADOW_RECEIPT_DIR", str(spool))
+    monkeypatch.setattr(bot_mode_dm, "_delivery_ledger_path", lambda _key: ledger)
+    monkeypatch.setattr(bot_mode_dm, "_delivery_lock", lambda *_a, **_k: nullcontext())
+    monkeypatch.setattr(bot_mode_dm, "_revalidate_delivery_identity", lambda _record: fence)
+    monkeypatch.setattr(
+        bot_mode_dm,
+        "_validate_local_ack_against_destination",
+        lambda ack, record, _argv: bot_mode_dm._validate_local_ack_row(receiver, ack, record),
+    )
+
+    def receiver_transport(argv, **_kwargs):
+        nonlocal transport_calls
+        transport_calls += 1
+        query_path = Path(argv[argv.index("--query-file") + 1])
+        message, envelope = cli._decode_delivery_query(query_path.read_text(encoding="utf-8"))
+        assert envelope is not None
+        if cli._delivery_ack(receiver, target_session, envelope, adapter="cli") is None:
+            receiver.append_message(
+                target_session,
+                "user",
+                message,
+                display_kind="bot_delivery",
+                display_metadata=cli._delivery_display_metadata(envelope),
+            )
+        ack = cli._delivery_ack(receiver, target_session, envelope, adapter="cli")
+        assert ack is not None
+        issued_acks.append(dict(ack))
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"reply": "ok", "session_id": target_session, "delivery_ack": ack}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(bot_mode_dm.subprocess, "run", receiver_transport)
+    idempotency_key = "7" * 64
+    first_file = tmp_path / "first.txt"
+    first_file.write_text("internal status", encoding="utf-8")
+    accepted = bot_mode_dm._write_delivery_receipt(
+        str(first_file),
+        origin_session_id=identity["origin_session_id"],
+        origin_reason="explicit",
+        route_reason="origin_exact",
+        label="mini/default",
+        idempotency_key=idempotency_key,
+        turn_identity=identity,
+        fence=fence,
+    )
+
+    assert bot_mode_dm._run_delivery(
+        ["hermes", "-p", "default", "chat"], str(first_file), stdin_file=False
+    ) == 0
+    persisted = json.loads((tmp_path / "first.txt.receipt.json").read_text(encoding="utf-8"))
+    issued_ack = issued_acks[0]
+    assert persisted["adapter_ack"] == issued_ack
+    assert bot_mode_dm._validated_delivery_ack(
+        {"session_id": target_session, "delivery_ack": issued_ack},
+        persisted,
+        expected_adapter="cli",
+    ) == issued_ack
+    assert persisted["state"] == "delivered"
+    assert persisted["adapter_receipt_sha256"] == bot_mode_dm._canonical_sha256(issued_ack)
+
+    events = list(spool.glob("*.json"))
+    assert len(events) == 1
+    event = json.loads(events[0].read_text(encoding="utf-8"))
+    assert event["schema"] == "hermes.kernel-shadow-event/v1"
+    assert event["action"] == "delivery"
+    assert event["source"] == identity["source"]
+    assert event["delivery_id"] == accepted["delivery_id"]
+    assert event["adapter_receipt_sha256"] == hashlib.sha256(
+        bot_mode_dm._canonical(issued_ack).encode("utf-8")
+    ).hexdigest()
+
+    replay_file = tmp_path / "replay.txt"
+    replay_file.write_text("internal status", encoding="utf-8")
+    replay = bot_mode_dm._write_delivery_receipt(
+        str(replay_file),
+        origin_session_id=identity["origin_session_id"],
+        origin_reason="explicit",
+        route_reason="origin_exact",
+        label="mini/default",
+        idempotency_key=idempotency_key,
+        turn_identity=identity,
+        fence=fence,
+    )
+    assert replay["duplicate"] is True
+    assert replay["delivery_id"] == accepted["delivery_id"]
+    assert bot_mode_dm._run_delivery(
+        ["hermes", "-p", "default", "chat"], str(replay_file), stdin_file=False
+    ) == 0
+    replay_sidecar = json.loads(
+        (tmp_path / "replay.txt.receipt.json").read_text(encoding="utf-8")
+    )
+    assert replay_sidecar["delivery_id"] == persisted["delivery_id"]
+    assert issued_acks[1] == issued_ack
+    assert replay_sidecar["adapter_ack"] == issued_ack
+    assert replay_sidecar["adapter_ack"]["target_session_id"] == issued_ack["target_session_id"]
+    assert replay_sidecar["adapter_ack"]["target_message_id"] == issued_ack["target_message_id"]
+    assert len(list(spool.glob("*.json"))) == 1
+    assert transport_calls == 2
+    assert sum(
+        row.get("role") == "user" for row in receiver.get_messages(target_session)
+    ) == 1
+
+    # Receiver persistence alone is deliberately not a shadow producer.
+    isolated_envelope = dict(
+        bot_mode_dm._delivery_envelope_from_record(persisted),
+        delivery_id="receiver-only-delivery",
+    )
+    isolated_session = receiver.create_session("receiver-only", "cli")
+    receiver.append_message(
+        isolated_session,
+        "user",
+        "receiver only",
+        display_kind="bot_delivery",
+        display_metadata=cli._delivery_display_metadata(isolated_envelope),
+    )
+    assert cli._delivery_ack(
+        receiver, isolated_session, isolated_envelope, adapter="cli"
+    )["state"] == "persisted"
+    assert len(list(spool.glob("*.json"))) == 1
+    receiver.close()
 
 
 def test_structured_ack_not_exit_code_releases_delivery_shadow(monkeypatch, tmp_path):
