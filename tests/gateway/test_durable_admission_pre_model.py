@@ -25,10 +25,10 @@ import pytest
 
 from agent import durable_admission
 
-K7_ROOT = Path(
+K7_ROOT = Path(os.environ.get("HERMES_TEST_K7_ROOT",
     "/Users/matheuskindrazki/development/personal/.worktrees/"
     "hermes-personal-os/hermes-kernel-turn-identity-20260904"
-)
+))
 K7_BIN = K7_ROOT / "control" / "kernel" / "admit_cli.py"
 K7_SCHEMA = K7_ROOT / "control" / "schemas" / "work-envelope.schema.json"
 
@@ -519,7 +519,7 @@ def test_turn_identity_rebind_is_rejected(field, value):
 
 @pytest.mark.parametrize("relative", [
     "control/kernel/admit_cli.py", "control/kernel/contracts.py", "control/kernel/admitter.py",
-    "control/kernel/client.py", "control/kernel/inbox.py", "control/kernel/projector.py",
+    "control/kernel/client.py", "control/kernel/native_keychain.py", "control/kernel/inbox.py", "control/kernel/projector.py",
     "control/kernel/store.py", "control/schemas/work-envelope.schema.json",
     "control/schemas/kernel-turn-identity.schema.json",
 ])

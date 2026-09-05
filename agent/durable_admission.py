@@ -107,14 +107,15 @@ TURN_FENCE_SCHEMA_VERSION = "hermes.kernel-turn-fence.v1"
 TURN_IDENTITY_ATTESTATION_VERSION = "hermes-kernel-turn-identity-attestation.v1"
 K7_BUNDLE_SHA256 = {
     "control/kernel/admit_cli.py": TURN_IDENTITY_ADMITTER_SHA256,
-    "control/kernel/contracts.py": "18c9a313003c54c60487e0d3f6cb0f3d7691e6f1c3f049813628718efd444d8f",
-    "control/kernel/admitter.py": "cb6b64774381eb2a85746d48756d885be1d7afc69def1319b30e5a19213558c2",
-    "control/kernel/client.py": "e3bf56cbda28e43dcd6c7860244d00824e51df03e3ecf19dfe49c35e1b393524",
+    "control/kernel/contracts.py": "dc1f7e818fb967a0d7eb8e5ac82e424c957e4623827c1746e692c164f828cc19",
+    "control/kernel/admitter.py": "8061b97b1798722e62e49e34d0dce9ad12fe0b54939d94a8ebe7baabb81ac4c7",
+    "control/kernel/client.py": "3c5398af05db68bd4de99eeba5b8acb2e2f8003710d1ef59998396979d7edbd6",
+    "control/kernel/native_keychain.py": "ae76dbe9e88ecb8a2b7d54595852f3e51a07a36d4009d73aea04cb021ab5c057",
     "control/kernel/inbox.py": "cf906a4f30285958a7aff3d3509eaa6b845c2ac68c5ef8136c8e47f4805df23f",
     "control/kernel/projector.py": "292f64cae244b90b56ec649e58b1487155c3dac5eab4af4f4b91c50a30806315",
     "control/kernel/store.py": "141577fce9456173b981ea33e2414af679fee4d574330040515abb8295c69af1",
     "control/schemas/work-envelope.schema.json": SCHEMA_SHA256,
-    "control/schemas/kernel-turn-identity.schema.json": "020d2b1bf93a19ccdf01e5f2cbd562f6c8b8a8a61fa88905c8131c5bad99329b",
+    "control/schemas/kernel-turn-identity.schema.json": "686ca4d5ef12877ff34b4edb258c92c79b10594359223880d19ea24f339e1a35",
 }
 
 # K7's own gate for its scripted offline transport. Forwarded only when the
@@ -1026,7 +1027,11 @@ def build_envelope(
 # Forwarded by name. PYTHONPATH is deliberately absent: a caller-set one could
 # shadow ``control.kernel`` inside the admitter, letting the thing being gated
 # supply its own gate.
-_ENV_PASSTHROUGH = ("PATH", "HOME", "LANG", "LC_ALL", "TZ", "TMPDIR", "SYSTEMROOT")
+_ENV_PASSTHROUGH = (
+    "PATH", "HOME", "LANG", "LC_ALL", "TZ", "TMPDIR", "SYSTEMROOT",
+    "HERMES_KERNEL_KEYCHAIN_HELPER", "HERMES_KERNEL_KEYCHAIN_HELPER_SHA256",
+    "HERMES_KERNEL_KEYCHAIN_PATH",
+)
 
 
 def _child_env(settings: Mapping[str, Any]) -> Dict[str, str]:
