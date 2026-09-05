@@ -109,7 +109,7 @@ K7_BUNDLE_SHA256 = {
     "control/kernel/admit_cli.py": TURN_IDENTITY_ADMITTER_SHA256,
     "control/kernel/contracts.py": "dc1f7e818fb967a0d7eb8e5ac82e424c957e4623827c1746e692c164f828cc19",
     "control/kernel/admitter.py": "8061b97b1798722e62e49e34d0dce9ad12fe0b54939d94a8ebe7baabb81ac4c7",
-    "control/kernel/client.py": "3c5398af05db68bd4de99eeba5b8acb2e2f8003710d1ef59998396979d7edbd6",
+    "control/kernel/client.py": "c0897f685211fc413f442ae32b62812e2242122dad31652ca71a0482418b28a2",
     "control/kernel/native_keychain.py": "ae76dbe9e88ecb8a2b7d54595852f3e51a07a36d4009d73aea04cb021ab5c057",
     "control/kernel/inbox.py": "cf906a4f30285958a7aff3d3509eaa6b845c2ac68c5ef8136c8e47f4805df23f",
     "control/kernel/projector.py": "292f64cae244b90b56ec649e58b1487155c3dac5eab4af4f4b91c50a30806315",
