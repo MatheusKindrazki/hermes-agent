@@ -533,7 +533,16 @@ def _validate_turn_identity(document: Any) -> Dict[str, Any]:
         raise TurnIdentityError("turn_identity_schema_invalid")
     if not _UUID_RE.fullmatch(str(identity["work_id"])) or not _UUID7_RE.fullmatch(str(identity["attempt_id"])):
         raise TurnIdentityError("turn_identity_work_attempt_invalid")
-    if identity["tenant"] != "personal" or identity["profile"] != "default" or identity["source"] != "default":
+    # The authenticated K7 envelope owns tenant/profile/source.  `default` was
+    # the original single-profile deployment, not a security boundary: keeping
+    # it hard-coded makes an attested Kindra turn impossible to revalidate.
+    # Accept only canonical profile names and require source to equal profile,
+    # so a caller cannot rebind a valid personal identity to another profile.
+    if (
+        identity["tenant"] != "personal"
+        or not _PROFILE_RE.fullmatch(str(identity["profile"]))
+        or identity["source"] != identity["profile"]
+    ):
         raise TurnIdentityError("turn_identity_scope_invalid")
     if identity["authority_source"] != AUTHORITY_REMOTE or not _ROOT_ID_RE.fullmatch(str(identity["authority_root_id"])):
         raise TurnIdentityError("turn_identity_authority_invalid")

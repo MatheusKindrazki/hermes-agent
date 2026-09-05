@@ -426,6 +426,25 @@ def _turn_identity():
     }
 
 
+def test_turn_identity_accepts_authenticated_kindra_profile_source_pair():
+    identity = _turn_identity()
+    identity.update({"profile": "projetospessoais", "source": "projetospessoais"})
+
+    assert durable_admission._validate_turn_identity(identity) == identity
+
+
+@pytest.mark.parametrize("profile,source", [
+    ("projetospessoais", "default"),
+    ("default", "projetospessoais"),
+])
+def test_turn_identity_rejects_profile_source_mismatch(profile, source):
+    identity = _turn_identity()
+    identity.update({"profile": profile, "source": source})
+
+    with pytest.raises(durable_admission.TurnIdentityError, match="scope"):
+        durable_admission._validate_turn_identity(identity)
+
+
 def test_turn_identity_is_bound_to_the_one_shot_carrier_and_revalidated(monkeypatch):
     identity = _turn_identity()
     outcome = durable_admission.AdmissionOutcome(
