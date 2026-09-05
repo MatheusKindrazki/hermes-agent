@@ -782,6 +782,7 @@ def _emit_delivery_shadow_receipt(
         authority_version = identity["authority_version"]
         tenant = identity["tenant"]
         profile = identity["profile"]
+        source = identity["source"]
         attempt_id = identity["attempt_id"]
         lease_epoch = identity["generation"]
         delivery_id = str(record["delivery_id"])
@@ -798,6 +799,7 @@ def _emit_delivery_shadow_receipt(
             "authority_version": authority_version,
             "tenant": tenant,
             "profile": profile,
+            "source": source,
             "origin_session_id": origin,
             "source_event_id": source_event_id,
             "attempt_id": attempt_id,

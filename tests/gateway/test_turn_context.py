@@ -21,19 +21,15 @@ from gateway.session import SessionSource
 from gateway.turn_context import TurnContext
 
 
-def test_kernel_shadow_receipt_is_content_free_atomic_and_private(tmp_path, monkeypatch):
-    from gateway.turn_context import write_kernel_shadow_receipt
-
-    spool = tmp_path / "shadow"
-    monkeypatch.setenv("HERMES_KERNEL_SHADOW_PRODUCER_ENABLED", "1")
-    monkeypatch.setenv("HERMES_KERNEL_SHADOW_RECEIPT_DIR", str(spool))
-    event = {
+def _kernel_shadow_event():
+    return {
         "schema": "hermes.kernel-shadow-event/v1",
         "event_id": "evt-agent-1",
         "work_id": "01a06c45-68ef-7d98-92cb-7225914a3437",
         "authority_version": 7,
         "tenant": "personal",
         "profile": "kindra",
+        "source": "default",
         "origin_session_id": "session-origin",
         "source_event_id": "source-1",
         "attempt_id": "01a06c46-68ef-7d98-92cb-7225914a3437",
@@ -49,12 +45,33 @@ def test_kernel_shadow_receipt_is_content_free_atomic_and_private(tmp_path, monk
         "waiting_for_human": False,
         "terminal": True,
     }
+
+
+def test_kernel_shadow_receipt_is_content_free_atomic_and_private(tmp_path, monkeypatch):
+    from gateway.turn_context import write_kernel_shadow_receipt
+
+    spool = tmp_path / "shadow"
+    monkeypatch.setenv("HERMES_KERNEL_SHADOW_PRODUCER_ENABLED", "1")
+    monkeypatch.setenv("HERMES_KERNEL_SHADOW_RECEIPT_DIR", str(spool))
+    event = _kernel_shadow_event()
     path = write_kernel_shadow_receipt(event)
     assert path is not None
     assert path.parent.stat().st_mode & 0o777 == 0o700
     assert path.stat().st_mode & 0o777 == 0o600
     assert json.loads(path.read_text()) == event
     assert not list(spool.glob("*.tmp.*"))
+
+
+def test_kernel_shadow_receipt_requires_source(tmp_path, monkeypatch):
+    from gateway.turn_context import write_kernel_shadow_receipt
+
+    monkeypatch.setenv("HERMES_KERNEL_SHADOW_PRODUCER_ENABLED", "1")
+    monkeypatch.setenv("HERMES_KERNEL_SHADOW_RECEIPT_DIR", str(tmp_path / "shadow"))
+    event = _kernel_shadow_event()
+    event.pop("source")
+
+    with pytest.raises(ValueError, match="kernel_shadow_event_fields_invalid"):
+        write_kernel_shadow_receipt(event)
 
 
 def test_kernel_shadow_receipt_is_double_default_off_and_rejects_content(tmp_path, monkeypatch):

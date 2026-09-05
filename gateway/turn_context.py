@@ -58,7 +58,7 @@ _REQUEST_CONTEXT: ContextVar[Optional[RequestContext]] = ContextVar(
 KERNEL_SHADOW_SCHEMA = "hermes.kernel-shadow-event/v1"
 KERNEL_SHADOW_FIELDS = frozenset({
     "schema", "event_id", "work_id", "authority_version", "tenant", "profile",
-    "origin_session_id", "source_event_id", "attempt_id", "lease_epoch", "action",
+    "source", "origin_session_id", "source_event_id", "attempt_id", "lease_epoch", "action",
     "delivery_id", "question_id", "outcome", "adapter_receipt_sha256", "observed_at",
     "fence_valid", "material", "waiting_for_human", "terminal",
 })
@@ -73,7 +73,7 @@ def _validate_kernel_shadow_event(event: dict[str, Any]) -> None:
     if event["schema"] != KERNEL_SHADOW_SCHEMA:
         raise ValueError("kernel_shadow_event_schema_invalid")
     for field_name in (
-        "event_id", "work_id", "tenant", "profile", "origin_session_id",
+        "event_id", "work_id", "tenant", "profile", "source", "origin_session_id",
         "source_event_id", "attempt_id", "action", "outcome",
     ):
         if not isinstance(event[field_name], str) or _SHADOW_ID.fullmatch(event[field_name]) is None:
