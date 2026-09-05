@@ -5484,7 +5484,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             mcp_names = set((CLI_CONFIG.get("mcp_servers") or {}).keys())
             invalid = [t for t in toolsets if not validate_toolset(t) and t not in mcp_names]
             if invalid:
-                self._console_print(f"[bold red]Warning: Unknown toolsets: {', '.join(invalid)}[/]")
+                print(f"Warning: Unknown toolsets: {', '.join(invalid)}", file=sys.stderr)
         
         # Filesystem checkpoints: CLI flag > config
         cp_cfg = CLI_CONFIG.get("checkpoints", {})
