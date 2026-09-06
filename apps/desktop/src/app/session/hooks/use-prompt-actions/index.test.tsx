@@ -2210,7 +2210,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
     // null so the session.resume recovery path is skipped and the error surfaces.
     let attempt = 0
 
-    const requestGateway = vi.fn(async (method: string) => {
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>, timeoutMs?: number) => {
       if (method === 'prompt.submit') {
         attempt += 1
 
