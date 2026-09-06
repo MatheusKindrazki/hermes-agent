@@ -689,6 +689,8 @@ export function visibleUserIndexAtOrdinal(messages: readonly ChatMessage[], targ
 }
 
 export interface SubmitTextOptions {
+  /** Stable UUID4 allocated for this logical input, including persisted queues. */
+  sourceEventId?: string
   attachments?: ComposerAttachment[]
   /** The composer scope key that was actually loaded when this text was
    *  submitted (see use-composer-draft's activeQueueSessionKeyRef). Compared

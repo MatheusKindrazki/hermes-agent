@@ -9,6 +9,7 @@ import { resetBrowseState } from '@/store/composer-input-history'
 import {
   $parkedQueueSessions,
   $queuedPromptsBySession,
+  canDispatchQueuedPrompt,
   enqueueQueuedPrompt,
   getQueuedPrompts,
   isSteerableEntry,
@@ -208,7 +209,7 @@ export function useComposerQueue({
       const drainRuntimeSessionId = sessionId ?? null
       const entry = pickEntry(getQueuedPrompts(drainQueueSessionKey))
 
-      if (!entry) {
+      if (!entry || !canDispatchQueuedPrompt(entry)) {
         return false
       }
 
@@ -220,6 +221,7 @@ export function useComposerQueue({
             attachments: entry.attachments,
             ...(entry.displayText ? { displayText: entry.displayText } : {}),
             fromQueue: true,
+            sourceEventId: entry.id,
             sessionId: drainRuntimeSessionId,
             storedSessionId: drainQueueSessionKey
           })

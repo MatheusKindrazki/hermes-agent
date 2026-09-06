@@ -105,6 +105,47 @@ def test_observation_writer_reserves_once_and_latches_first_failure(tmp_path, mo
     assert writer.broken is True
 
 
+def test_observation_channel_rejects_a_second_live_writer(tmp_path):
+    root = tmp_path / "channel-owner"
+    first = durable_admission.ObservationWriter(root, code_sha="a" * 40)
+    second = durable_admission.ObservationWriter(root, code_sha="a" * 40)
+    first.checkpoint()
+    before = (root / "observation-channel.json").read_bytes()
+    try:
+        with pytest.raises(BlockingIOError):
+            second.checkpoint()
+        assert (root / "observation-channel.json").read_bytes() == before
+    finally:
+        first.checkpoint(stopped=True)
+
+
+def test_observation_channel_lock_excludes_another_process(tmp_path):
+    import sys
+    root = tmp_path / "process-channel"
+    first = durable_admission.ObservationWriter(root, code_sha="a" * 40)
+    first.checkpoint()
+    before = (root / "observation-channel.json").read_bytes()
+    code = """
+import sys
+from pathlib import Path
+from agent.durable_admission import ObservationWriter
+writer = ObservationWriter(Path(sys.argv[1]), code_sha='a' * 40)
+try:
+    writer.checkpoint()
+except BlockingIOError:
+    sys.exit(73)
+writer.checkpoint(stopped=True)
+"""
+    try:
+        refused = subprocess.run([sys.executable, "-c", code, str(root)], capture_output=True, timeout=15)
+        assert refused.returncode == 73 and refused.stdout == b""
+        assert (root / "observation-channel.json").read_bytes() == before
+    finally:
+        first.checkpoint(stopped=True)
+    successor = subprocess.run([sys.executable, "-c", code, str(root)], capture_output=True, timeout=15)
+    assert successor.returncode == 0 and successor.stdout == b""
+
+
 def test_observation_sequence_across_boots_and_concurrent_reservations(tmp_path, monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
     monkeypatch.setenv(durable_admission.ENV_MODE, "observe")

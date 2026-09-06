@@ -7,6 +7,7 @@
  */
 
 import { host } from '@hermes/plugin-sdk'
+import { createPromptSourceEventId } from '@/lib/prompt-source-event'
 
 import { recordGroupActivity } from './group-activity'
 import { $groupChats, $groupClarify, $groupNeedsYou, appendGroupChatEntry, updateGroupChat } from './group-chat'
@@ -306,8 +307,10 @@ async function submitGroupTurnPrompt(
   stored: null | string | true | undefined,
   text: string
 ): Promise<string> {
+  const sourceEventId = createPromptSourceEventId()
   try {
     await requestForBot(member, 'prompt.submit', {
+      source_event_id: sourceEventId,
       session_id: runtime,
       text
     })
@@ -331,6 +334,7 @@ async function submitGroupTurnPrompt(
     }
 
     await requestForBot(member, 'prompt.submit', {
+      source_event_id: sourceEventId,
       session_id: fresh,
       text
     })

@@ -212,6 +212,9 @@ describe('session-gone classification', () => {
     expect(reply).toBe('recovered reply')
     // One failed submit + exactly one retry — never more.
     expect(room.gateway.rpcFor('prompt.submit')).toHaveLength(2)
+    const submissions = room.gateway.rpcFor('prompt.submit')
+    expect(submissions[0].params.source_event_id).toMatch(/^[0-9a-f-]{36}$/)
+    expect(submissions[1].params.source_event_id).toBe(submissions[0].params.source_event_id)
     // The recovery re-resumed the durable stored id, not the dead runtime id.
     expect(room.chat.$groupChats.get().Room.sessions?.helper).toBeTruthy()
   })

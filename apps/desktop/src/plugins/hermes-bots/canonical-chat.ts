@@ -416,10 +416,12 @@ export function createCanonicalChat(
       const submitIntro = kickoff || !titled
 
       if (submitIntro) {
+        const sourceEventId = crypto.randomUUID()
         await new Promise(resolve => window.setTimeout(resolve, 400))
 
         try {
           await requestForBot(bot, 'prompt.submit', {
+            source_event_id: sourceEventId,
             session_id: runtime,
             text: kickoffText()
           })

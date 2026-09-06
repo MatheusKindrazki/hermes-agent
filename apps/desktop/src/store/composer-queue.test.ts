@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ComposerAttachment } from './composer'
 import {
@@ -46,6 +46,20 @@ describe('composer queue store', () => {
     expect(dequeueQueuedPrompt(SESSION_KEY)).toBeNull()
   })
 
+  it('persists distinct UUID4 identities for equal inputs across edits and moves', () => {
+    const first = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'same' })!
+    const second = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'same' })!
+    expect(first.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+    expect(second.id).not.toBe(first.id)
+    updateQueuedPromptText(SESSION_KEY, first.id, 'edited')
+    promoteQueuedPrompt(SESSION_KEY, second.id)
+    parkQueuedPrompts(SESSION_KEY)
+    migrateQueuedPrompts(SESSION_KEY, 'resumed-key')
+    expect(getQueuedPrompts('resumed-key').map(entry => entry.id)).toEqual([second.id, first.id])
+    expect(dequeueQueuedPrompt('resumed-key')?.id).toBe(second.id)
+    expect(JSON.parse(window.localStorage.getItem(QUEUE_STORAGE_KEY)!)['resumed-key'][0].id).toBe(first.id)
+  })
+
   it('clones attachments when queueing', () => {
     const source = [attachment('a-1')]
     const queued = enqueueQueuedPrompt(SESSION_KEY, { attachments: source, text: 'check clones' })
@@ -53,6 +67,47 @@ describe('composer queue store', () => {
     expect(queued).not.toBeNull()
     expect(getQueuedPrompts(SESSION_KEY)[0]?.attachments[0]).toEqual(source[0])
     expect(getQueuedPrompts(SESSION_KEY)[0]?.attachments[0]).not.toBe(source[0])
+  })
+
+  it('migrates legacy queue identities once and preserves every entry field across reload', async () => {
+    const legacy = [
+      { id: 'queued-old-1', text: 'same', displayText: 'display', attachments: [attachment('a')], queuedAt: 10 },
+      { id: 'queued-old-2', text: 'same', attachments: [], queuedAt: 11 }
+    ]
+    window.localStorage.setItem(QUEUE_STORAGE_KEY, JSON.stringify({ [SESSION_KEY]: legacy }))
+    vi.resetModules()
+    const loaded = await import('./composer-queue')
+    const migrated = loaded.getQueuedPrompts(SESSION_KEY)
+    expect(migrated).toHaveLength(2)
+    expect(migrated[0].id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+    expect(migrated[1].id).not.toBe(migrated[0].id)
+    expect(migrated.map(({ id, ...rest }) => rest)).toEqual(legacy.map(({ id, ...rest }) => rest))
+    expect(JSON.parse(window.localStorage.getItem(QUEUE_STORAGE_KEY)!)[SESSION_KEY]).toEqual(migrated)
+    vi.resetModules()
+    const reloaded = await import('./composer-queue')
+    expect(reloaded.getQueuedPrompts(SESSION_KEY)).toEqual(migrated)
+  })
+
+  it('retains duplicate valid IDs without dispatch when migration cannot be persisted', async () => {
+    const id = '11111111-1111-4111-8111-111111111111'
+    const entries = [
+      { id, text: 'one', attachments: [], queuedAt: 10 },
+      { id, text: 'two', attachments: [], queuedAt: 11 }
+    ]
+    const before = JSON.stringify({ [SESSION_KEY]: entries })
+    window.localStorage.setItem(QUEUE_STORAGE_KEY, before)
+    const failure = vi.spyOn(window.localStorage, 'setItem').mockImplementation(() => {
+      throw new Error('fixture quota')
+    })
+    try {
+      vi.resetModules()
+      const loaded = await import('./composer-queue')
+      expect(loaded.getQueuedPrompts(SESSION_KEY)).toEqual(entries)
+      expect(window.localStorage.getItem(QUEUE_STORAGE_KEY)).toBe(before)
+      expect(loaded.getQueuedPrompts(SESSION_KEY).map(loaded.canDispatchQueuedPrompt)).toEqual([false, false])
+    } finally {
+      failure.mockRestore()
+    }
   })
 
   it('updates and removes queued entries by id', () => {

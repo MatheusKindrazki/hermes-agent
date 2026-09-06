@@ -390,6 +390,8 @@ def _eager_reconcile_own_session_db() -> None:
 
 @asynccontextmanager
 async def _lifespan(app: "FastAPI"):
+    from agent.durable_admission import start_observation_heartbeat, stop_observation_heartbeat
+    start_observation_heartbeat()
     app.state.event_channels = {}  # dict[str, set]
     app.state.event_lock = asyncio.Lock()
     app.state.pty_active_session_files = {}  # dict[str, Path]
@@ -479,6 +481,7 @@ async def _lifespan(app: "FastAPI"):
     finally:
         if cron_stop is not None:
             cron_stop.set()
+        stop_observation_heartbeat()
         pty_reaper_task.cancel()
         selftest_task.cancel()
         auto_archive_task.cancel()
@@ -17762,7 +17765,8 @@ async def gateway_ws(ws: WebSocket) -> None:
         await ws.close(code=4403)
         return
 
-    if not _ws_auth_ok(ws):
+    auth_reason, auth_method = _ws_auth_reason(ws)
+    if auth_reason is not None:
         await ws.close(code=4401)
         return
 
@@ -17779,6 +17783,7 @@ async def gateway_ws(ws: WebSocket) -> None:
     await handle_ws(
         ws,
         auth_identity=getattr(ws, "_hermes_auth_identity", None),
+        auth_method=auth_method,
         subprotocol=getattr(ws, "_hermes_ws_subprotocol", None),
     )
 

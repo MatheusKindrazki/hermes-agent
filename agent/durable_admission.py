@@ -170,6 +170,30 @@ class ObservationWriter:
         self.broken = False
         self.stopped = False
         self._mutex = threading.RLock()
+        self._channel_fd = None
+
+    def _claim_channel(self):
+        """One live process/class owns a checkpoint stream until stopped."""
+        import fcntl
+
+        if self._channel_fd is not None:
+            return
+        fd = os.open(self.root / ".observation-channel-owner", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600):
+                raise OSError("observation owner unsafe")
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._channel_fd = fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def __del__(self):
+        if getattr(self, "_channel_fd", None) is not None:
+            os.close(self._channel_fd)
+            self._channel_fd = None
 
     @contextmanager
     def _locked(self):
@@ -242,6 +266,7 @@ class ObservationWriter:
         now = int(time.time()) if now is None else now
         self.stopped = self.stopped or stopped
         with self._locked():
+            self._claim_channel()
             previous = self._read(self.root / "observation-channel.json") or {}
             records = [self._read(path) for path in (self.root / "observation-effects").glob("*.json")]
             last = max((r["sequence"] for r in records if r and r["boot_id"] == self.boot_id), default=0)
@@ -252,6 +277,9 @@ class ObservationWriter:
                 "state": "broken" if self.broken else "stopped" if self.stopped else "healthy" if previous.get("boot_id") == self.boot_id else "starting",
                 "checked_at": now, "valid_until": now + 120, "last_effect_sequence": last,
             })
+            if self.stopped:
+                os.close(self._channel_fd)
+                self._channel_fd = None
 
     def reserve(self, origin: EffectOrigin, destination: str, content: str, *, now: Optional[int] = None, include_created=False):
         with effect_origin_scope(origin):
@@ -318,7 +346,17 @@ class ObservationWriter:
 _OBSERVER: Optional[ObservationWriter] = None
 
 
+_OBSERVER_START_LOCK = threading.RLock()
+_OBSERVER_HEARTBEAT = None
+_OBSERVER_STOP = threading.Event()
+
+
 def start_observation() -> Optional[ObservationWriter]:
+    with _OBSERVER_START_LOCK:
+        return _start_observation_locked()
+
+
+def _start_observation_locked() -> Optional[ObservationWriter]:
     global _OBSERVER
     if not observation_enabled():
         return None
@@ -328,13 +366,78 @@ def start_observation() -> Optional[ObservationWriter]:
         configured = (_settings().get("observation") or {}).get("code_sha")
         if code_sha != configured:
             raise ValueError("observation code pin mismatch")
-        _OBSERVER = ObservationWriter(Path(os.environ.get("HERMES_KERNEL_SHADOW_RECEIPT_DIR", "")), code_sha=code_sha)
-        _OBSERVER.checkpoint()
+        root = Path(os.environ.get("HERMES_KERNEL_SHADOW_RECEIPT_DIR", ""))
+        if _OBSERVER is not None:
+            if _OBSERVER.root != root or _OBSERVER.code_sha != code_sha or _OBSERVER.stopped:
+                raise ValueError("observation owner cannot be rebound")
+            return _OBSERVER
+        candidate = ObservationWriter(root, code_sha=code_sha)
+        candidate.checkpoint()
+        _OBSERVER = candidate
     except Exception:
         logger.error("observation startup unavailable; checkpoint must expire", exc_info=False)
         if _OBSERVER is not None:
             _OBSERVER.broken = True
     return _OBSERVER
+
+
+def start_observation_heartbeat():
+    """Serve's idle-independent writer, pinned to the effective home context."""
+    global _OBSERVER_HEARTBEAT
+    with _OBSERVER_START_LOCK:
+        writer = start_observation()
+        if writer is None or writer.broken or _OBSERVER_HEARTBEAT is not None:
+            return writer
+        context = contextvars.copy_context()
+        def heartbeat():
+            while not _OBSERVER_STOP.wait(30):
+                observation_checkpoint()
+        _OBSERVER_HEARTBEAT = threading.Thread(
+            target=lambda: context.run(heartbeat), daemon=True, name="kernel-observation",
+        )
+        _OBSERVER_HEARTBEAT.start()
+        return writer
+
+
+def stop_observation_heartbeat():
+    _OBSERVER_STOP.set()
+    thread = _OBSERVER_HEARTBEAT
+    if thread is not None:
+        thread.join()
+        observation_checkpoint(stopped=True)
+
+
+def bind_native_prompt_source(session_id: str, source_event_id: str, text: str) -> bool:
+    """Bind authenticated input identity to content without storing its payload.
+
+    Called under the session's effective home. The ID is supplied by the
+    authenticated ingress, never generated here or inferred from the text.
+    """
+    if not observation_enabled() or not isinstance(text, str):
+        return False
+    writer = start_observation_heartbeat()
+    if writer is None or writer.broken or writer.stopped:
+        return False
+    try:
+        source = uuid.UUID(source_event_id)
+        if source.version != 4 or str(source) != source_event_id:
+            return False
+        if not _SESSION_ID_RE.fullmatch(session_id):
+            return False
+        binding = _digest("native-prompt.v1", session_id, source_event_id)
+        document = {"schema": "hermes.native-prompt-binding/v1", "binding": binding,
+                    "content_sha256": content_sha256(text)}
+        with writer._locked():
+            path = writer.root / (".native-prompt-" + binding + ".json")
+            previous = writer._read(path)
+            if previous is not None and previous != document:
+                raise ValueError("native source conflict")
+            if previous is None:
+                writer._write(path, document)
+        return True
+    except Exception:
+        observation_gap(None, "native_source_conflict_or_storage_failed")
+        return False
 
 
 def observation_checkpoint(*, stopped=False):

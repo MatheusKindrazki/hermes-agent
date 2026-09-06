@@ -1,6 +1,7 @@
 import { atom } from 'nanostores'
 
 import { SLASH_COMMAND_RE } from '@/lib/chat-runtime'
+import { createPromptSourceEventId, isPromptSourceEventId } from '@/lib/prompt-source-event'
 
 import type { ComposerAttachment } from './composer'
 
@@ -27,6 +28,7 @@ export const isSteerableEntry = (entry: Pick<QueuedPromptEntry, 'attachments' | 
 type QueueState = Record<string, QueuedPromptEntry[]>
 
 const STORAGE_KEY = 'hermes.desktop.composerQueue.v1'
+const uncommittedIdentityIds = new Set<string>()
 
 const load = (): QueueState => {
   if (typeof window === 'undefined') {
@@ -37,7 +39,52 @@ const load = (): QueueState => {
     const raw = window.localStorage.getItem(STORAGE_KEY)
     const parsed = raw ? JSON.parse(raw) : null
 
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as QueueState) : {}
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return {}
+    }
+
+    const seen = new Set<string>()
+    const replacedIds = new Set<string>()
+    let changed = false
+    const migrated = Object.fromEntries(
+      Object.entries(parsed).map(([key, queue]) => [
+        key,
+        Array.isArray(queue)
+          ? queue.map(entry => {
+              if (!entry || typeof entry !== 'object') {
+                return entry
+              }
+
+              if (isPromptSourceEventId(entry.id) && !seen.has(entry.id)) {
+                seen.add(entry.id)
+                return entry
+              }
+
+              const id = createPromptSourceEventId()
+              replacedIds.add(entry.id)
+              seen.add(id)
+              changed = true
+              return { ...entry, id }
+            })
+          : queue
+      ])
+    ) as QueueState
+
+    if (changed) {
+      try {
+        // Persist before exposing the migrated identities to either drain.
+        window.localStorage.setItem(STORAGE_KEY, JSON.stringify(migrated))
+      } catch {
+        // Keep every old entry visible. Drains refuse invalid legacy IDs;
+        // an unpersisted UUID must not become a new identity on every reload.
+        for (const id of replacedIds) {
+          uncommittedIdentityIds.add(id)
+        }
+        return parsed as QueueState
+      }
+    }
+
+    return migrated
   } catch {
     return {}
   }
@@ -60,6 +107,10 @@ const save = (state: QueueState) => {
 }
 
 export const $queuedPromptsBySession = atom<QueueState>(load())
+
+/** A migrated identity is usable only after its persistent write succeeds. */
+export const canDispatchQueuedPrompt = (entry: QueuedPromptEntry): boolean =>
+  isPromptSourceEventId(entry.id) && !uncommittedIdentityIds.has(entry.id)
 
 /**
  * Sessions whose queue the user explicitly halted (Stop button / Esc). A parked
@@ -113,7 +164,7 @@ const sidOf = (key: string | null | undefined): null | string => {
 
 const queueFor = (sid: string) => $queuedPromptsBySession.get()[sid] ?? []
 
-const nextId = () => `queued-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+const nextId = createPromptSourceEventId
 
 const cloneAttachments = (attachments: ComposerAttachment[]) => attachments.map(a => ({ ...a }))
 

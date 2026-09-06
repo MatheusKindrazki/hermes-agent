@@ -373,4 +373,9 @@ def test_failed_agent_build_leaves_marker_for_retry(
 
 # ── End to end: continuation runs a real turn and clears the marker ────
 
+def test_native_source_identity_survives_marker_without_text_inference(tmp_path):
+    from tui_gateway.turn_marker import record_turn_start, read_turn_marker
+    source = "11111111-1111-4111-8111-111111111111"
+    record_turn_start(tmp_path, "native-session", "input", source_event_id=source)
+    assert read_turn_marker(tmp_path, "native-session")["source_event_id"] == source
 

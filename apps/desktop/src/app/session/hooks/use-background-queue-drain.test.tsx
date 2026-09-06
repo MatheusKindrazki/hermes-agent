@@ -87,6 +87,7 @@ describe('useBackgroundQueueDrain', () => {
       expect(submitText).toHaveBeenCalledWith('continue in the background', {
         attachments: [],
         fromQueue: true,
+        sourceEventId: expect.stringMatching(/^[0-9a-f-]{36}$/),
         sessionId: 'rt-session-a',
         storedSessionId: 'stored-session-a'
       })
@@ -191,6 +192,7 @@ describe('useBackgroundQueueDrain', () => {
       expect(submitText).toHaveBeenCalledWith('resume then send', {
         attachments: [],
         fromQueue: true,
+        sourceEventId: expect.stringMatching(/^[0-9a-f-]{36}$/),
         sessionId: null,
         storedSessionId: 'stored-session-a'
       })
@@ -203,7 +205,7 @@ describe('useBackgroundQueueDrain', () => {
     const runtimeMap = { current: new Map([['stored-session-a', 'rt-session-a']]) }
     const submitText = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true)
 
-    enqueueQueuedPrompt('stored-session-a', { text: 'retry me', attachments: [] })
+    const entry = enqueueQueuedPrompt('stored-session-a', { text: 'retry me', attachments: [] })!
 
     render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
 
@@ -220,6 +222,7 @@ describe('useBackgroundQueueDrain', () => {
     })
 
     expect(submitText).toHaveBeenCalledTimes(2)
+    expect(submitText.mock.calls.map(call => call[1].sourceEventId)).toEqual([entry.id, entry.id])
     expect(getQueuedPrompts('stored-session-a')).toHaveLength(0)
   })
 })

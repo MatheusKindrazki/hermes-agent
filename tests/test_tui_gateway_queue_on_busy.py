@@ -39,6 +39,15 @@ def test_enqueue_pins_text_and_transport():
     assert session["queued_prompt"] == {"text": "hello", "transport": "ws-1"}
 
 
+def test_observed_inputs_of_same_text_keep_distinct_fifo_envelopes():
+    session = _session()
+    server._enqueue_prompt(session, "same", None, source_event_id="11111111-1111-4111-8111-111111111111")
+    server._enqueue_prompt(session, "same", None, source_event_id="22222222-2222-4222-8222-222222222222")
+    assert session["queued_prompt"]["source_event_id"] == "11111111-1111-4111-8111-111111111111"
+    assert session["queued_prompts"][0]["source_event_id"] == "22222222-2222-4222-8222-222222222222"
+    assert session["queued_prompt"]["text"] == session["queued_prompts"][0]["text"] == "same"
+
+
 def test_enqueue_preserves_order_after_an_image_turn():
     session = _session()
     server._enqueue_prompt(session, "B", "ws-1")
@@ -779,4 +788,3 @@ def test_drain_continues_with_later_queued_prompt_after_dispatch_failure(monkeyp
     assert calls == ["broken", "next"]
     assert session["queued_prompt"] is None
     assert session.get("queued_prompts") is None
-

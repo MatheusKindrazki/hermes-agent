@@ -9687,7 +9687,8 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
                 {"kind": "process", "text": "Resuming interrupted turn…"},
             )
             _emit("message.start", sid)
-            _run_prompt_submit(rid, sid, session, text, display_kind="auto_continue")
+            _run_prompt_submit(rid, sid, session, text, display_kind="auto_continue",
+                               **({"source_event_id": marker["source_event_id"]} if marker.get("source_event_id") else {}))
         except Exception as exc:
             print(
                 f"[tui_gateway] auto-continue dispatch failed: "
@@ -9712,6 +9713,8 @@ def _enqueue_prompt(
     text: Any,
     transport: Any,
     image_paths: list[str] | None = None,
+    source_event_id: str | None = None,
+    observe_input: bool = False,
 ) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
@@ -9723,6 +9726,21 @@ def _enqueue_prompt(
     sent it even if the session transport is rebound meanwhile.
     """
     image_paths = list(image_paths or [])
+    if source_event_id is not None or observe_input:
+        entry = {"text": text, "transport": transport, "observation_isolated": True}
+        if source_event_id is not None:
+            entry["source_event_id"] = source_event_id
+        if image_paths:
+            entry["image_paths"] = image_paths
+        existing = session.get("queued_prompt")
+        envelopes = ([existing] if existing else []) + list(session.get("queued_prompts") or [])
+        if source_event_id and any(item.get("source_event_id") == source_event_id for item in envelopes):
+            return
+        if existing:
+            session.setdefault("queued_prompts", []).append(entry)
+        else:
+            session["queued_prompt"] = entry
+        return
     # #84417: scrub any live-turn self-duplicates first so the consecutive-text
     # merge below cannot glue "{original}\\n\\n{later}" and re-fire original
     # on drain after a later correction settles.
@@ -9772,7 +9790,7 @@ def _sanitize_queued_entry_vs_inflight_user(
     """
     if not original or not isinstance(entry, dict):
         return entry if isinstance(entry, dict) else None
-    if entry.get("image_paths"):
+    if entry.get("image_paths") or entry.get("source_event_id") or entry.get("observation_isolated"):
         return entry
     text = entry.get("text")
     if not isinstance(text, str):
@@ -9870,7 +9888,9 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
 
 
 def _handle_busy_submit(
-    rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False
+    rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False,
+    source_event_id: str | None = None,
+    observe_input: bool = False,
 ) -> dict | None:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
@@ -9891,7 +9911,7 @@ def _handle_busy_submit(
     unwinding the turn) redirected the live turn with next-turn text — queue
     semantics betrayed by a millisecond race the user can't see.
     """
-    mode = "queue" if queued else _load_busy_input_mode()
+    mode = "queue" if queued or source_event_id is not None or observe_input else _load_busy_input_mode()
     agent = session.get("agent")
     with session["history_lock"]:
         if not session.get("running"):
@@ -9948,7 +9968,9 @@ def _handle_busy_submit(
             if image_paths:
                 session["attached_images"] = image_paths + list(session.get("attached_images", []))
             return None
-        _enqueue_prompt(session, text, transport, image_paths=image_paths)
+        _enqueue_prompt(session, text, transport, image_paths=image_paths,
+                        **({"source_event_id": source_event_id} if source_event_id is not None else {}),
+                        **({"observe_input": True} if observe_input else {}))
         session["last_active"] = time.time()
 
     # Attachments need a separate model invocation. Queue them without
@@ -10040,6 +10062,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     queued["text"],
                     image_paths=queued["image_paths"],
                     queued_prompt_generation=queue_generation,
+                    **({"source_event_id": queued["source_event_id"]} if queued.get("source_event_id") else {}),
                 )
             else:
                 _run_prompt_submit(
@@ -10048,6 +10071,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     session,
                     queued["text"],
                     queued_prompt_generation=queue_generation,
+                    **({"source_event_id": queued["source_event_id"]} if queued.get("source_event_id") else {}),
                 )
     except Exception as exc:
         print(
@@ -12406,6 +12430,7 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    source_event_id: str | None = None,
 ) -> bool:
     with session["history_lock"]:
         if session.get("_closing"):
@@ -12488,7 +12513,8 @@ def _run_prompt_submit(
         marker_attempt = int(session.pop("_auto_continue_attempt", 0) or 0)
         marker_text = session.pop("_auto_continue_prompt", None) or text
         if isinstance(marker_text, str) and marker_text.strip():
-            record_turn_start(marker_home, marker_key, marker_text, attempts=marker_attempt)
+            record_turn_start(marker_home, marker_key, marker_text, attempts=marker_attempt,
+                              **({"source_event_id": source_event_id} if source_event_id else {}))
         try:
             from tools.approval import (
                 reset_current_session_key,
@@ -12504,6 +12530,8 @@ def _run_prompt_submit(
             if _profile_home_str:
                 home_token = set_hermes_home_override(_profile_home_str)
                 secret_token = set_secret_scope(build_profile_secret_scope(Path(_profile_home_str)))
+            from agent.durable_admission import start_observation_heartbeat
+            start_observation_heartbeat()
             # The sudo password callback is thread-local (tools.terminal_tool
             # _callback_tls), so wiring it on the build thread doesn't reach this
             # turn thread — terminal sudo prompts would fall through to /dev/tty
@@ -12749,7 +12777,12 @@ def _run_prompt_submit(
             )
             _usage_stop, _usage_thread = _start_usage_ticker(sid, agent)
             try:
-                result = agent.run_conversation(run_message, **run_kwargs)
+                from agent.durable_admission import capture_effect_origin, effect_origin_scope, execution_event_id, bind_native_prompt_source
+                origin = capture_effect_origin(
+                    session["session_key"], execution_event_id(marker_key, {"source_event_id": source_event_id, "surface": "desktop"})
+                ) if source_event_id and bind_native_prompt_source(marker_key, source_event_id, marker_text) else None
+                with effect_origin_scope(origin):
+                    result = agent.run_conversation(run_message, **run_kwargs)
             finally:
                 # Stop AND join before anything below emits: an in-flight tick
                 # surviving past message.complete would roll the client's final

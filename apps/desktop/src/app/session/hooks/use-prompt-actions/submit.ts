@@ -6,6 +6,7 @@ import { type ChatMessage, textPart } from '@/lib/chat-messages'
 import { optimisticAttachmentRef } from '@/lib/chat-runtime'
 import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
 import { setMutableRef } from '@/lib/mutable-ref'
+import { createPromptSourceEventId, isPromptSourceEventId } from '@/lib/prompt-source-event'
 import {
   isVoicePlaybackActive,
   markVoicePlaybackInterrupted,
@@ -120,6 +121,9 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
   return useCallback(
     async (rawText: string, options?: SubmitTextOptions) => {
+      const sourceEventId = isPromptSourceEventId(options?.sourceEventId)
+        ? options.sourceEventId
+        : createPromptSourceEventId()
       const visibleText = sanitizeComposerInput(rawText).trim()
       const usingComposerAttachments = !options?.attachments
 
@@ -754,6 +758,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         const text = buildContextText(syncedAttachments)
 
         const submitParams = (targetId: string) => ({
+          source_event_id: sourceEventId,
           session_id: targetId,
           text,
           ...(interrupted && { interrupted }),

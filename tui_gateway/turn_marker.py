@@ -26,6 +26,7 @@ import os
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -95,7 +96,8 @@ def _store(path: Path, entries: dict[str, dict]) -> None:
 
 
 def record_turn_start(
-    home: Path | str, session_key: str, prompt: str, *, attempts: int = 0
+    home: Path | str, session_key: str, prompt: str, *, attempts: int = 0,
+    source_event_id: str | None = None,
 ) -> None:
     """Persist the marker for a turn that is about to run.
 
@@ -111,6 +113,8 @@ def record_turn_start(
         "prompt": prompt[:_MAX_PROMPT_CHARS],
         "started_at": now,
     }
+    if _valid_source_event_id(source_event_id):
+        entry["source_event_id"] = source_event_id
     try:
         with _lock:
             path = _marker_path(home)
@@ -137,6 +141,14 @@ def clear_turn_marker(home: Path | str, session_key: str) -> None:
         logger.debug("failed to clear turn marker for %s", session_key, exc_info=True)
 
 
+def _valid_source_event_id(value):
+    try:
+        parsed = uuid.UUID(value) if isinstance(value, str) else None
+        return parsed is not None and parsed.version == 4 and str(parsed) == value
+    except ValueError:
+        return False
+
+
 def read_turn_marker(home: Path | str, session_key: str) -> dict[str, Any] | None:
     """The marker left by a turn that never concluded, or None."""
     if not session_key:
@@ -156,4 +168,7 @@ def read_turn_marker(home: Path | str, session_key: str) -> dict[str, Any] | Non
         attempts = max(0, int(entry.get("attempts") or 0))
     except (TypeError, ValueError):
         return None
-    return {"attempts": attempts, "prompt": prompt, "started_at": started_at}
+    result = {"attempts": attempts, "prompt": prompt, "started_at": started_at}
+    if _valid_source_event_id(entry.get("source_event_id")):
+        result["source_event_id"] = entry["source_event_id"]
+    return result

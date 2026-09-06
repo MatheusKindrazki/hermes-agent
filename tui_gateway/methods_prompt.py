@@ -357,6 +357,31 @@ def _(rid, params: dict) -> dict:
         )
     isolation_cfg = _load_dashboard_process_isolation_config()
     turn_isolation = _session_uses_compute_host(session, isolation_cfg)
+    # Only the server-authenticated WS upgrade can promote this carrier.
+    # Neither params.source/profile nor a stdio/internal transport is proof.
+    from tui_gateway.ws import WSTransport
+    import uuid
+    source_event_id = None
+    request_transport = current_transport()
+    candidate = params.get("source_event_id")
+    if isinstance(request_transport, WSTransport) and request_transport.native_prompt_authenticated:
+        try:
+            parsed = uuid.UUID(candidate) if isinstance(candidate, str) else None
+            if parsed and parsed.version == 4 and str(parsed) == candidate:
+                source_event_id = candidate
+        except ValueError:
+            pass
+    from agent.durable_admission import observation_enabled, bind_native_prompt_source
+    native_home_token = set_hermes_home_override(session.get("profile_home")) if session.get("profile_home") else None
+    try:
+        observe_input = observation_enabled() and not turn_isolation
+        if not observe_input:
+            source_event_id = None
+        elif source_event_id and not bind_native_prompt_source(session["session_key"], source_event_id, text):
+            source_event_id = None
+    finally:
+        if native_home_token is not None:
+            reset_hermes_home_override(native_home_token)
     # Re-bind to the current client transport for this request. This keeps
     # streaming events on the active websocket even if an earlier disconnect
     # or fallback moved the session transport to stdio.
@@ -376,6 +401,8 @@ def _(rid, params: dict) -> dict:
         busy_response = _handle_busy_submit(
             rid, sid, session, text, busy_transport,
             queued=bool(params.get("queued")),
+            **({"source_event_id": source_event_id} if source_event_id is not None else {}),
+            **({"observe_input": True} if observe_input else {}),
         )
         if busy_response is not None:
             return busy_response
@@ -908,7 +935,8 @@ def _(rid, params: dict) -> dict:
                     },
                 )
                 return
-        _run_prompt_submit(rid, sid, session, text, display_kind=display_kind)
+        _run_prompt_submit(rid, sid, session, text, display_kind=display_kind,
+                           source_event_id=source_event_id if not turn_isolation else None)
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck

@@ -92,6 +92,7 @@ class WSTransport:
         *,
         peer: str = "unknown",
         auth_identity: dict | None = None,
+        auth_method: str | None = None,
     ) -> None:
         self._ws = ws
         self._loop = loop
@@ -104,6 +105,7 @@ class WSTransport:
         #: never populate this: it is the only identity authority for
         #: browser-controller registration.
         self.auth_identity = auth_identity
+        self._native_prompt_authenticated = auth_method in {"token", "ticket", "ticket-subprotocol"}
         self._closed = False
         self._last_inbound_at = time.monotonic()
         # Token-coalescing buffer (CF-2). Streamed token frames land here and a
@@ -118,6 +120,11 @@ class WSTransport:
         # writes need an async boundary because several batches can be queued on
         # the owning loop while it recovers from a stall.
         self._send_lock = asyncio.Lock()
+
+    @property
+    def native_prompt_authenticated(self) -> bool:
+        """Upgrade proof only; RPC params never populate this property."""
+        return self._native_prompt_authenticated
 
     @property
     def closed(self) -> bool:
@@ -321,6 +328,7 @@ async def handle_ws(
     ws: Any,
     *,
     auth_identity: dict | None = None,
+    auth_method: str | None = None,
     subprotocol: str | None = None,
 ) -> None:
     """Run one WebSocket session. Wire-compatible with ``tui_gateway.entry``.
@@ -356,6 +364,7 @@ async def handle_ws(
             asyncio.get_running_loop(),
             peer=peer,
             auth_identity=auth_identity,
+            auth_method=auth_method,
         )
 
         # resolve_skin() reads config + initializes the skin engine —
