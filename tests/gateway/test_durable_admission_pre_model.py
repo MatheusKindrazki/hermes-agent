@@ -25,16 +25,13 @@ import pytest
 
 from agent import durable_admission
 
-K7_ROOT = Path(os.environ.get("HERMES_TEST_K7_ROOT",
-    "/Users/matheuskindrazki/development/personal/.worktrees/"
-    "hermes-personal-os/kindra-passive-observer-20260906"
-))
-K7_BIN = K7_ROOT / "control" / "kernel" / "admit_cli.py"
-K7_SCHEMA = K7_ROOT / "control" / "schemas" / "work-envelope.schema.json"
+K7_ROOT = Path(os.environ["HERMES_TEST_K7_ROOT"]) if os.environ.get("HERMES_TEST_K7_ROOT") else None
+K7_BIN = K7_ROOT / "control/kernel/admit_cli.py" if K7_ROOT else None
+K7_SCHEMA = K7_ROOT / "control/schemas/work-envelope.schema.json" if K7_ROOT else None
 
 requires_k7 = pytest.mark.skipif(
-    not (K7_BIN.is_file() and os.access(K7_BIN, os.X_OK) and K7_SCHEMA.is_file()),
-    reason="K7 admitter worktree not present on this host",
+    K7_ROOT is None,
+    reason="cross-repo unavailable: HERMES_TEST_K7_ROOT required (real POS kernel/schema)",
 )
 
 OK_RESPONSE = {
@@ -523,6 +520,7 @@ def test_turn_identity_rebind_is_rejected(field, value):
     "control/kernel/store.py", "control/schemas/work-envelope.schema.json",
     "control/schemas/kernel-turn-identity.schema.json",
 ])
+@requires_k7
 def test_every_executed_k7_bundle_file_is_pinned_before_subprocess(monkeypatch, tmp_path, relative):
     root = tmp_path / "k7"
     shutil.copytree(K7_ROOT / "control", root / "control")

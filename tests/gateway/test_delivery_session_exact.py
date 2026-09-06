@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
@@ -17,6 +18,7 @@ from tools import bot_mode_dm
 
 
 @pytest.mark.parametrize("failure", [None, "release_ambiguous", "spool_failed", "ack_missing"])
+@pytest.mark.skipif(not os.environ.get("HERMES_TEST_K7_ROOT"), reason="cross-repo unavailable: HERMES_TEST_K7_ROOT required (real POS collector)")
 def test_observe_effect_four_stores_exact_release_and_ack_replay(tmp_path, monkeypatch, failure):
     """Real SessionDB, private ledger/spool and POS collector SQLite.
 
@@ -30,8 +32,7 @@ def test_observe_effect_four_stores_exact_release_and_ack_replay(tmp_path, monke
     from agent import durable_admission as da
     from hermes_state import SessionDB
 
-    root = Path(os.environ.get("HERMES_TEST_K7_ROOT",
-        "/Users/matheuskindrazki/development/personal/.worktrees/hermes-personal-os/kindra-passive-observer-20260906"))
+    root = Path(os.environ["HERMES_TEST_K7_ROOT"])
     spec = importlib.util.spec_from_file_location("observation_collector", root / "cron/scripts/kernel-shadow-collector.py")
     collector = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(collector)

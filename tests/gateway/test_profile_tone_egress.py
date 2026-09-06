@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
+
+import pytest
 
 from gateway.egress_policy import EgressPolicy
 
 
-POS = Path("/Users/matheuskindrazki/development/personal/.worktrees/hermes-personal-os/hermes-kernel-v1-grok46-20260901")
+POS = Path(os.environ["HERMES_TEST_K7_ROOT"]) if os.environ.get("HERMES_TEST_K7_ROOT") else None
+requires_pos = pytest.mark.skipif(POS is None, reason="cross-repo unavailable: HERMES_TEST_K7_ROOT required (real K11 gate)")
 WORK_ID = "01a04a0f-455a-7bea-a064-4aa68b009d39"
 
 
@@ -40,6 +44,7 @@ def _metadata(envelope):
             "session_id": "bot-session", "policy_version": "tone-v1"}
 
 
+@requires_pos
 def test_real_k11_gate_accepts_exact_schema_and_preserves_facts(monkeypatch):
     prepared, decision = _policy(monkeypatch).prepare_metadata(
         action="send", destination="hermes:bot-chat", content=b"conclusao",
@@ -51,6 +56,7 @@ def test_real_k11_gate_accepts_exact_schema_and_preserves_facts(monkeypatch):
     assert receipt["facts_match"] is True
 
 
+@requires_pos
 def test_k11_schema_pin_mismatch_or_fact_corruption_fails_closed(monkeypatch):
     bad_sha = "0" * 64
     _, decision = _policy(monkeypatch, sha=bad_sha).prepare_metadata(

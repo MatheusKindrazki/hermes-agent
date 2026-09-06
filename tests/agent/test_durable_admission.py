@@ -25,16 +25,13 @@ import pytest
 
 from agent import conversation_loop, durable_admission
 
-K7_ROOT = Path(os.environ.get("HERMES_TEST_K7_ROOT",
-    "/Users/matheuskindrazki/development/personal/.worktrees/"
-    "hermes-personal-os/hermes-kernel-v1-k7-kernel-20260902"
-))
-K7_BIN = K7_ROOT / "control" / "kernel" / "admit_cli.py"
-K7_SCHEMA = K7_ROOT / "control" / "schemas" / "work-envelope.schema.json"
+K7_ROOT = Path(os.environ["HERMES_TEST_K7_ROOT"]) if os.environ.get("HERMES_TEST_K7_ROOT") else None
+K7_BIN = K7_ROOT / "control/kernel/admit_cli.py" if K7_ROOT else None
+K7_SCHEMA = K7_ROOT / "control/schemas/work-envelope.schema.json" if K7_ROOT else None
 
 requires_k7 = pytest.mark.skipif(
-    not (K7_BIN.is_file() and os.access(K7_BIN, os.X_OK) and K7_SCHEMA.is_file()),
-    reason="K7 admitter worktree not present on this host",
+    K7_ROOT is None,
+    reason="cross-repo unavailable: HERMES_TEST_K7_ROOT required (real POS kernel/schema)",
 )
 
 OK_RESPONSE = {
@@ -519,11 +516,7 @@ def test_config_mode_off_disarms_an_armed_env(monkeypatch, tmp_path, turn_probe)
 @requires_k7
 def test_the_pinned_admitter_hash_is_the_approved_k7_build():
     """The constant this consumer ships must be the hash of the real binary."""
-    expected_sha256 = (
-        durable_admission.TURN_IDENTITY_ADMITTER_SHA256
-        if os.environ.get("HERMES_TEST_K7_ROOT")
-        else durable_admission.ADMITTER_SHA256
-    )
+    expected_sha256 = durable_admission.TURN_IDENTITY_ADMITTER_SHA256
     assert (
         durable_admission._sha256_file(K7_BIN) == expected_sha256
     )
@@ -577,6 +570,7 @@ def test_schema_file_hash_is_verified_against_the_pin(monkeypatch, tmp_path):
     assert outcome.effects_allowed is False
 
 
+@requires_k7
 def test_outer_budget_is_frozen_and_config_cannot_raise_it(monkeypatch, tmp_path):
     """The 2.0s outer wait is a module constant with no config override."""
     assert durable_admission.TIMEOUT_SECONDS == 2.0
@@ -598,6 +592,7 @@ def test_outer_budget_is_frozen_and_config_cannot_raise_it(monkeypatch, tmp_path
     assert seen["timeout"] == 2.0, "a config key raised the frozen outer budget"
 
 
+@requires_k7
 def test_external_timeout_is_ambiguous_never_dispatched(monkeypatch, tmp_path):
     """K7's client owns its own remote timeout; this budget measures how long we
     wait on the subprocess. Expiring it says nothing about whether the kernel
@@ -613,6 +608,7 @@ def test_external_timeout_is_ambiguous_never_dispatched(monkeypatch, tmp_path):
     assert outcome.work_id is None
 
 
+@requires_k7
 def test_user_text_cannot_steer_the_invocation(monkeypatch, tmp_path):
     """Argv is a list, there is no shell, and the input rides stdin — so text
     that looks like a flag stays text."""
@@ -635,6 +631,7 @@ def test_user_text_cannot_steer_the_invocation(monkeypatch, tmp_path):
     assert seen["argv"][0] == str(adapter)
 
 
+@requires_k7
 def test_python_path_is_not_forwarded_to_the_admitter(monkeypatch, tmp_path):
     """A caller-set ``PYTHONPATH`` could shadow ``control.kernel`` inside the
     admitter, letting the thing being gated supply its own gate."""
@@ -712,6 +709,7 @@ def test_fixture_authority_never_authorizes_an_effect(monkeypatch, tmp_path):
     assert outcome.work_receipt() is None
 
 
+@requires_k7
 def test_no_pin_configured_means_no_effect_is_ever_authorized(monkeypatch, tmp_path):
     """"The gate found no pin, so it trusted the receipt" is the exact defect
     the pin exists to remove."""
@@ -733,6 +731,7 @@ def test_no_pin_configured_means_no_effect_is_ever_authorized(monkeypatch, tmp_p
         ({"attestation": None}, "no attestation at all"),
     ],
 )
+@requires_k7
 def test_receipts_that_do_not_match_the_pin_are_refused(
     monkeypatch, tmp_path, mutation, label
 ):
@@ -761,6 +760,7 @@ def test_receipts_that_do_not_match_the_pin_are_refused(
         {"value": "short"},
     ],
 )
+@requires_k7
 def test_attestation_that_is_not_the_pinned_key_is_refused(
     monkeypatch, tmp_path, attestation_mutation
 ):
@@ -785,6 +785,7 @@ def test_attestation_that_is_not_the_pinned_key_is_refused(
          "attestation_key_id": "0123456789abcdef"},
     ],
 )
+@requires_k7
 def test_an_incomplete_or_fixture_pin_authorizes_nothing(monkeypatch, tmp_path, bad_pin):
     """Pinning the offline domain, or pinning half a pin, must not become a
     weaker gate than pinning nothing."""
@@ -815,6 +816,7 @@ def test_an_incomplete_or_fixture_pin_authorizes_nothing(monkeypatch, tmp_path, 
         ({"state": "nonsense"}, "receipt_incoherent"),
     ],
 )
+@requires_k7
 def test_a_receipt_that_is_not_ours_is_refused(monkeypatch, tmp_path, mutation, expected):
     doc = _receipt()
     doc.update(mutation)
@@ -826,6 +828,7 @@ def test_a_receipt_that_is_not_ours_is_refused(monkeypatch, tmp_path, mutation, 
     assert outcome.effects_allowed is False
 
 
+@requires_k7
 def test_exit_code_and_state_must_agree(monkeypatch, tmp_path):
     """``admitted`` on the pending exit code is incoherent, and an incoherent
     receipt is refused rather than resolved in the caller's favour."""
@@ -834,6 +837,7 @@ def test_exit_code_and_state_must_agree(monkeypatch, tmp_path):
     assert _admit().reason_code == "receipt_incoherent"
 
 
+@requires_k7
 def test_admitter_crash_is_pending_not_permission(monkeypatch, tmp_path):
     _arm_adapter(
         monkeypatch,
@@ -1019,6 +1023,7 @@ def test_a_deterministic_upstream_time_is_carried_when_supplied(monkeypatch, tmp
 
 
 @pytest.mark.parametrize("bad", [-1, "0", 1.5, True, None])
+@requires_k7
 def test_a_non_negative_integer_is_required_for_observation_time(
     monkeypatch, tmp_path, bad
 ):
