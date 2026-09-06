@@ -2340,6 +2340,7 @@ def run_conversation(
             # history through shared nested containers. See
             # _clone_message_for_send.
             api_msg = _clone_message_for_send(msg)
+            api_msg.pop("client_turn_id", None)
 
             # api_content is the persistence sidecar carrying the exact bytes
             # sent to the API for this message when they differ from the clean

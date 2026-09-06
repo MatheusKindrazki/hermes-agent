@@ -146,6 +146,11 @@ class TestChatCompletionsBasic:
         msgs = [{"role": "user", "content": "hi"}]
         assert transport.convert_messages(msgs) is msgs
 
+    def test_client_turn_identity_is_durable_only(self, transport):
+        messages = [{"role": "user", "content": "hello", "client_turn_id": "turn-original"}]
+        assert transport.convert_messages(messages) == [{"role": "user", "content": "hello"}]
+        assert messages[0]["client_turn_id"] == "turn-original"
+
     def test_convert_messages_strips_internal_scaffolding_markers(self, transport):
         """Hermes-internal ``_``-prefixed markers must never reach the wire.
 

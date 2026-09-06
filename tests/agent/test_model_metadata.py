@@ -51,6 +51,10 @@ class TestEstimateTokensRough:
 
 
 class TestEstimateMessagesTokensRough:
+    def test_client_turn_identity_does_not_count_as_wire_tokens(self):
+        plain = {"role": "user", "content": "hello"}
+        durable = {**plain, "client_turn_id": "internal-identity-" * 1000}
+        assert estimate_messages_tokens_rough([durable]) == estimate_messages_tokens_rough([plain])
 
 
 

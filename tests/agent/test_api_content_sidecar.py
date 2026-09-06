@@ -525,6 +525,8 @@ class TestWireInvariant:
         agent1 = make_agent()
         agent1.run_conversation("hello please", conversation_history=[], task_id="t1")
         turn_n_user = _user_messages(_chat_requests(handler)[0])[0]
+        assert "client_turn_id" not in turn_n_user
+        durable_turn_id = agent1._session_messages[0]["client_turn_id"]
         turn_n_bytes = json.dumps(turn_n_user, sort_keys=True)
 
         # ── Turn N+1: fresh agent, history reloaded from the store ──
@@ -532,6 +534,7 @@ class TestWireInvariant:
         # The stored history carries the sidecar, not the injected content.
         assert history[0]["content"] == "hello please"
         assert history[0]["api_content"] == turn_n_user["content"]
+        assert history[0]["display_metadata"]["_compression_turn_id"] == durable_turn_id
 
         handler.captured_requests = []
         agent2 = make_agent()
