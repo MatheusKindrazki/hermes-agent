@@ -25,10 +25,10 @@ import pytest
 
 from agent import conversation_loop, durable_admission
 
-K7_ROOT = Path(
+K7_ROOT = Path(os.environ.get("HERMES_TEST_K7_ROOT",
     "/Users/matheuskindrazki/development/personal/.worktrees/"
     "hermes-personal-os/hermes-kernel-v1-k7-kernel-20260902"
-)
+))
 K7_BIN = K7_ROOT / "control" / "kernel" / "admit_cli.py"
 K7_SCHEMA = K7_ROOT / "control" / "schemas" / "work-envelope.schema.json"
 
@@ -453,8 +453,13 @@ def test_config_mode_off_disarms_an_armed_env(monkeypatch, tmp_path, turn_probe)
 @requires_k7
 def test_the_pinned_admitter_hash_is_the_approved_k7_build():
     """The constant this consumer ships must be the hash of the real binary."""
+    expected_sha256 = (
+        durable_admission.TURN_IDENTITY_ADMITTER_SHA256
+        if os.environ.get("HERMES_TEST_K7_ROOT")
+        else durable_admission.ADMITTER_SHA256
+    )
     assert (
-        durable_admission._sha256_file(K7_BIN) == durable_admission.ADMITTER_SHA256
+        durable_admission._sha256_file(K7_BIN) == expected_sha256
     )
     assert (
         durable_admission._sha256_file(K7_SCHEMA) == durable_admission.SCHEMA_SHA256

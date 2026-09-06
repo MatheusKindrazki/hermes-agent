@@ -24,10 +24,10 @@ import pytest
 from agent import durable_admission
 from tools import async_delegation
 
-K7_ROOT = Path(
+K7_ROOT = Path(os.environ.get("HERMES_TEST_K7_ROOT",
     "/Users/matheuskindrazki/development/personal/.worktrees/"
     "hermes-personal-os/hermes-kernel-v1-k7-kernel-20260902"
-)
+))
 K7_BIN = K7_ROOT / "control" / "kernel" / "admit_cli.py"
 K7_SCHEMA = K7_ROOT / "control" / "schemas" / "work-envelope.schema.json"
 
