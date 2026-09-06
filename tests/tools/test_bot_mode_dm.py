@@ -70,6 +70,33 @@ class _FakeAgent:
         self.valid_tool_names: set = set()
 
 
+def test_observe_admission_failure_delivers_once_with_durable_gap(tmp_path, monkeypatch):
+    from agent import durable_admission as da
+
+    home = _managed_home(tmp_path)
+    agent = _FakeAgent(home)
+    monkeypatch.setattr(bot_mode_dm.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setenv(da.ENV_MODE, "observe")
+    monkeypatch.setattr(da, "_settings", lambda: {"tenant": "personal", "machine": "mini"})
+    monkeypatch.setattr(da, "_active_profile", lambda: "projetospessoais")
+    writer = da.ObservationWriter(tmp_path / "receipts", code_sha="a" * 40)
+    monkeypatch.setattr(da, "_OBSERVER", writer)
+    writer.checkpoint()
+    calls = []
+    monkeypatch.setattr(da, "admit_observed_effect", lambda obs: (_ for _ in ()).throw(RuntimeError("observer failed")))
+    monkeypatch.setattr(bot_mode_dm, "_spawn_delivery", lambda *a, **kw: calls.append(kw["receipt"]) or json.dumps({"status": "accepted"}))
+    origin = da.capture_effect_origin("chat-original", "telegram:123")
+    with da.effect_origin_scope(origin):
+        first = json.loads(bot_mode_dm._start_delivery(["hermes"], "body", "target", stdin_file=False, task_id=None, agent=agent))
+        replay = json.loads(bot_mode_dm._start_delivery(["hermes"], "body", "target", stdin_file=False, task_id=None, agent=agent))
+    assert first["status"] == replay["status"] == "accepted"
+    assert len(calls) == 1
+    assert calls[0]["origin_session_id"] == "chat-original"
+    assert da._UUID7_RE.fullmatch(calls[0]["release_event_id"])
+    effect = json.loads(next((writer.root / "observation-effects").glob("*.json")).read_text())
+    assert effect["state"] == "gap" and effect["gap_reason"] == "admission_failed"
+
+
 # ── injection gate (leak containment) ────────────────────────────────────────
 
 

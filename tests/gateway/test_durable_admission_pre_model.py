@@ -27,7 +27,7 @@ from agent import durable_admission
 
 K7_ROOT = Path(os.environ.get("HERMES_TEST_K7_ROOT",
     "/Users/matheuskindrazki/development/personal/.worktrees/"
-    "hermes-personal-os/hermes-kernel-turn-identity-20260904"
+    "hermes-personal-os/kindra-passive-observer-20260906"
 ))
 K7_BIN = K7_ROOT / "control" / "kernel" / "admit_cli.py"
 K7_SCHEMA = K7_ROOT / "control" / "schemas" / "work-envelope.schema.json"

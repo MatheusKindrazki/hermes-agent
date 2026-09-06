@@ -74,6 +74,9 @@ import secrets
 import subprocess
 import threading
 import time
+import stat
+import tempfile
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -89,6 +92,353 @@ MODE_OFF = "off"
 _ARMING_MODES = frozenset({"enforce", "on", "1", "true"})
 _OFF_MODES = frozenset({"off", "0", "false", "disabled", ""})
 
+# Non-authoritative provenance: sealed against accidental reconstruction or
+# mutation in this process, not a security boundary against same-UID code.
+_ORIGIN_KEY = secrets.token_bytes(32)
+_EFFECT_ORIGIN = contextvars.ContextVar("hermes_effect_origin", default=None)
+
+
+@dataclass(frozen=True)
+class EffectOrigin:
+    session_id: str
+    event_id: str
+    tenant: str
+    profile: str
+    machine: str
+    seal: str = field(repr=False)
+
+
+def _origin_seal(parts: tuple[str, ...]) -> str:
+    return hmac.new(_ORIGIN_KEY, json.dumps(parts, separators=(",", ":")).encode(), hashlib.sha256).hexdigest()
+
+
+def observation_enabled() -> bool:
+    if (os.environ.get(ENV_MODE) or "").strip().lower() != "observe":
+        return False
+    settings = _settings()
+    return (not _config_disarms(settings) and settings.get("tenant") == "personal" and settings.get("machine") == "mini"
+            and _active_profile() == "projetospessoais")
+
+
+def capture_effect_origin(session_id: str, event_id: str) -> Optional[EffectOrigin]:
+    """Called only after upstream authentication; never synthesizes identity."""
+    if not observation_enabled():
+        return None
+    if not isinstance(session_id, str) or not _SESSION_ID_RE.fullmatch(session_id):
+        return None
+    if not isinstance(event_id, str) or not _EVENT_ID_RE.fullmatch(event_id):
+        return None
+    parts = (session_id, event_id, "personal", "projetospessoais", "mini")
+    return EffectOrigin(*parts, _origin_seal(parts))
+
+
+def current_effect_origin() -> Optional[EffectOrigin]:
+    return _EFFECT_ORIGIN.get()
+
+
+def publish_effect_origin(origin: Optional[EffectOrigin]) -> None:
+    if origin is not None:
+        parts = (origin.session_id, origin.event_id, origin.tenant, origin.profile, origin.machine)
+        if not hmac.compare_digest(origin.seal, _origin_seal(parts)):
+            raise ValueError("invalid effect origin seal")
+    _EFFECT_ORIGIN.set(origin)
+
+
+@contextmanager
+def effect_origin_scope(origin: Optional[EffectOrigin]):
+    token = _EFFECT_ORIGIN.set(None)
+    try:
+        publish_effect_origin(origin)
+        yield
+    finally:
+        _EFFECT_ORIGIN.reset(token)
+
+
+class ObservationWriter:
+    """Owner-only local CAS. Effect sequence never changes during settlement.
+
+    A write failure latches this boot broken. A missing disk cannot be made
+    observable by writing to it: the last checkpoint expires within 120s.
+    """
+
+    def __init__(self, root: Path, *, code_sha: str, boot_id: Optional[str] = None):
+        if not root.is_absolute() or not re.fullmatch(r"[0-9a-f]{40}", code_sha):
+            raise ValueError("observation configuration invalid")
+        self.root = root
+        self.code_sha = code_sha
+        self.boot_id = boot_id or str(uuid.uuid4())
+        self.broken = False
+        self.stopped = False
+        self._mutex = threading.RLock()
+
+    @contextmanager
+    def _locked(self):
+        import fcntl
+
+        with self._mutex:
+            try:
+                for directory in (self.root, self.root / "observation-effects"):
+                    if directory.is_symlink():
+                        raise OSError("observation directory symlink")
+                    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    info = directory.stat()
+                    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+                        raise OSError("observation directory permissions")
+                fd = os.open(self.root / ".observation.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+                try:
+                    info = os.fstat(fd)
+                    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1
+                            or stat.S_IMODE(info.st_mode) != 0o600):
+                        raise OSError("observation lock unsafe")
+                    deadline = time.monotonic() + 0.25
+                    while True:
+                        try:
+                            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            break
+                        except BlockingIOError:
+                            if time.monotonic() >= deadline:
+                                raise TimeoutError("observation lock busy")
+                            time.sleep(0.005)
+                    yield
+                finally:
+                    os.close(fd)
+            except OSError:
+                self.broken = True
+                raise
+
+    def _read(self, path: Path) -> Optional[dict]:
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return None
+        with os.fdopen(fd) as stream:
+            info = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600
+                    or info.st_nlink != 1 or info.st_size > 65536):
+                raise OSError("observation file unsafe")
+            document = json.load(stream)
+        if not isinstance(document, dict):
+            raise ValueError("observation file invalid")
+        return document
+
+    def _write(self, path: Path, document: dict):
+        fd, temporary = tempfile.mkstemp(prefix=".observation-", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w") as stream:
+                json.dump(document, stream, sort_keys=True, separators=(",", ":"))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def checkpoint(self, *, now: Optional[int] = None, stopped: bool = False):
+        now = int(time.time()) if now is None else now
+        self.stopped = self.stopped or stopped
+        with self._locked():
+            previous = self._read(self.root / "observation-channel.json") or {}
+            records = [self._read(path) for path in (self.root / "observation-effects").glob("*.json")]
+            last = max((r["sequence"] for r in records if r and r["boot_id"] == self.boot_id), default=0)
+            self._write(self.root / "observation-channel.json", {
+                "schema": "hermes.kernel-observation-channel/v1", "profile": "projetospessoais", "machine": "mini",
+                "code_sha": self.code_sha, "pid": os.getpid(), "boot_id": self.boot_id,
+                "sequence": previous.get("sequence", 0) + 1,
+                "state": "broken" if self.broken else "stopped" if self.stopped else "healthy" if previous.get("boot_id") == self.boot_id else "starting",
+                "checked_at": now, "valid_until": now + 120, "last_effect_sequence": last,
+            })
+
+    def reserve(self, origin: EffectOrigin, destination: str, content: str, *, now: Optional[int] = None, include_created=False):
+        with effect_origin_scope(origin):
+            effect_id = hashlib.sha256(json.dumps([
+                "hermes-effect.v1", origin.session_id, origin.event_id, origin.tenant,
+                origin.profile, origin.machine, destination, content_sha256(content),
+            ], separators=(",", ":")).encode()).hexdigest()
+        now = int(time.time()) if now is None else now
+        with self._locked():
+            path = self.root / "observation-effects" / (effect_id + ".json")
+            existing = self._read(path)
+            if existing is not None:
+                return (existing, False) if include_created else existing
+            if self.broken or self.stopped:
+                raise OSError("observation boot not healthy")
+            records = [self._read(p) for p in path.parent.glob("*.json")]
+            sequence = max((r["sequence"] for r in records if r and r["boot_id"] == self.boot_id), default=0) + 1
+            record = {"schema": "hermes.kernel-effect-observation/v1", "effect_id": effect_id,
+                      "profile": origin.profile, "machine": origin.machine, "boot_id": self.boot_id,
+                      "sequence": sequence, "state": "reserved", "reserved_at": now, "updated_at": now,
+                      "origin_session_id": origin.session_id, "settlement": None, "gap_reason": None}
+            self._write(path, record)
+            return (record, True) if include_created else record
+
+    def transition(self, effect_id: str, state: str, *, settlement=None, gap_reason=None, now: Optional[int] = None):
+        if not re.fullmatch(r"[0-9a-f]{64}", effect_id) or state not in {"settled", "gap"}:
+            raise ValueError("invalid observation transition")
+        with self._locked():
+            path = self.root / "observation-effects" / (effect_id + ".json")
+            record = self._read(path)
+            if record is None:
+                raise ValueError("observation reservation missing")
+            if record["state"] != "reserved":
+                if (record["state"], record["settlement"], record["gap_reason"]) == (state, settlement, gap_reason):
+                    return record
+                raise ValueError("observation terminal transition")
+            if state == "gap" and (settlement is not None or gap_reason not in {
+                "admission_failed", "delivery_ambiguous", "delivery_failed", "ack_missing", "ledger_failed",
+                "spool_failed", "release_ambiguous", "release_failed", "identity_missing", "storage_failed",
+            }):
+                raise ValueError("invalid observation gap")
+            if state == "settled" and (not isinstance(settlement, dict) or gap_reason is not None):
+                raise ValueError("invalid observation settlement")
+            if state == "settled":
+                fields = {"work_id", "attempt_id", "generation", "delivery_id", "delivery_event_id", "ack_sha256",
+                          "ledger_sha256", "spool_sha256", "release_event_id", "release_source_event_id", "release_receipt_sha256"}
+                if (set(settlement) != fields or type(settlement["generation"]) is not int
+                        or not 1 <= settlement["generation"] <= 9007199254740991
+                        or any(not isinstance(settlement[k], str) or not _UUID7_RE.fullmatch(settlement[k])
+                               for k in ("work_id", "attempt_id", "release_event_id"))
+                        or any(not isinstance(settlement[k], str) or not re.fullmatch(r"[0-9a-f]{64}", settlement[k])
+                               for k in ("ack_sha256", "ledger_sha256", "spool_sha256", "release_receipt_sha256"))
+                        or any(not isinstance(settlement[k], str) or not re.fullmatch(r"[A-Za-z0-9._:@/-]{1,200}", settlement[k])
+                               for k in ("delivery_id", "delivery_event_id"))
+                        or not isinstance(settlement["release_source_event_id"], str)
+                        or not re.fullmatch(r"kernel-effect-[0-9a-f]{64}:release-[1-9][0-9]{0,15}", settlement["release_source_event_id"])):
+                    raise ValueError("invalid observation settlement")
+            updated = dict(record, state=state, settlement=settlement, gap_reason=gap_reason,
+                           updated_at=int(time.time()) if now is None else now)
+            self._write(path, updated)
+            return updated
+
+
+_OBSERVER: Optional[ObservationWriter] = None
+
+
+def start_observation() -> Optional[ObservationWriter]:
+    global _OBSERVER
+    if not observation_enabled():
+        return None
+    try:
+        from hermes_cli.build_info import get_code_identity
+        code_sha = get_code_identity().get("sha")
+        configured = (_settings().get("observation") or {}).get("code_sha")
+        if code_sha != configured:
+            raise ValueError("observation code pin mismatch")
+        _OBSERVER = ObservationWriter(Path(os.environ.get("HERMES_KERNEL_SHADOW_RECEIPT_DIR", "")), code_sha=code_sha)
+        _OBSERVER.checkpoint()
+    except Exception:
+        logger.error("observation startup unavailable; checkpoint must expire", exc_info=False)
+        if _OBSERVER is not None:
+            _OBSERVER.broken = True
+    return _OBSERVER
+
+
+def observation_checkpoint(*, stopped=False):
+    if _OBSERVER is not None:
+        try:
+            _OBSERVER.checkpoint(stopped=stopped)
+        except Exception:
+            _OBSERVER.broken = True
+            logger.error("observation storage unavailable; checkpoint must expire", exc_info=False)
+
+
+def observation_gap(observation: Optional[dict], reason: str):
+    if not observation:
+        if _OBSERVER is not None:
+            _OBSERVER.broken = True
+            observation_checkpoint()
+        logger.error("effect observation unavailable: %s", reason)
+        return
+    try:
+        writer = ObservationWriter(Path(observation["root"]), code_sha=observation["code_sha"], boot_id=observation["effect"]["boot_id"])
+        with writer._locked():
+            prior = writer._read(writer.root / "observation-effects" / (observation["effect"]["effect_id"] + ".json"))
+            if prior and prior["state"] in {"gap", "settled"}:
+                return  # Preserve the first terminal observation; never rewrite it.
+        writer.transition(observation["effect"]["effect_id"], "gap", gap_reason=reason)
+    except Exception:
+        if _OBSERVER is not None:
+            _OBSERVER.broken = True
+            observation_checkpoint()
+        logger.error("effect observation gap persistence failed: %s", reason)
+
+
+def reserve_observed_effect(destination: str, content: str):
+    """Observation never supplies delivery authorization or changes legacy send."""
+    if not observation_enabled():
+        return None
+    origin = current_effect_origin()
+    if origin is None or _OBSERVER is None:
+        observation_gap(None, "identity_missing" if origin is None else "storage_failed")
+        return None
+    try:
+        effect, created = _OBSERVER.reserve(origin, destination, content, include_created=True)
+        return {"root": str(_OBSERVER.root), "code_sha": _OBSERVER.code_sha, "effect": effect, "created": created}
+    except Exception:
+        observation_gap(None, "storage_failed")
+        return None
+
+
+def admit_observed_effect(observation: dict) -> Optional[dict]:
+    origin = current_effect_origin()
+    if origin is None or not observation_enabled():
+        return None
+    outcome = _run_admission(session_id=origin.session_id,
+        request_text="message_agent effect " + observation["effect"]["effect_id"],
+        seam=SEAM_EXECUTION, event_id="effect-" + observation["effect"]["effect_id"],
+        event_kind="chat_message", declares_execution=True, _observing=True)
+    if outcome.state != STATE_ADMITTED or outcome.turn_identity is None or not outcome.authority_pin_matched:
+        observation_gap(observation, "admission_failed")
+        return None
+    return dict(outcome.turn_identity)
+
+
+def new_release_event_id() -> str:
+    return str(uuid.UUID(int=((int(time.time() * 1000) & ((1 << 48) - 1)) << 80)
+        | (7 << 76) | (secrets.randbits(12) << 64) | (2 << 62) | secrets.randbits(62)))
+
+
+def release_observed_effect(identity: Mapping[str, Any], release_event_id: str) -> dict:
+    """One exact release call; timeout/invalid response is ambiguous, never retried."""
+    identity = _validate_turn_identity(identity)
+    if not _UUID7_RE.fullmatch(release_event_id):
+        raise TurnIdentityError("release_event_invalid")
+    roots = _resolve_trust_roots()
+    settings = _settings()
+    base_url = str(settings.get("jarvis_base_url") or "").strip()
+    secret_ref = str(settings.get("secret_ref") or "").strip()
+    if not base_url or not secret_ref or settings.get("transport_fixture"):
+        raise TurnIdentityError("turn_identity_requires_remote")
+    result = subprocess.run([roots.admitter_bin, "release-turn-identity", "--stdin",
+        "--jarvis-base-url", base_url, "--secret-ref", secret_ref],
+        input=_canonical({"turn_identity": identity, "release_event_id": release_event_id}),
+        capture_output=True, text=True, timeout=TIMEOUT_SECONDS, cwd=roots.root_dir,
+        env=_child_env(settings), shell=False)
+    if result.returncode != EXIT_OK:
+        raise TurnIdentityError("release_unavailable")
+    receipt = json.loads(result.stdout or "")
+    session_key = "hk1-" + hashlib.sha256(json.dumps([
+        "hermes-kernel-execution.v1", identity["work_id"], identity["origin_session_id"],
+    ], separators=(",", ":")).encode()).hexdigest()
+    source_event = "kernel-effect-" + hashlib.sha256(json.dumps([
+        "hermes-kernel-effect-release.v1", identity["work_id"], identity["attempt_id"],
+        identity["generation"], session_key, release_event_id,
+    ], separators=(",", ":")).encode()).hexdigest() + ":release-" + str(identity["generation"])
+    expected = {"schema_version": "work-control.effect-release.v1", "contract_version": "work-control.v1",
+        "source_event_id": source_event, "work_id": identity["work_id"],
+        "origin_session_id": identity["origin_session_id"], "execution_session_key": session_key,
+        "attempt_id": identity["attempt_id"], "generation": identity["generation"],
+        "release_event_id": release_event_id}
+    if (not isinstance(receipt, dict) or set(receipt) != set(expected) | {"outcome"}
+            or any(receipt[k] != v for k, v in expected.items())
+            or receipt["outcome"] not in {"released", "already_released"}):
+        raise TurnIdentityError("release_receipt_rebind")
+    return receipt
+
 # --------------------------------------------------------------------------- #
 # Trust roots — the environment says WHERE, these constants say WHICH
 # --------------------------------------------------------------------------- #
@@ -100,7 +450,7 @@ ENV_SCHEMA_SHA256 = "HERMES_KERNEL_SCHEMA_SHA256"
 # Retained for the explicitly gated offline fixture suite. Production accepts
 # only TURN_IDENTITY_ADMITTER_SHA256 below.
 ADMITTER_SHA256 = "9110be8580acdaf0acee3b3fd0df149523b9f189c3a0c0898f5b90510c6c2a99"
-TURN_IDENTITY_ADMITTER_SHA256 = "6fbf78d17e0b45d0894ac061657c95273a88fa84fb23c134af40d03e9a8cf653"
+TURN_IDENTITY_ADMITTER_SHA256 = "69cb5d2ce9486b22145b1ab8d80399f9ba866b619332e8ffeb924c4d8475f03b"
 SCHEMA_SHA256 = "92ce749bf6bfecf3528b83da9a5ef716f4ac6f7795342e2bf70e094eff306a3b"
 TURN_IDENTITY_SCHEMA_VERSION = "hermes.kernel-turn-identity.v1"
 TURN_FENCE_SCHEMA_VERSION = "hermes.kernel-turn-fence.v1"
@@ -109,7 +459,7 @@ K7_BUNDLE_SHA256 = {
     "control/kernel/admit_cli.py": TURN_IDENTITY_ADMITTER_SHA256,
     "control/kernel/contracts.py": "dc1f7e818fb967a0d7eb8e5ac82e424c957e4623827c1746e692c164f828cc19",
     "control/kernel/admitter.py": "8061b97b1798722e62e49e34d0dce9ad12fe0b54939d94a8ebe7baabb81ac4c7",
-    "control/kernel/client.py": "c0897f685211fc413f442ae32b62812e2242122dad31652ca71a0482418b28a2",
+    "control/kernel/client.py": "7a61d2548fcb10f7bf93256d9833d6dd7b7812f6de98e4ebc2c0e7605764bdb7",
     "control/kernel/native_keychain.py": "ae76dbe9e88ecb8a2b7d54595852f3e51a07a36d4009d73aea04cb021ab5c057",
     "control/kernel/inbox.py": "cf906a4f30285958a7aff3d3509eaa6b845c2ac68c5ef8136c8e47f4805df23f",
     "control/kernel/projector.py": "292f64cae244b90b56ec649e58b1487155c3dac5eab4af4f4b91c50a30806315",
@@ -583,13 +933,15 @@ def resolve_mode(environ: Optional[Mapping[str, str]] = None) -> bool:
     none. Refusing is the only reading that cannot quietly disable the gate,
     and it happens here — before any config read, any subprocess and any model.
 
-    A valid "off" returns False having done nothing at all.
+    A valid "off" returns False having done nothing at all. "observe" also
+    returns False here: it never arms ingress or legacy enforcement. Its
+    separately scoped observer runs only at the actual effect boundary.
     """
     env = os.environ if environ is None else environ
     mode = (env.get(ENV_MODE) or "").strip().lower()
     if mode in _ARMING_MODES:
         return True
-    if mode in _OFF_MODES:
+    if mode in _OFF_MODES or mode == "observe":
         return False
     raise ModeError(
         "%s=%r is not a recognised mode (expected one of %s, or one of %s to "
@@ -1236,9 +1588,10 @@ def _run_admission(
     event_kind: str,
     declares_execution: bool,
     observed_at: int = OBSERVED_AT_UNKNOWN,
+    _observing: bool = False,
 ) -> AdmissionOutcome:
     try:
-        armed = resolve_mode()
+        armed = resolve_mode() or (_observing and observation_enabled() and current_effect_origin() is not None)
     except ModeError as exc:
         # Before config, before subprocess, before the model.
         logger.error("durable admission mode refused: %s", exc)
