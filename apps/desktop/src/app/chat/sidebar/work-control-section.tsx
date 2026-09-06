@@ -52,7 +52,7 @@ export function WorkControlSection() {
       ) : projection.records.length === 0 ? (
         <p className="mt-1 text-(--ui-text-tertiary)">No active work</p>
       ) : (
-        <ul className="mt-1 space-y-1" aria-label="Current work">
+        <ul aria-label="Current work" className="mt-1 space-y-1">
           {projection.records.map(record => (
             <li className="flex min-w-0 items-center gap-1.5" key={record.work_id}>
               <span className="min-w-0 flex-1 truncate text-foreground">{record.front}</span>

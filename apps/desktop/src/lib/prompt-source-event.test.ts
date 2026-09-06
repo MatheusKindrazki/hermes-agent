@@ -1,4 +1,5 @@
 import { expect, it } from 'vitest'
+
 import { createPromptSourceEventId, isPromptSourceEventId } from './prompt-source-event'
 
 it('allocates distinct input identities independently of text', () => {

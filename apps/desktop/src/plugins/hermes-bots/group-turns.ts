@@ -6,8 +6,7 @@
  * Room-level sequencing lives in group-rounds.ts, which drives these.
  */
 
-import { host } from '@hermes/plugin-sdk'
-import { createPromptSourceEventId } from '@/lib/prompt-source-event'
+import { createPromptSourceEventId, host } from '@hermes/plugin-sdk'
 
 import { recordGroupActivity } from './group-activity'
 import { $groupChats, $groupClarify, $groupNeedsYou, appendGroupChatEntry, updateGroupChat } from './group-chat'

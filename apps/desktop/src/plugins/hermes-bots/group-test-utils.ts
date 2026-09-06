@@ -424,6 +424,7 @@ export async function pluginSdkMock(host: Record<string, unknown>) {
     blobatarSvg: undefined,
     computed: nanostores.computed,
     createBudgetedLoop: undefined,
+    createPromptSourceEventId: () => crypto.randomUUID(),
     host,
     SkillsView: undefined,
     Streamdown: undefined,
