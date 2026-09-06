@@ -12,6 +12,7 @@ def test_signal_cleared_on_entry_between_calls(monkeypatch):
     from agent.conversation_compression import compress_context
 
     agent = MagicMock()
+    agent.session_id = "signal-leak-session"
     agent._cached_system_prompt = ""
     agent.tools = None
     agent._memory_manager = None
@@ -22,11 +23,6 @@ def test_signal_cleared_on_entry_between_calls(monkeypatch):
         {"role": "user", "content": "a"}, {"role": "assistant", "content": "b"},
         {"role": "user", "content": "c"}, {"role": "assistant", "content": "d"},
     ]
-
-    monkeypatch.setattr(
-        "agent.conversation_compression._compression_lock_holder",
-        lambda a: "pid=test:holder",
-    )
 
     # --- Call 1: lock held ---
     db1 = MagicMock()

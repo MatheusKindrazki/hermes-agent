@@ -96,7 +96,7 @@ def _make_draft_adapter():
 
 class TestConsumerDeclaredFinal:
     @pytest.mark.asyncio
-    async def test_enforced_final_uses_shadow_outbox_without_native_adapter(self, tmp_path):
+    async def test_enforced_final_uses_shadow_outbox_without_native_adapter(self, tmp_path, unit_tone_gate):
         """The production stream-final seam must gate and enqueue atomically.
 
         Enforce holds previews until the complete identity can be checked;
@@ -111,7 +111,7 @@ class TestConsumerDeclaredFinal:
                 transport="auto", chat_type="dm", edit_interval=0.01,
                 buffer_threshold=1, cursor="",
             ),
-            metadata=_final_identity(),
+            metadata={**_final_identity(), "tone_envelope": unit_tone_gate()},
             egress_policy=EgressPolicy.from_config(cfg),
             reliability_outbox=ReliabilityOutbox.from_config(
                 cfg, hermes_home=tmp_path,
@@ -296,7 +296,7 @@ class TestFinalAdoptionGuards:
 
 class TestQueuedLaneReconcile:
     @pytest.mark.asyncio
-    async def test_direct_runner_final_uses_same_policy_and_shadow_outbox(self, tmp_path):
+    async def test_direct_runner_final_uses_same_policy_and_shadow_outbox(self, tmp_path, unit_tone_gate):
         from gateway.run import GatewayRunner
 
         cfg = _reliability_config(tmp_path)
@@ -313,7 +313,7 @@ class TestQueuedLaneReconcile:
             "direct completed response",
             source=source,
             adapter=adapter,
-            metadata=_final_identity(),
+            metadata={**_final_identity(), "tone_envelope": unit_tone_gate()},
             text_already_delivered=False,
             deliver_media=False,
         )

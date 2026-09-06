@@ -228,8 +228,36 @@ def _metadata(**overrides) -> dict:
     return metadata
 
 
+@pytest.mark.parametrize("fault", ["missing", "extra", "facts", "tenant"])
+def test_unit_tone_fixture_rejects_unregistered_or_changed_envelopes(unit_tone_gate, fault):
+    metadata = _metadata(tone_envelope=unit_tone_gate())
+    if fault == "missing":
+        del metadata["tone_envelope"]
+    elif fault == "extra":
+        metadata["tone_envelope"]["unexpected"] = True
+    elif fault == "facts":
+        metadata["tone_envelope"]["facts"]["status"] = "changed"
+    else:
+        metadata["tenant"] = "foreign"
+    _, decision = EgressPolicy.from_config(_config("enforce")).prepare_metadata(
+        action="send", destination="slack:C123", content=b"unit", metadata=metadata,
+    )
+    assert decision.allowed is False
+    assert "unit_tone_envelope_invalid" in decision.reasons
+
+
+def test_unit_tone_fixture_does_not_bypass_identity(unit_tone_gate):
+    metadata = _metadata(tone_envelope=unit_tone_gate())
+    del metadata["work_id"]
+    prepared, decision = EgressPolicy.from_config(_config("enforce")).prepare_metadata(
+        action="send", destination="slack:C123", content=b"unit", metadata=metadata,
+    )
+    assert prepared["tone_gate"]["allowed"] is True
+    assert decision.allowed is False
+
+
 @pytest.mark.asyncio
-async def test_delivery_calls_gate_once_and_blocks_before_native_adapter():
+async def test_delivery_calls_gate_once_and_blocks_before_native_adapter(unit_tone_gate):
     adapter = _RecordingAdapter()
     policy = EgressPolicy.from_config(_config("enforce"))
     router = DeliveryRouter(
@@ -241,7 +269,7 @@ async def test_delivery_calls_gate_once_and_blocks_before_native_adapter():
 
     blocked = await router._deliver_to_platform(target, "blocked", metadata={})
     delivered = await router._deliver_to_platform(
-        target, "allowed", metadata=_metadata()
+        target, "allowed", metadata=_metadata(tone_envelope=unit_tone_gate())
     )
 
     assert blocked["success"] is False
@@ -281,16 +309,16 @@ def _relay(transport: _RelayTransport) -> RelayAdapter:
 
 
 @pytest.mark.asyncio
-async def test_relay_send_and_edit_cannot_bypass_enforced_gate():
+async def test_relay_send_and_edit_cannot_bypass_enforced_gate(unit_tone_gate):
     transport = _RelayTransport()
     relay = _relay(transport)
     relay._egress_policy = EgressPolicy.from_config(_config("enforce"))
 
     blocked_send = await relay.send("C123", "blocked", metadata={})
     blocked_edit = await relay.edit_message("C123", "M1", "blocked", metadata={})
-    allowed_send = await relay.send("C123", "allowed", metadata=_metadata())
+    allowed_send = await relay.send("C123", "allowed", metadata=_metadata(tone_envelope=unit_tone_gate()))
     allowed_edit = await relay.edit_message(
-        "C123", "M1", "allowed edit", metadata=_metadata()
+        "C123", "M1", "allowed edit", metadata=_metadata(tone_envelope=unit_tone_gate())
     )
 
     assert blocked_send.success is False
@@ -301,7 +329,7 @@ async def test_relay_send_and_edit_cannot_bypass_enforced_gate():
 
 
 @pytest.mark.asyncio
-async def test_runner_stream_relay_derives_identity_before_adapter():
+async def test_runner_stream_relay_derives_identity_before_adapter(unit_tone_gate):
     """Placement metadata is not an identity envelope.
 
     The runner-created consumer must carry the task-local authority into the
@@ -345,7 +373,7 @@ async def test_runner_stream_relay_derives_identity_before_adapter():
                 transport="edit", edit_interval=0.01,
                 buffer_threshold=1, cursor="",
             ),
-            metadata={"thread_id": "T123", "scope_id": "lugui-workspace"},
+            metadata={"thread_id": "T123", "scope_id": "lugui-workspace", "tone_envelope": unit_tone_gate()},
             egress_policy=policy,
         )
         task = asyncio.create_task(consumer.run())

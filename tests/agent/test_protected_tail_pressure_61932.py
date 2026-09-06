@@ -13,7 +13,6 @@ This is the core compressor contract — not Desktop/Windows-specific.
 
 from __future__ import annotations
 
-import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -245,20 +244,11 @@ class TestProtectedTailPressure61932:
         before = estimate_messages_tokens_rough(messages)
         assert before > 1_000_000
 
-        def slow_aux(**_kwargs):
-            time.sleep(0.2)
-            return SimpleNamespace(
-                choices=[SimpleNamespace(message=SimpleNamespace(content="too late"))]
-            )
-
-        started = time.monotonic()
-        with patch("agent.context_compressor.call_llm", side_effect=slow_aux) as main_aux, patch(
-            "agent.auxiliary_client.call_llm", side_effect=slow_aux
-        ) as digest_aux:
+        with patch("agent.context_compressor.call_llm") as main_aux, patch(
+            "agent.auxiliary_client.call_llm"
+        ) as digest_aux, patch("time.sleep") as sleep:
             out = c.compress(messages, current_tokens=before)
-        elapsed = time.monotonic() - started
-
-        assert elapsed < 0.5
+        sleep.assert_not_called()
         main_aux.assert_not_called()
         digest_aux.assert_not_called()
         assert estimate_messages_tokens_rough(out) < c.context_length

@@ -9,6 +9,7 @@ PATCH/bulk/model-options surfaces.
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import subprocess
 import sys
 from pathlib import Path
@@ -118,6 +119,11 @@ def test_migration_adds_provider_override_column(conn):
 
 
 def _spawn_and_capture(monkeypatch, tmp_path, task):
+    worker_path = tmp_path / "worker-path.sh"
+    worker_path.write_text("export HERMES_PYTEST_WORKER_PATH=1\n", encoding="utf-8")
+    worker_path.chmod(0o700)
+    monkeypatch.setenv("HERMES_WORKER_PATH_LIB", str(worker_path))
+    monkeypatch.setenv("K5_WORKER_PATH_SHA256", hashlib.sha256(worker_path.read_bytes()).hexdigest())
     monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
     captured = {}
 

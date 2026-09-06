@@ -351,7 +351,7 @@ class TestSendUpdateNotification:
 
     @pytest.mark.asyncio
     async def test_shadow_completion_notification_enqueues_without_native_send(
-        self, tmp_path
+        self, tmp_path, unit_tone_gate
     ):
         runner = _make_runner()
         hermes_home = tmp_path / "hermes"
@@ -372,6 +372,7 @@ class TestSendUpdateNotification:
             "policy_version": "tone-v1",
             "milestone": "update-complete",
             "version": "update-7",
+            "tone_envelope": unit_tone_gate(),
         }
         runner._thread_metadata_for_target = MagicMock(return_value=identity)
         config = {

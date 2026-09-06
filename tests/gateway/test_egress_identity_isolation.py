@@ -34,7 +34,7 @@ class _InterleavingAdapter:
 
 
 @pytest.mark.asyncio
-async def test_two_concurrent_tenants_keep_distinct_egress_envelopes():
+async def test_two_concurrent_tenants_keep_distinct_egress_envelopes(unit_tone_gate):
     adapter = _InterleavingAdapter()
     policy = EgressPolicy.from_config(
         {"gateway": {"reliability": {"egress": {"mode": "enforce"}}}}
@@ -53,6 +53,7 @@ async def test_two_concurrent_tenants_keep_distinct_egress_envelopes():
                 f"message for {tenant}",
                 metadata={
                     "tenant": tenant,
+                    "tone_envelope": unit_tone_gate(profile=profile, tenant=tenant),
                     "machine": "personal-mac-mini",
                     "work_id": WORK_ID,
                     "policy_version": "tone-v1",

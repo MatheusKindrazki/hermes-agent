@@ -73,14 +73,14 @@ def _event_types(tmp_path):
 
 @pytest.mark.asyncio
 async def test_runner_auto_tts_shadow_enqueues_without_native_voice(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, unit_tone_gate
 ):
     monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
     _fake_tts_call(monkeypatch)
     native_voice = AsyncMock()
     runner = _runner_with_adapter(native_voice)
     runner._thread_metadata_for_source = MagicMock(
-        return_value=_identity("auto-tts-1")
+        return_value={**_identity("auto-tts-1"), "tone_envelope": unit_tone_gate()}
     )
     _enable_shadow(runner, tmp_path)
 
@@ -92,7 +92,7 @@ async def test_runner_auto_tts_shadow_enqueues_without_native_voice(
 
 @pytest.mark.asyncio
 async def test_discord_voice_channel_auto_tts_shadow_skips_native_playback(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, unit_tone_gate
 ):
     monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
     _fake_tts_call(monkeypatch)
@@ -107,7 +107,7 @@ async def test_discord_voice_channel_auto_tts_shadow_skips_native_playback(
     runner = object.__new__(GatewayRunner)
     runner.adapters = {Platform.DISCORD: adapter}
     runner._thread_metadata_for_source = MagicMock(
-        return_value=_identity("discord-vc-tts-1")
+        return_value={**_identity("discord-vc-tts-1"), "tone_envelope": unit_tone_gate()}
     )
     _enable_shadow(runner, tmp_path)
     event = make_voice_event()
@@ -121,7 +121,7 @@ async def test_discord_voice_channel_auto_tts_shadow_skips_native_playback(
 
 
 @pytest.mark.asyncio
-async def test_background_result_shadow_enqueues_without_native_send(tmp_path):
+async def test_background_result_shadow_enqueues_without_native_send(tmp_path, unit_tone_gate):
     runner = make_background_runner()
     adapter = AsyncMock()
     adapter.extract_media = MagicMock(return_value=([], "background answer"))
@@ -129,7 +129,7 @@ async def test_background_result_shadow_enqueues_without_native_send(tmp_path):
     adapter.toolsets_for_source = MagicMock(return_value=None)
     runner.adapters[Platform.TELEGRAM] = adapter
     runner._thread_metadata_for_source = MagicMock(
-        return_value=_identity("background-1")
+        return_value={**_identity("background-1"), "tone_envelope": unit_tone_gate()}
     )
     _enable_shadow(runner, tmp_path)
     source = SessionSource(
@@ -155,13 +155,13 @@ async def test_background_result_shadow_enqueues_without_native_send(tmp_path):
 
 @pytest.mark.asyncio
 async def test_nonstream_final_shadow_enqueues_without_native_adapter(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, unit_tone_gate
 ):
     adapter = _Adapter()
     _enable_shadow(adapter, tmp_path)
     monkeypatch.setattr(
         "gateway.platforms.base._thread_metadata_for_source",
-        lambda *_args, **_kwargs: _identity("nonstream-1"),
+        lambda *_args, **_kwargs: {**_identity("nonstream-1"), "tone_envelope": unit_tone_gate()},
     )
 
     await _run(adapter, _event(), response="nonstream final")

@@ -271,6 +271,8 @@ def test_zip_overlay_flag_is_valid_against_real_git(tmp_path):
     a real .gitignore and asserts the guard both runs clean AND still sees
     ignored user files.
     """
+    tmp_path = tmp_path / "repo"
+    tmp_path.mkdir()
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
     (tmp_path / ".gitignore").write_text("*.local\nvenv/\n")
     subprocess.run(

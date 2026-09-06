@@ -19795,11 +19795,14 @@ def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch):
     """The trim boundary must not retain the just-pruned history snapshots."""
     observed = {}
     cleanup_order = []
+    completed = []
 
     class _Agent:
         def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
+            self, prompt, conversation_history=None, stream_callback=None,
+            persist_user_message=None,
         ):
+            cleanup_order.append("run")
             return {
                 "final_response": "reply",
                 "messages": [{"role": "assistant", "content": "reply"}],
@@ -19839,7 +19842,7 @@ def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch):
         monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
-        monkeypatch.setattr(server, "_emit", lambda *a: None)
+        monkeypatch.setattr(server, "_emit", lambda event, _sid, payload=None: completed.append(payload) if event == "message.complete" else None)
         monkeypatch.setattr(server, "set_hermes_home_override", lambda _home: object())
         monkeypatch.setattr(
             server,
@@ -19859,7 +19862,9 @@ def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch):
         assert resp is not None and resp.get("result")
         assert not observed["history"]
         assert not observed["run_kwargs"]
-        assert cleanup_order == ["trim", "reset_home"]
+        assert cleanup_order == ["reset_home", "run", "trim", "reset_home"]
+        assert len(completed) == 1
+        assert completed[0]["status"] == "complete"
     finally:
         server._sessions.pop("sid_trim", None)
 

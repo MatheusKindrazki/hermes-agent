@@ -163,11 +163,11 @@ async def test_post_stream_media_enforce_blocks_before_native_adapter(tmp_path, 
 
 
 @pytest.mark.asyncio
-async def test_post_stream_media_shadow_enqueues_without_native_adapter(tmp_path, monkeypatch):
+async def test_post_stream_media_shadow_enqueues_without_native_adapter(tmp_path, monkeypatch, unit_tone_gate):
     media_file = _allowed_media_path(tmp_path, monkeypatch, "shadow.png")
     adapter = _adapter()
     config = _reliability_config(tmp_path)
-    runner = _fake_runner(_identity())
+    runner = _fake_runner({**_identity(), "tone_envelope": unit_tone_gate()})
     runner._egress_policy = EgressPolicy.from_config(config)
     runner._reliability_outbox = ReliabilityOutbox.from_config(
         config, hermes_home=tmp_path
@@ -188,4 +188,3 @@ async def test_post_stream_media_shadow_enqueues_without_native_adapter(tmp_path
     assert events == [
         ("gateway_runner_media", "turn-complete", "SimpleNamespace:C123CHAN")
     ]
-
