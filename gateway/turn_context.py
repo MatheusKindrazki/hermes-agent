@@ -123,6 +123,11 @@ def write_kernel_shadow_receipt(event: dict[str, Any]) -> Optional[Path]:
         os.chmod(temporary, 0o600)
         os.replace(temporary, target)
         target.chmod(0o600)
+        directory_fd = os.open(spool, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     except BaseException:
         try:
             os.unlink(temporary)
@@ -307,6 +312,7 @@ class TurnContext:
     # reference, so taking it is visible to the parent that owns the lifecycle
     # and retires it.
     k8_pre_admission: Any = None
+    effect_origin: Any = None
 
     # --- lazy-imported callables captured from the outer body -------------
     AIAgent: Any = None

@@ -16,6 +16,134 @@ import pytest
 from tools import bot_mode_dm
 
 
+@pytest.mark.parametrize("failure", [None, "release_ambiguous", "spool_failed", "ack_missing"])
+def test_observe_effect_four_stores_exact_release_and_ack_replay(tmp_path, monkeypatch, failure):
+    """Real SessionDB, private ledger/spool and POS collector SQLite.
+
+    Admission/release transport responses are explicit offline fixtures, not
+    evidence of a live Jarvis lifecycle event or production authority.
+    """
+    import cli
+    import importlib.util
+    import os
+    import time
+    from agent import durable_admission as da
+    from hermes_state import SessionDB
+
+    root = Path(os.environ.get("HERMES_TEST_K7_ROOT",
+        "/Users/matheuskindrazki/development/personal/.worktrees/hermes-personal-os/kindra-passive-observer-20260906"))
+    spec = importlib.util.spec_from_file_location("observation_collector", root / "cron/scripts/kernel-shadow-collector.py")
+    collector = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(collector)
+    spool = tmp_path / "spool"
+    writer = da.ObservationWriter(spool, code_sha="a" * 40)
+    monkeypatch.setattr(da, "_OBSERVER", writer)
+    monkeypatch.setenv(da.ENV_MODE, "observe")
+    monkeypatch.setenv("HERMES_KERNEL_SHADOW_PRODUCER_ENABLED", "1")
+    monkeypatch.setenv("HERMES_KERNEL_SHADOW_RECEIPT_DIR", str(spool))
+    monkeypatch.setattr(da, "_settings", lambda: {"tenant": "personal", "machine": "mini"})
+    monkeypatch.setattr(da, "_active_profile", lambda: "projetospessoais")
+    monkeypatch.setattr(bot_mode_dm.tempfile, "gettempdir", lambda: str(tmp_path))
+    identity = dict(_identity(), profile="projetospessoais", source="projetospessoais", origin_machine="mini")
+    fence = {"fence_valid": True, "identity_sha256": bot_mode_dm._canonical_sha256(identity)}
+    writer.checkpoint()
+    receiver = SessionDB(tmp_path / "receiver.db")
+    target_session = receiver.create_session("receiver-target", "cli")
+    sends, releases, fences = [], [], []
+    monkeypatch.setattr(da, "admit_observed_effect", lambda obs: identity)
+    monkeypatch.setattr(da, "_run_turn_identity_revalidation", lambda value: fences.append(value) or fence)
+    monkeypatch.setattr(bot_mode_dm, "_delivery_lock", lambda *a, **k: nullcontext())
+    monkeypatch.setattr(bot_mode_dm, "_validate_local_ack_against_destination",
+        lambda ack, record, argv: bot_mode_dm._validate_local_ack_row(receiver, ack, record))
+    if failure == "ack_missing":
+        monkeypatch.setattr(bot_mode_dm, "_validate_local_ack_against_destination",
+            lambda *a: (_ for _ in ()).throw(OSError("independent SessionDB unavailable")))
+    if failure == "spool_failed":
+        monkeypatch.setattr(bot_mode_dm, "_emit_delivery_shadow_receipt",
+            lambda *a, **k: (_ for _ in ()).throw(OSError("spool unavailable")))
+
+    def transport(argv, **kwargs):
+        query = Path(argv[argv.index("--query-file") + 1])
+        message, envelope = cli._decode_delivery_query(query.read_text())
+        receiver.append_message(target_session, "user", message, display_kind="bot_delivery",
+            display_metadata=cli._delivery_display_metadata(envelope))
+        ack = cli._delivery_ack(receiver, target_session, envelope, adapter="cli")
+        sends.append(ack)
+        return SimpleNamespace(returncode=0, stdout=json.dumps({"reply": "ok", "session_id": target_session, "delivery_ack": ack}), stderr="")
+
+    def release(value, event_id):
+        releases.append(event_id)
+        if failure == "release_ambiguous":
+            raise TimeoutError("ambiguous transport")
+        session = "hk1-" + hashlib.sha256(json.dumps(["hermes-kernel-execution.v1", value["work_id"], value["origin_session_id"]], separators=(",", ":")).encode()).hexdigest()
+        source = "kernel-effect-" + hashlib.sha256(json.dumps(["hermes-kernel-effect-release.v1", value["work_id"], value["attempt_id"], value["generation"], session, event_id], separators=(",", ":")).encode()).hexdigest() + ":release-" + str(value["generation"])
+        return {"schema_version": "work-control.effect-release.v1", "contract_version": "work-control.v1",
+            "outcome": "released", "work_id": value["work_id"], "origin_session_id": value["origin_session_id"],
+            "attempt_id": value["attempt_id"], "generation": value["generation"], "release_event_id": event_id,
+            "execution_session_key": session, "source_event_id": source}
+
+    monkeypatch.setattr(da, "release_observed_effect", release)
+    monkeypatch.setattr(bot_mode_dm.subprocess, "run", transport)
+    receipts = []
+    def spawn(command, label, **kwargs):
+        receipts.append(kwargs["dm_file"])
+        assert bot_mode_dm._run_delivery(["hermes", "-p", "receiver"], kwargs["dm_file"], stdin_file=False) == 0
+        return json.dumps({"status": "accepted"})
+    monkeypatch.setattr(bot_mode_dm, "_spawn_delivery", spawn)
+    agent = SimpleNamespace(session_id="wrong-cached-origin", _session_db=SimpleNamespace(db_path=str(tmp_path / "sender.db")))
+    origin = da.capture_effect_origin("origin-exact", "telegram:123")
+    with da.effect_origin_scope(origin):
+        bot_mode_dm._start_delivery(["hermes", "-p", "receiver"], "private outgoing", "receiver",
+            stdin_file=False, task_id=None, agent=agent)
+        replay = json.loads(bot_mode_dm._start_delivery(["hermes", "-p", "receiver"], "private outgoing", "receiver",
+            stdin_file=False, task_id=None, agent=agent))
+    if failure != "ack_missing":
+        bot_mode_dm._update_delivery_receipt(receipts[0], "delivered", ack=sends[0], ack_row_validated=True)
+        assert bot_mode_dm._run_delivery(["hermes", "-p", "receiver"], receipts[0], stdin_file=False) == 0
+    assert replay["status"] == ("accepted" if failure == "ack_missing" else "delivered")
+    assert len(sends) == 1 and len(fences) == 2
+    assert len(releases) == (0 if failure in {"spool_failed", "ack_missing"} else 1)
+    assert len(receiver.get_messages(target_session)) == 1
+    effect = json.loads(next((spool / "observation-effects").glob("*.json")).read_text())
+    assert effect["sequence"] == 1
+    ledger_record = json.loads(Path(receipts[0] + ".receipt.json").read_text())
+    if releases:
+        assert releases == [ledger_record["release_event_id"]]
+    if failure is not None:
+        assert effect["state"] == "gap" and effect["gap_reason"] == failure
+        if failure == "release_ambiguous":
+            assert ledger_record["release_state"] == "requested"
+        receiver.close()
+        return
+    assert effect["state"] == "settled"
+    assert ledger_record["release_state"] == "acknowledged"
+    settlement = effect["settlement"]
+    ledger_path = bot_mode_dm._delivery_ledger_path(ledger_record["idempotency_key"])
+    assert settlement["ledger_sha256"] == hashlib.sha256(ledger_path.read_bytes()).hexdigest()
+    collector_db = collector._connect(tmp_path / "collector.db")
+    assert collector._ingest(collector_db, spool, {"max_receipt_bytes": 65536}, int(time.time())) == (1, 0, 0)
+    assert collector._ingest(collector_db, spool, {"max_receipt_bytes": 65536}, int(time.time())) == (0, 1, 0)
+    assert collector._settlement_valid(effect)
+    # A callback fixture is insufficient: no canonical Jarvis release exported.
+    assert not collector._settlement_correlated(collector_db, effect)
+    assert collector_db.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 1
+    # Explicit offline projection fixture: proves the collector correlation,
+    # not that Jarvis emitted it in a live installation.
+    from gateway.turn_context import write_kernel_shadow_receipt
+    delivery_event = json.loads((spool / (settlement["delivery_event_id"] + ".json")).read_text())
+    release_projection_id = "01a061a7-cea0-7503-b308-1f4029d450cb"
+    release_projection = dict(delivery_event, event_id=release_projection_id,
+        source_event_id=release_projection_id, action="terminal", outcome="unknown",
+        delivery_id="", terminal=False, adapter_receipt_sha256="f" * 64)
+    write_kernel_shadow_receipt(release_projection)
+    assert collector._ingest(collector_db, spool, {"max_receipt_bytes": 65536}, int(time.time())) == (1, 1, 0)
+    assert collector._settlement_correlated(collector_db, effect)
+    assert collector._observation_records(collector_db, spool, {"max_receipt_bytes": 65536}, int(time.time())) is None
+    assert collector_db.execute("SELECT COUNT(*) FROM observation_effects").fetchone()[0] == 1
+    collector_db.close()
+    receiver.close()
+
+
 def _identity():
     return {
         "schema_version": "hermes.kernel-turn-identity.v1",
@@ -39,6 +167,45 @@ def _ack(delivery_id, request_key, identity_sha):
         "adapter": "cli", "state": "persisted", "accepted_at": 10,
         "persisted_at": 11,
     }
+
+
+@pytest.mark.parametrize("fault", [None, "generation", "source_event_id", "extra", "timeout"])
+def test_exact_release_pinned_cli_closed_wire_single_call(tmp_path, monkeypatch, fault):
+    from agent import durable_admission as da
+    import subprocess
+
+    identity = dict(_identity(), profile="projetospessoais", source="projetospessoais", origin_machine="mini")
+    event_id = "01a061a7-cea0-7503-b308-1f4029d450ca"
+    response = {"schema_version": "work-control.effect-release.v1", "contract_version": "work-control.v1",
+        "outcome": "released", "work_id": identity["work_id"], "origin_session_id": "origin-exact",
+        "attempt_id": identity["attempt_id"], "generation": 7, "release_event_id": event_id,
+        "execution_session_key": "hk1-a8a115423c86c374acbd53e76d5510ca2f214944ca3ee48abaaa3ee52e14d4fd",
+        "source_event_id": "kernel-effect-6e2f536d661d670096b35a0b743adc66b5f53937400a69d351a3054d7e7a7b57:release-7"}
+    if fault == "generation":
+        response["generation"] = 8
+    if fault == "source_event_id":
+        response["source_event_id"] = "foreign-release"
+    if fault == "extra":
+        response["text"] = "forbidden"
+    monkeypatch.setattr(da, "_resolve_trust_roots", lambda: SimpleNamespace(admitter_bin="/fixture/pinned-cli", root_dir=tmp_path))
+    monkeypatch.setattr(da, "_settings", lambda: {"jarvis_base_url": "https://fixture.invalid", "secret_ref": "fixture-ref"})
+    calls = []
+    def execute(argv, **kwargs):
+        calls.append((argv, kwargs))
+        if fault == "timeout":
+            raise subprocess.TimeoutExpired(argv, 2)
+        return SimpleNamespace(returncode=0, stdout=json.dumps(response))
+    monkeypatch.setattr(da.subprocess, "run", execute)
+    if fault:
+        with pytest.raises((da.TurnIdentityError, subprocess.TimeoutExpired)):
+            da.release_observed_effect(identity, event_id)
+    else:
+        assert da.release_observed_effect(identity, event_id) == response
+    assert len(calls) == 1
+    argv, options = calls[0]
+    assert argv == ["/fixture/pinned-cli", "release-turn-identity", "--stdin", "--jarvis-base-url", "https://fixture.invalid", "--secret-ref", "fixture-ref"]
+    assert json.loads(options["input"]) == {"turn_identity": identity, "release_event_id": event_id}
+    assert options["timeout"] == 2 and options["shell"] is False
 
 
 def test_delivery_receipt_binds_origin_session_and_reaches_terminal_state(tmp_path):

@@ -95,6 +95,58 @@ def _make_runner(ctx):
     return TurnRunner(_StubGatewayRunner(), ctx)
 
 
+def test_effect_origin_explicit_executor_scope_resets_on_failure(monkeypatch):
+    from agent import durable_admission as da
+    from gateway.run import GatewayRunner
+
+    monkeypatch.setenv(da.ENV_MODE, "observe")
+    monkeypatch.setattr(da, "_settings", lambda: {"tenant": "personal", "machine": "mini"})
+    monkeypatch.setattr(da, "_active_profile", lambda: "projetospessoais")
+    origin = da.capture_effect_origin("origin-session", "telegram:456")
+    runner = _make_runner(TurnContext(effect_origin=origin, user_config={}))
+    def body():
+        assert da.current_effect_origin() is origin
+        raise RuntimeError("turn failed")
+    monkeypatch.setattr(runner, "_run_sync_inner", body)
+    async def exercise():
+        gateway = GatewayRunner.__new__(GatewayRunner)
+        with pytest.raises(RuntimeError, match="turn failed"):
+            await gateway._run_in_executor_with_context(runner.run_sync)
+        assert da.current_effect_origin() is None
+        assert await gateway._run_in_executor_with_context(da.current_effect_origin) is None
+    asyncio.run(exercise())
+
+
+def test_observation_heartbeat_is_idle_local_and_stops(monkeypatch, tmp_path):
+    from agent import durable_admission as da
+    from gateway.run import GatewayRunner
+    import hermes_cli.build_info
+    monkeypatch.setenv(da.ENV_MODE, "observe")
+    monkeypatch.setenv("HERMES_KERNEL_SHADOW_RECEIPT_DIR", str(tmp_path / "receipts"))
+    monkeypatch.setattr(da, "_settings", lambda: {"tenant": "personal", "machine": "mini", "observation": {"code_sha": "a" * 40}})
+    monkeypatch.setattr(da, "_active_profile", lambda: "projetospessoais")
+    monkeypatch.setattr(hermes_cli.build_info, "get_code_identity", lambda: {"sha": "a" * 40})
+    monkeypatch.setattr(da, "_OBSERVER", None)
+    monkeypatch.setattr(da.subprocess, "run", lambda *a, **k: pytest.fail("heartbeat authority call"))
+    gateway = GatewayRunner.__new__(GatewayRunner)
+    gateway._running = True
+    gateway._background_tasks = set()
+    intervals = []
+    async def sleep(interval):
+        intervals.append(interval)
+        gateway._running = False
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    async def exercise():
+        gateway._start_observation_task()
+        await gateway._observation_task
+    asyncio.run(exercise())
+    record = json.loads((tmp_path / "receipts/observation-channel.json").read_text())
+    assert intervals == [30]
+    assert record["state"] == "stopped" and record["sequence"] == 3
+    assert record["last_effect_sequence"] == 0
+    assert record["valid_until"] - record["checked_at"] == 120
+
+
 class TestTurnContext:
     def test_defaults_are_independent_containers(self):
         a, b = TurnContext(), TurnContext()

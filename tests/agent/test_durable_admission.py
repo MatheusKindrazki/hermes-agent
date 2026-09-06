@@ -25,10 +25,10 @@ import pytest
 
 from agent import conversation_loop, durable_admission
 
-K7_ROOT = Path(
+K7_ROOT = Path(os.environ.get("HERMES_TEST_K7_ROOT",
     "/Users/matheuskindrazki/development/personal/.worktrees/"
     "hermes-personal-os/hermes-kernel-v1-k7-kernel-20260902"
-)
+))
 K7_BIN = K7_ROOT / "control" / "kernel" / "admit_cli.py"
 K7_SCHEMA = K7_ROOT / "control" / "schemas" / "work-envelope.schema.json"
 
@@ -44,6 +44,88 @@ OK_RESPONSE = {
     "work_status": "open",
     "created": True,
 }
+
+
+def test_observe_origin_is_sealed_scoped_and_never_admits(monkeypatch):
+    from dataclasses import FrozenInstanceError, replace
+
+    monkeypatch.setenv(durable_admission.ENV_MODE, "observe")
+    monkeypatch.setattr(durable_admission, "_settings", lambda: {
+        "tenant": "personal", "machine": "mini",
+    })
+    monkeypatch.setattr(durable_admission, "_active_profile", lambda: "projetospessoais")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("ingress subprocess"))
+    assert durable_admission.resolve_mode() is False
+    origin = durable_admission.capture_effect_origin("chat-original", "telegram:123")
+    assert origin is not None
+    with pytest.raises(FrozenInstanceError):
+        origin.event_id = "telegram:456"
+    assert durable_admission.capture_effect_origin("chat-original", "") is None
+    with durable_admission.effect_origin_scope(origin):
+        assert durable_admission.current_effect_origin() is origin
+        with pytest.raises(RuntimeError):
+            with durable_admission.effect_origin_scope(None):
+                assert durable_admission.current_effect_origin() is None
+                raise RuntimeError("unwind")
+        assert durable_admission.current_effect_origin() is origin
+        with pytest.raises(ValueError):
+            with durable_admission.effect_origin_scope(replace(origin, event_id="telegram:456")):
+                pass
+    assert durable_admission.current_effect_origin() is None
+    monkeypatch.setattr(durable_admission, "_active_profile", lambda: "business")
+    assert durable_admission.capture_effect_origin("chat-original", "telegram:123") is None
+
+
+def test_observation_writer_reserves_once_and_latches_first_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv(durable_admission.ENV_MODE, "observe")
+    monkeypatch.setattr(durable_admission, "_settings", lambda: {"tenant": "personal", "machine": "mini"})
+    monkeypatch.setattr(durable_admission, "_active_profile", lambda: "projetospessoais")
+    root = tmp_path / "receipts"
+    writer = durable_admission.ObservationWriter(root, code_sha="a" * 40)
+    writer.checkpoint(now=1000)
+    origin = durable_admission.capture_effect_origin("chat-original", "telegram:123")
+    first = writer.reserve(origin, "destination", "secret outgoing body", now=1001)
+    assert first["state"] == "reserved" and first["sequence"] == 1
+    assert writer.reserve(origin, "destination", "secret outgoing body", now=1002) == first
+    second = writer.reserve(durable_admission.capture_effect_origin("chat-original", "telegram:124"),
+                            "destination", "secret outgoing body", now=1002)
+    assert second["effect_id"] != first["effect_id"] and second["sequence"] == 2
+    writer.transition(first["effect_id"], "gap", gap_reason="ack_missing", now=1003)
+    replay = writer.reserve(origin, "destination", "secret outgoing body", now=1004)
+    assert replay["state"] == "gap" and replay["sequence"] == 1
+    with pytest.raises(ValueError):
+        writer.transition(first["effect_id"], "gap", gap_reason="release_failed", now=1004)
+    writer.checkpoint(now=1005)
+    channel = json.loads((root / "observation-channel.json").read_text())
+    assert channel["last_effect_sequence"] == 2 and channel["valid_until"] == 1125
+    assert "secret outgoing body" not in "".join(p.read_text() for p in root.rglob("*.json"))
+    monkeypatch.setattr(writer, "_write", lambda *a: (_ for _ in ()).throw(OSError("disk full")))
+    with pytest.raises(OSError):
+        writer.checkpoint(now=1006)
+    assert writer.broken is True
+
+
+def test_observation_sequence_across_boots_and_concurrent_reservations(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    monkeypatch.setenv(durable_admission.ENV_MODE, "observe")
+    monkeypatch.setattr(durable_admission, "_settings", lambda: {"tenant": "personal", "machine": "mini"})
+    monkeypatch.setattr(durable_admission, "_active_profile", lambda: "projetospessoais")
+    root = tmp_path / "receipts"
+    writer = durable_admission.ObservationWriter(root, code_sha="a" * 40)
+    writer.checkpoint(now=1000)
+    origin = durable_admission.capture_effect_origin("chat-original", "telegram:123")
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        records = list(pool.map(lambda _: writer.reserve(origin, "peer", "outgoing", now=1001), range(12)))
+    assert all(record == records[0] for record in records)
+    writer.checkpoint(now=1002, stopped=True)
+    writer.checkpoint(now=1003)
+    assert json.loads((root / "observation-channel.json").read_text())["state"] == "stopped"
+    reboot = durable_admission.ObservationWriter(root, code_sha="a" * 40)
+    reboot.checkpoint(now=1004)
+    channel = json.loads((root / "observation-channel.json").read_text())
+    assert channel["sequence"] == 4 and channel["state"] == "starting"
+    assert channel["last_effect_sequence"] == 0
+    assert reboot.reserve(origin, "peer", "outgoing", now=1005) == records[0]
 
 
 class ReachedTurnContext(RuntimeError):
@@ -371,8 +453,13 @@ def test_config_mode_off_disarms_an_armed_env(monkeypatch, tmp_path, turn_probe)
 @requires_k7
 def test_the_pinned_admitter_hash_is_the_approved_k7_build():
     """The constant this consumer ships must be the hash of the real binary."""
+    expected_sha256 = (
+        durable_admission.TURN_IDENTITY_ADMITTER_SHA256
+        if os.environ.get("HERMES_TEST_K7_ROOT")
+        else durable_admission.ADMITTER_SHA256
+    )
     assert (
-        durable_admission._sha256_file(K7_BIN) == durable_admission.ADMITTER_SHA256
+        durable_admission._sha256_file(K7_BIN) == expected_sha256
     )
     assert (
         durable_admission._sha256_file(K7_SCHEMA) == durable_admission.SCHEMA_SHA256

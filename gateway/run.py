@@ -5470,6 +5470,12 @@ class TurnRunner:
             _fut.add_done_callback(_track_status_id)
 
     def run_sync(self):
+        from agent.durable_admission import effect_origin_scope
+
+        with effect_origin_scope(self._ctx.effect_origin):
+            return self._run_sync_with_request_context()
+
+    def _run_sync_with_request_context(self):
         """Execute one turn under its immutable request authority snapshot.
 
         Runtime model/provider resolution happens exactly once when the v2
@@ -12915,6 +12921,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _stop_loop_liveness_guards(self) -> None:
         """Disarm lifetime liveness guards before shutdown can load the loop."""
+        observation_task = getattr(self, "_observation_task", None)
+        if observation_task is not None:
+            observation_task.cancel()
+            self._observation_task = None
+            from agent.durable_admission import observation_checkpoint
+            observation_checkpoint(stopped=True)
         watchdog = getattr(self, "_loop_liveness_watchdog", None)
         self._loop_liveness_watchdog = None
         if watchdog is not None:
@@ -13005,6 +13017,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._loop_heartbeat_task.add_done_callback(_bg.discard)
         except Exception:
             logger.debug("Failed to start gateway loop heartbeat", exc_info=True)
+
+    def _start_observation_task(self):
+        from agent.durable_admission import start_observation, observation_checkpoint
+
+        if start_observation() is None:
+            return
+
+        async def _observation_heartbeat():
+            try:
+                while self._running:
+                    await asyncio.sleep(30)
+                    observation_checkpoint()
+            finally:
+                observation_checkpoint(stopped=True)
+
+        self._observation_task = asyncio.create_task(_observation_heartbeat())
+        self._observation_task._hermes_supervised_watcher = True
+        self._background_tasks.add(self._observation_task)
+        self._observation_task.add_done_callback(self._background_tasks.discard)
 
     async def start(self) -> bool:
         """
@@ -13783,6 +13814,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._update_runtime_status("running")
 
         self._start_loop_heartbeat_task()
+
+        self._start_observation_task()
 
         # Emit gateway:startup hook
         hook_count = len(self.hooks.loaded_hooks)
@@ -17638,6 +17671,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return blocked_turn_result(self, outcome, None)["final_response"]
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
+        from agent.durable_admission import effect_origin_scope
+
+        with effect_origin_scope(None):
+            return await self._handle_message_with_effect_scope(event)
+
+    async def _handle_message_with_effect_scope(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
         
@@ -17961,6 +18000,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _k8_blocked = self._k8_admit_inbound(event, source)
             if _k8_blocked is not None:
                 return _k8_blocked
+
+        if not is_internal:
+            from agent.durable_admission import capture_effect_origin, platform_event_id, publish_effect_origin
+
+            _raw_event = getattr(event, "message_id", None)
+            if _raw_event in (None, ""):
+                _raw_event = getattr(event, "platform_update_id", None)
+            _platform = getattr(getattr(source, "platform", None), "value", "") or "hermes"
+            publish_effect_origin(capture_effect_origin(
+                self._session_key_for_source(source), platform_event_id(_platform, _raw_event),
+            ))
 
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
@@ -30284,7 +30334,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("K8 carrier pickup failed", exc_info=True)
             _k8_pre_admission = None
 
+        from agent.durable_admission import current_effect_origin
+
         turn_ctx = TurnContext(
+            effect_origin=current_effect_origin(),
             k8_pre_admission=_k8_pre_admission,
             source=source,
             _run_still_current=_run_still_current,

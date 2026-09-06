@@ -56,6 +56,11 @@ import uuid
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
+if __name__ == "__main__":
+    # The delivery runner must use the same checkout as this script, including
+    # when a worktree borrows an interpreter with another editable install.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows fallback below
@@ -95,7 +100,7 @@ def _encode_delivery_query(envelope: Mapping[str, Any], message: str) -> str:
 
 
 def _public_delivery_receipt(record: dict[str, Any]) -> dict[str, Any]:
-    hidden = {"turn_identity", "fence", "adapter_ack"}
+    hidden = {"turn_identity", "fence", "adapter_ack", "observation", "release_event_id", "release_state", "release_receipt"}
     return {key: value for key, value in record.items() if key not in hidden}
 
 
@@ -503,6 +508,13 @@ def _try_relay_delivery(
                 f"'{raw_target}' exists on several connected machines — "
                 f"disambiguate with one of: {forms}."
             )
+        from agent.durable_admission import reserve_observed_effect, observation_gap
+        relay_observation = reserve_observed_effect(
+            "relay:" + str(match["connection_id"]) + ":" + str(match["handle"]), body,
+        )
+        if relay_observation is not None:
+            # Desktop owns a different ACK seam. This adapter cannot claim it.
+            observation_gap(relay_observation, "ack_missing")
         try:
             envelope = enqueue_envelope(
                 root,
@@ -708,6 +720,7 @@ def _write_delivery_receipt(
     dm_file: str, *, origin_session_id: str, origin_reason: str, route_reason: str,
     label: str, idempotency_key: str, turn_identity: Optional[Mapping[str, Any]] = None,
     fence: Optional[Mapping[str, Any]] = None,
+    observation: Optional[dict] = None, ledger_locked: bool = False,
 ) -> dict[str, Any]:
     """Persist the accepted-state receipt before spawning a child process.
 
@@ -717,7 +730,7 @@ def _write_delivery_receipt(
     same record to a terminal state in :func:`_run_delivery`.
     """
     ledger = _delivery_ledger_path(idempotency_key)
-    with _delivery_ledger_lock(idempotency_key):
+    with (contextlib.nullcontext() if ledger_locked else _delivery_ledger_lock(idempotency_key)):
         existing = _read_delivery_ledger(ledger, idempotency_key)
         if isinstance(existing, dict) and existing.get("idempotency_key") == idempotency_key:
             existing["duplicate"] = True
@@ -739,6 +752,10 @@ def _write_delivery_receipt(
             "idempotency_key": idempotency_key, "state": "accepted",
             "accepted_at": int(time.time()),
         }
+        if observation is not None:
+            from agent.durable_admission import new_release_event_id
+            record["observation"] = observation
+            record["release_event_id"] = new_release_event_id()
         if turn_identity is not None:
             record["turn_identity"] = dict(turn_identity)
             record["fence"] = dict(fence or {})
@@ -756,10 +773,38 @@ def _write_delivery_receipt(
         return record
 
 
-def _update_delivery_receipt(dm_file: str, state: str, *, ack: Optional[dict[str, Any]] = None) -> None:
+def _update_delivery_receipt(dm_file: str, state: str, *, ack: Optional[dict[str, Any]] = None,
+                             ack_row_validated: bool = False) -> None:
+    try:
+        record = json.loads(Path(dm_file + ".receipt.json").read_text())
+    except (OSError, ValueError, TypeError):
+        from agent.durable_admission import observation_enabled, observation_gap
+        if observation_enabled():
+            observation_gap(None, "ledger_failed")
+            return
+        record = {}
+    if not record.get("observation"):
+        return _update_delivery_receipt_inner(dm_file, state, ack=ack, ack_row_validated=ack_row_validated)
+    from agent.durable_admission import observation_gap
+    try:
+        key = record["idempotency_key"]
+        with _delivery_ledger_lock(key):
+            canonical = _read_delivery_ledger(_delivery_ledger_path(key), key)
+            if canonical is None or canonical["delivery_id"] != record["delivery_id"]:
+                raise ValueError("delivery ledger mismatch")
+            if canonical.get("adapter_ack") is not None:
+                return
+            return _update_delivery_receipt_inner(dm_file, state, ack=ack, ack_row_validated=ack_row_validated)
+    except Exception:
+        observation_gap(record["observation"], "ledger_failed")
+
+
+def _update_delivery_receipt_inner(dm_file: str, state: str, *, ack=None, ack_row_validated=False):
     path = Path(dm_file + ".receipt.json")
     try:
         record = json.loads(path.read_text(encoding="utf-8"))
+        if record.get("observation") and record.get("adapter_ack") is not None:
+            return  # ACK/release replay: never fence, renew, resend or release.
         record["state"] = state
         record["updated_at"] = int(time.time())
         if ack is not None:
@@ -771,14 +816,73 @@ def _update_delivery_receipt(dm_file: str, state: str, *, ack: Optional[dict[str
             ledger = _delivery_ledger_path(idempotency_key)
             _atomic_json(ledger, record)
         if ack is not None and state == "delivered":
-            _emit_delivery_shadow_receipt(record, state, ack_bytes=_canonical(ack))
+            if record.get("observation"):
+                _settle_observed_delivery(record, path, ack, ack_row_validated=ack_row_validated)
+            else:
+                _emit_delivery_shadow_receipt(record, state, ack_bytes=_canonical(ack))
+        elif record.get("observation"):
+            from agent.durable_admission import observation_gap
+            observation_gap(record["observation"], "ack_missing" if state in {"delivered", "unknown"} else "delivery_failed")
     except (OSError, ValueError, TypeError):
-        logger.debug("delivery receipt update failed", exc_info=True)
+        if isinstance(locals().get("record"), dict) and record.get("observation"):
+            from agent.durable_admission import observation_gap
+            observation_gap(record["observation"], "ledger_failed")
+        else:
+            logger.debug("delivery receipt update failed", exc_info=True)
+
+
+def _settle_observed_delivery(record: dict, path: Path, ack: dict, *, ack_row_validated: bool):
+    from agent.durable_admission import ObservationWriter, observation_gap, release_observed_effect
+
+    observation = record["observation"]
+    if not ack_row_validated:
+        observation_gap(observation, "ack_missing")
+        return
+    try:
+        spool = _emit_delivery_shadow_receipt(record, "delivered", ack_bytes=_canonical(ack))
+        if spool is None:
+            raise ValueError("spool disabled")
+    except Exception:
+        observation_gap(observation, "spool_failed")
+        return
+    try:
+        record["release_state"] = "requested"
+        _atomic_json(path, record)
+        ledger = _delivery_ledger_path(record["idempotency_key"])
+        _atomic_json(ledger, record)
+        ledger_hash = hashlib.sha256(ledger.read_bytes()).hexdigest()
+    except Exception:
+        observation_gap(observation, "ledger_failed")
+        return
+    try:
+        release = release_observed_effect(record["turn_identity"], record["release_event_id"])
+    except Exception:
+        observation_gap(observation, "release_ambiguous")
+        return
+    try:
+        spool_document = json.loads(spool.read_text())
+        record["release_state"] = "acknowledged"
+        record["release_receipt"] = release
+        _atomic_json(path, record)
+        _atomic_json(ledger, record)
+        ledger_hash = hashlib.sha256(ledger.read_bytes()).hexdigest()
+        identity = record["turn_identity"]
+        writer = ObservationWriter(Path(observation["root"]), code_sha=observation["code_sha"], boot_id=observation["effect"]["boot_id"])
+        writer.transition(observation["effect"]["effect_id"], "settled", settlement={
+            "work_id": identity["work_id"], "attempt_id": identity["attempt_id"], "generation": identity["generation"],
+            "delivery_id": record["delivery_id"], "delivery_event_id": spool_document["event_id"],
+            "ack_sha256": _canonical_sha256(ack), "ledger_sha256": ledger_hash,
+            "spool_sha256": hashlib.sha256(spool.read_bytes()).hexdigest(),
+            "release_event_id": record["release_event_id"], "release_source_event_id": release["source_event_id"],
+            "release_receipt_sha256": _canonical_sha256(release),
+        })
+    except Exception:
+        observation_gap(observation, "storage_failed")
 
 
 def _emit_delivery_shadow_receipt(
     record: dict[str, Any], state: str, *, ack_bytes: Optional[str] = None
-) -> None:
+) -> Optional[Path]:
     """Observe a terminal DM effect only with an upstream-validated fence."""
     if os.environ.get("HERMES_KERNEL_SHADOW_PRODUCER_ENABLED", "0") != "1":
         return
@@ -787,7 +891,7 @@ def _emit_delivery_shadow_receipt(
     try:
         from gateway.turn_context import write_kernel_shadow_receipt
         identity = record["turn_identity"]
-        fence = _revalidate_delivery_identity(record)
+        fence = record["fence"] if record.get("observation") else _revalidate_delivery_identity(record)
         work_id = identity["work_id"]
         authority_version = identity["authority_version"]
         tenant = identity["tenant"]
@@ -802,7 +906,7 @@ def _emit_delivery_shadow_receipt(
         event_id = "agent-delivery-" + hashlib.sha256(
             (work_id + "\0" + delivery_id + "\0" + state).encode("utf-8")
         ).hexdigest()
-        write_kernel_shadow_receipt({
+        return write_kernel_shadow_receipt({
             "schema": "hermes.kernel-shadow-event/v1",
             "event_id": event_id,
             "work_id": work_id,
@@ -823,9 +927,13 @@ def _emit_delivery_shadow_receipt(
             "fence_valid": bool(fence["fence_valid"]),
             "material": False,
             "waiting_for_human": False,
+            # Terminal DELIVERY, never Work completion. The separate release
+            # projection remains action=terminal, outcome=unknown, terminal=false.
             "terminal": True,
         })
     except (KeyError, TypeError, ValueError, OSError, RuntimeError):
+        if record.get("observation"):
+            raise
         logger.debug("kernel shadow delivery receipt skipped", exc_info=True)
 
 
@@ -990,6 +1098,7 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool) -> int:
     returncode = 1
     structured = False
     ack: Optional[dict[str, Any]] = None
+    ack_row_validated = False
     try:
         receipt_path = Path(dm_file + ".receipt.json")
         try:
@@ -997,6 +1106,18 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool) -> int:
         except (OSError, ValueError, TypeError):
             record = {}
         structured = isinstance(record.get("turn_identity"), dict)
+        if record.get("observation"):
+            key = record["idempotency_key"]
+            with _delivery_ledger_lock(key):
+                canonical = _read_delivery_ledger(_delivery_ledger_path(key), key)
+                if canonical is not None and canonical.get("adapter_ack") is not None:
+                    if canonical["delivery_id"] != record["delivery_id"]:
+                        raise ValueError("delivery ledger mismatch")
+                    # The effect already has an independent ACK. No fence,
+                    # transport or release is legal on a child replay either.
+                    ack = canonical["adapter_ack"]
+                    returncode = 0
+                    return returncode
         transport_argv = list(argv)
         if structured:
             try:
@@ -1005,9 +1126,15 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool) -> int:
                     fresh_fence.get("fence_valid") is not True
                     or fresh_fence.get("identity_sha256") != _canonical_sha256(record["turn_identity"])
                 ):
-                    return 1
+                    raise ValueError("delivery fence invalid")
             except Exception:
-                return 1
+                if record.get("observation"):
+                    from agent.durable_admission import observation_gap
+                    observation_gap(record["observation"], "admission_failed")
+                    structured = False
+                else:
+                    return 1
+        if structured:
             if stdin_file:
                 transport_argv += ["--delivery-envelope-file", str(_delivery_envelope_path(dm_file))]
                 transport_argv.append("--json")
@@ -1065,10 +1192,19 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool) -> int:
                     )
                     if not stdin_file:
                         _validate_local_ack_against_destination(ack, record, argv)
+                        ack_row_validated = True
                     reply = str(payload.get("reply") or "")
-                except (TypeError, ValueError):
-                    returncode = 1
-                    reply = ""
+                except Exception as exc:
+                    if record.get("observation"):
+                        from agent.durable_admission import observation_gap
+                        observation_gap(record["observation"], "ack_missing")
+                        ack = None
+                        reply = proc.stdout or ""
+                    else:
+                        if not isinstance(exc, (TypeError, ValueError)):
+                            raise
+                        returncode = 1
+                        reply = ""
                 if reply:
                     sys.stdout.write(reply)
                     sys.stdout.flush()
@@ -1081,7 +1217,12 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool) -> int:
             return returncode
     finally:
         state = "delivered" if returncode == 0 and (ack is not None or not structured) else "failed"
-        _update_delivery_receipt(dm_file, state, ack=ack)
+        if record.get("observation") and returncode == 0 and structured and ack is None:
+            state = "unknown"
+        if record.get("observation"):
+            _update_delivery_receipt(dm_file, state, ack=ack, ack_row_validated=ack_row_validated)
+        else:
+            _update_delivery_receipt(dm_file, state, ack=ack)
         _unlink_dm_file(dm_file)
         _unlink_dm_file(str(_delivery_envelope_path(dm_file)))
 
@@ -1106,6 +1247,53 @@ def _delivery_command(argv: list[str], dm_file: str, *, stdin_file: bool) -> str
 
 
 def _start_delivery(
+    argv: list[str], content: str, label: str, *, stdin_file: bool,
+    task_id: Optional[str], agent: Any, origin_session_id: Optional[str] = None,
+    route_reason: str = "canonical_title_fallback",
+) -> str:
+    from agent import durable_admission as da
+
+    if not da.observation_enabled():
+        return _start_delivery_inner(argv, content, label, stdin_file=stdin_file,
+            task_id=task_id, agent=agent, origin_session_id=origin_session_id, route_reason=route_reason)
+    observation = da.reserve_observed_effect(label, content)
+    if observation is None:
+        return _start_delivery_inner(argv, content, label, stdin_file=stdin_file,
+            task_id=task_id, agent=agent, origin_session_id=origin_session_id, route_reason=route_reason)
+    effect = observation["effect"]
+    key = effect["effect_id"]
+    # The cross-process delivery ledger arbitrates dispatch, not an expiring
+    # Work lease. Replay is decided before any authority call.
+    with _delivery_ledger_lock(key):
+        existing = _read_delivery_ledger(_delivery_ledger_path(key), key)
+        if existing is not None:
+            return json.dumps({"status": "delivered" if existing["state"] == "delivered" else "accepted",
+                "to": label, "delivery": _public_delivery_receipt(existing),
+                "detail": "Exact delivery already recorded; no resend or authority call."})
+        identity = fence = None
+        if observation["created"]:
+            try:
+                identity = da.admit_observed_effect(observation)
+                if identity is not None:
+                    fence = da._run_turn_identity_revalidation(identity)
+            except Exception:
+                identity = fence = None
+                da.observation_gap(observation, "admission_failed")
+        else:
+            # Reservation survived without a dispatch ledger: no blind remote
+            # admission retry. Legacy transport still owns its first dispatch.
+            da.observation_gap(observation, "delivery_ambiguous")
+        prepared = _start_delivery_inner(argv, content, label, stdin_file=stdin_file,
+            task_id=task_id, agent=agent, origin_session_id=effect["origin_session_id"],
+            route_reason=route_reason, _observation=observation, _identity=identity,
+            _fence=fence, _idempotency=key, _defer_spawn=True)
+    if isinstance(prepared, str):
+        return prepared
+    command, dm_file, receipt = prepared
+    return _spawn_delivery(command, label, dm_file=dm_file, receipt=receipt, task_id=task_id, agent=agent)
+
+
+def _start_delivery_inner(
     argv: list[str],
     content: str,
     label: str,
@@ -1115,10 +1303,11 @@ def _start_delivery(
     agent: Any,
     origin_session_id: Optional[str] = None,
     route_reason: str = "canonical_title_fallback",
+    _observation=None, _identity=None, _fence=None, _idempotency=None, _defer_spawn=False,
 ) -> str:
     """Create a DM file and transfer its cleanup ownership to the runner."""
-    turn_identity = None
-    fence = None
+    turn_identity = _identity
+    fence = _fence
     try:
         from agent.durable_admission import (
             admission_enabled,
@@ -1147,6 +1336,7 @@ def _start_delivery(
         idempotency_key = hashlib.sha256(
             (ledger_scope + "\0" + origin + "\0" + authority_request + "\0" + label + "\0" + content).encode("utf-8")
         ).hexdigest()
+        idempotency_key = _idempotency or idempotency_key
         receipt = _write_delivery_receipt(
             dm_file,
             origin_session_id=origin,
@@ -1156,6 +1346,8 @@ def _start_delivery(
             idempotency_key=idempotency_key,
             turn_identity=turn_identity,
             fence=fence,
+            observation=_observation,
+            ledger_locked=_idempotency is not None,
         )
         if receipt.get("duplicate") and receipt.get("state") == "delivered":
             _unlink_dm_file(dm_file)
@@ -1169,6 +1361,8 @@ def _start_delivery(
         _unlink_dm_file(dm_file)
         _unlink_dm_file(dm_file + ".receipt.json")
         raise
+    if _defer_spawn:
+        return command, dm_file, receipt
     return _spawn_delivery(
         command,
         label,

@@ -25,10 +25,10 @@ import pytest
 
 from agent import durable_admission
 
-K7_ROOT = Path(
+K7_ROOT = Path(os.environ.get("HERMES_TEST_K7_ROOT",
     "/Users/matheuskindrazki/development/personal/.worktrees/"
-    "hermes-personal-os/hermes-kernel-turn-identity-20260904"
-)
+    "hermes-personal-os/kindra-passive-observer-20260906"
+))
 K7_BIN = K7_ROOT / "control" / "kernel" / "admit_cli.py"
 K7_SCHEMA = K7_ROOT / "control" / "schemas" / "work-envelope.schema.json"
 
@@ -426,6 +426,25 @@ def _turn_identity():
     }
 
 
+def test_turn_identity_accepts_authenticated_kindra_profile_source_pair():
+    identity = _turn_identity()
+    identity.update({"profile": "projetospessoais", "source": "projetospessoais"})
+
+    assert durable_admission._validate_turn_identity(identity) == identity
+
+
+@pytest.mark.parametrize("profile,source", [
+    ("projetospessoais", "default"),
+    ("default", "projetospessoais"),
+])
+def test_turn_identity_rejects_profile_source_mismatch(profile, source):
+    identity = _turn_identity()
+    identity.update({"profile": profile, "source": source})
+
+    with pytest.raises(durable_admission.TurnIdentityError, match="scope"):
+        durable_admission._validate_turn_identity(identity)
+
+
 def test_turn_identity_is_bound_to_the_one_shot_carrier_and_revalidated(monkeypatch):
     identity = _turn_identity()
     outcome = durable_admission.AdmissionOutcome(
@@ -457,6 +476,27 @@ def test_turn_identity_is_bound_to_the_one_shot_carrier_and_revalidated(monkeypa
     assert durable_admission.consume_pre_admission(carrier) is None
 
 
+def test_turn_identity_from_another_profile_is_refused_at_execution_seam(monkeypatch):
+    identity = _turn_identity()
+    identity.update({"profile": "projetospessoais", "source": "projetospessoais"})
+    outcome = durable_admission.AdmissionOutcome(
+        state="admitted", reason_code="structured_execution", work_id=identity["work_id"],
+        request_key=identity["request_key"], event_id=identity["source_event_id"],
+        session_id=identity["origin_session_id"], model_may_run=True,
+        authority_pin_matched=True, signal_persisted=True, authority_version=4,
+        turn_identity=identity, turn_identity_seal=durable_admission._turn_identity_seal(identity),
+    )
+    durable_admission.bind_admitted_turn(outcome)
+    monkeypatch.setattr(durable_admission, "_active_profile", lambda: "default")
+    monkeypatch.setattr(
+        durable_admission, "_run_turn_identity_revalidation",
+        lambda _identity: pytest.fail("cross-profile identity reached remote fence"),
+    )
+
+    with pytest.raises(durable_admission.TurnIdentityError, match="profile_rebind"):
+        durable_admission.revalidate_current_turn_identity()
+
+
 @pytest.mark.parametrize("field,value", [
     ("origin_session_id", "other"), ("request_key", "other-key"),
     ("attempt_id", "01a061a7-cea0-7503-b308-1f4029d450ca"), ("generation", 8),
@@ -479,7 +519,7 @@ def test_turn_identity_rebind_is_rejected(field, value):
 
 @pytest.mark.parametrize("relative", [
     "control/kernel/admit_cli.py", "control/kernel/contracts.py", "control/kernel/admitter.py",
-    "control/kernel/client.py", "control/kernel/inbox.py", "control/kernel/projector.py",
+    "control/kernel/client.py", "control/kernel/native_keychain.py", "control/kernel/inbox.py", "control/kernel/projector.py",
     "control/kernel/store.py", "control/schemas/work-envelope.schema.json",
     "control/schemas/kernel-turn-identity.schema.json",
 ])
