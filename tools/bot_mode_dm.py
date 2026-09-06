@@ -776,7 +776,7 @@ def _write_delivery_receipt(
 def _update_delivery_receipt(dm_file: str, state: str, *, ack: Optional[dict[str, Any]] = None,
                              ack_row_validated: bool = False) -> None:
     try:
-        record = json.loads(Path(dm_file + ".receipt.json").read_text())
+        record = json.loads(Path(dm_file + ".receipt.json").read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
         from agent.durable_admission import observation_enabled, observation_gap
         if observation_enabled():
@@ -860,7 +860,7 @@ def _settle_observed_delivery(record: dict, path: Path, ack: dict, *, ack_row_va
         observation_gap(observation, "release_ambiguous")
         return
     try:
-        spool_document = json.loads(spool.read_text())
+        spool_document = json.loads(spool.read_text(encoding="utf-8"))
         record["release_state"] = "acknowledged"
         record["release_receipt"] = release
         _atomic_json(path, record)

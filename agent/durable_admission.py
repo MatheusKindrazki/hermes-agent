@@ -154,6 +154,20 @@ def effect_origin_scope(origin: Optional[EffectOrigin]):
         _EFFECT_ORIGIN.reset(token)
 
 
+def _observation_uid() -> int:
+    """Ownership has no fallback when the host cannot establish its UID."""
+    getter = getattr(os, "getuid", None)
+    if not callable(getter):
+        raise OSError("observation ownership unavailable")
+    try:
+        uid = getter()
+    except Exception as exc:
+        raise OSError("observation ownership unavailable") from exc
+    if type(uid) is not int or uid < 0:
+        raise OSError("observation ownership invalid")
+    return uid
+
+
 class ObservationWriter:
     """Owner-only local CAS. Effect sequence never changes during settlement.
 
@@ -181,7 +195,7 @@ class ObservationWriter:
         fd = os.open(self.root / ".observation-channel-owner", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         try:
             info = os.fstat(fd)
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != _observation_uid()
                     or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600):
                 raise OSError("observation owner unsafe")
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -197,21 +211,22 @@ class ObservationWriter:
 
     @contextmanager
     def _locked(self):
-        import fcntl
-
         with self._mutex:
             try:
+                uid = _observation_uid()
+                import fcntl
+
                 for directory in (self.root, self.root / "observation-effects"):
                     if directory.is_symlink():
                         raise OSError("observation directory symlink")
                     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
                     info = directory.stat()
-                    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+                    if info.st_uid != uid or stat.S_IMODE(info.st_mode) != 0o700:
                         raise OSError("observation directory permissions")
                 fd = os.open(self.root / ".observation.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
                 try:
                     info = os.fstat(fd)
-                    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1
+                    if (not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_nlink != 1
                             or stat.S_IMODE(info.st_mode) != 0o600):
                         raise OSError("observation lock unsafe")
                     deadline = time.monotonic() + 0.25
@@ -235,9 +250,9 @@ class ObservationWriter:
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
         except FileNotFoundError:
             return None
-        with os.fdopen(fd) as stream:
+        with os.fdopen(fd, encoding="utf-8") as stream:
             info = os.fstat(stream.fileno())
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != _observation_uid() or stat.S_IMODE(info.st_mode) != 0o600
                     or info.st_nlink != 1 or info.st_size > 65536):
                 raise OSError("observation file unsafe")
             document = json.load(stream)
@@ -248,7 +263,7 @@ class ObservationWriter:
     def _write(self, path: Path, document: dict):
         fd, temporary = tempfile.mkstemp(prefix=".observation-", dir=path.parent)
         try:
-            with os.fdopen(fd, "w") as stream:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
                 json.dump(document, stream, sort_keys=True, separators=(",", ":"))
                 stream.flush()
                 os.fsync(stream.fileno())

@@ -851,3 +851,15 @@ def test_dm_dir_rejects_precreated_symlink(tmp_path, monkeypatch):
 
     with pytest.raises(PermissionError, match="not a directory"):
         bot_mode_dm._dm_dir()
+def test_delivery_receipt_reads_unicode_with_explicit_utf8(tmp_path, monkeypatch):
+    dm_file = tmp_path / "message.txt"
+    receipt = Path(str(dm_file) + ".receipt.json")
+    receipt.write_text(json.dumps({"note": "ação 日本語"}, ensure_ascii=False), encoding="utf-8")
+    real_read = Path.read_text
+    def utf8_only(path, *args, **kwargs):
+        if path == receipt:
+            assert kwargs.get("encoding") == "utf-8"
+        return real_read(path, *args, **kwargs)
+    monkeypatch.setattr(Path, "read_text", utf8_only)
+    bot_mode_dm._update_delivery_receipt(str(dm_file), "accepted")
+    assert json.loads(receipt.read_text(encoding="utf-8"))["note"] == "ação 日本語"

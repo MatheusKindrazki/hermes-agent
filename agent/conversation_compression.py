@@ -391,10 +391,14 @@ class DurableCompressionTurnSpool:
         if pid_int <= 0:
             return "unknown", None
         try:
-            os.kill(pid_int, 0)
-        except ProcessLookupError:
-            return "dead_or_reused", None
-        except (PermissionError, OSError):
+            import psutil
+
+            exists = psutil.pid_exists(pid_int)
+            if exists is False:
+                return "dead_or_reused", None
+            if exists is not True:
+                return "unknown", None
+        except Exception:
             return "unknown", None
         try:
             boot = Path("/proc/sys/kernel/random/boot_id").read_text(

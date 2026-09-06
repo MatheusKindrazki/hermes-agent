@@ -119,6 +119,31 @@ def test_observation_channel_rejects_a_second_live_writer(tmp_path):
         first.checkpoint(stopped=True)
 
 
+@pytest.mark.parametrize("getter", [None, lambda: (_ for _ in ()).throw(RuntimeError("uid unavailable"))])
+def test_observation_missing_ownership_latches_broken(tmp_path, monkeypatch, getter):
+    writer = durable_admission.ObservationWriter(tmp_path / "no-owner", code_sha="a" * 40)
+    with monkeypatch.context() as scoped:
+        scoped.setattr(os, "getuid", getter)
+        with pytest.raises(OSError):
+            writer.checkpoint()
+        assert writer.broken
+    assert not (writer.root / "observation-channel.json").exists()
+
+
+def test_observation_json_streams_use_explicit_utf8(tmp_path, monkeypatch):
+    root = tmp_path / "unicode"
+    root.mkdir(mode=0o700)
+    writer = durable_admission.ObservationWriter(root, code_sha="a" * 40)
+    real_fdopen = os.fdopen
+    def utf8_only(fd, *args, **kwargs):
+        assert kwargs.get("encoding") == "utf-8"
+        return real_fdopen(fd, *args, **kwargs)
+    monkeypatch.setattr(os, "fdopen", utf8_only)
+    path = root / "fixture.json"
+    writer._write(path, {"note": "ação 日本語"})
+    assert writer._read(path) == {"note": "ação 日本語"}
+
+
 def test_observation_channel_lock_excludes_another_process(tmp_path):
     import sys
     root = tmp_path / "process-channel"

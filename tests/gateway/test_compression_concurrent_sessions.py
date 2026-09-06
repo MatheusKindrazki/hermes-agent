@@ -31,6 +31,20 @@ from hermes_state import SessionDB
 from agent.conversation_compression import DurableCompressionTurnSpool
 
 
+@pytest.mark.parametrize("probe, expected", [(False, "dead_or_reused"), (None, "unknown"), (PermissionError(), "unknown")])
+def test_compression_liveness_never_signals_process(monkeypatch, probe, expected):
+    import psutil
+    def pid_exists(_pid):
+        if isinstance(probe, Exception):
+            raise probe
+        return probe
+    monkeypatch.setattr(psutil, "pid_exists", pid_exists)
+    def forbidden_signal(*_args):
+        raise AssertionError("liveness must not send a signal")
+    monkeypatch.setattr(os, "kill", forbidden_signal)
+    assert DurableCompressionTurnSpool._process_liveness(os.getpid()) == (expected, None)
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
