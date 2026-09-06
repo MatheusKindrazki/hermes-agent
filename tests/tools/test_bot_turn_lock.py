@@ -229,6 +229,8 @@ def test_peer_stdin_delivery_skips_local_lock(root, tmp_path, monkeypatch):
         def _fake_run(argv, **kwargs):
             class _P:
                 returncode = 0
+                stdout = ""
+                stderr = ""
 
             return _P()
 
