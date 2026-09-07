@@ -100,9 +100,10 @@ def test_effect_origin_explicit_executor_scope_resets_on_failure(monkeypatch):
     from gateway.run import GatewayRunner
 
     monkeypatch.setenv(da.ENV_MODE, "observe")
-    monkeypatch.setattr(da, "_settings", lambda: {"tenant": "personal", "machine": "mini"})
-    monkeypatch.setattr(da, "_active_profile", lambda: "projetospessoais")
+    monkeypatch.setattr(da, "_settings", lambda: {"mode": "observe", "tenant": "personal", "machine": "mini", "profile": "default"})
+    monkeypatch.setattr(da, "_active_profile", lambda: "default")
     origin = da.capture_effect_origin("origin-session", "telegram:456")
+    assert origin is not None and origin.profile == "default"
     runner = _make_runner(TurnContext(effect_origin=origin, user_config={}))
     def body():
         assert da.current_effect_origin() is origin
@@ -123,8 +124,8 @@ def test_observation_heartbeat_is_idle_local_and_stops(monkeypatch, tmp_path):
     import hermes_cli.build_info
     monkeypatch.setenv(da.ENV_MODE, "observe")
     monkeypatch.setenv("HERMES_KERNEL_SHADOW_RECEIPT_DIR", str(tmp_path / "receipts"))
-    monkeypatch.setattr(da, "_settings", lambda: {"tenant": "personal", "machine": "mini", "observation": {"code_sha": "a" * 40}})
-    monkeypatch.setattr(da, "_active_profile", lambda: "projetospessoais")
+    monkeypatch.setattr(da, "_settings", lambda: {"mode": "observe", "tenant": "personal", "machine": "mini", "profile": "default", "observation": {"code_sha": "a" * 40}})
+    monkeypatch.setattr(da, "_active_profile", lambda: "default")
     monkeypatch.setattr(hermes_cli.build_info, "get_code_identity", lambda: {"sha": "a" * 40})
     monkeypatch.setattr(da, "_OBSERVER", None)
     monkeypatch.setattr(da.subprocess, "run", lambda *a, **k: pytest.fail("heartbeat authority call"))
@@ -141,6 +142,7 @@ def test_observation_heartbeat_is_idle_local_and_stops(monkeypatch, tmp_path):
         await gateway._observation_task
     asyncio.run(exercise())
     record = json.loads((tmp_path / "receipts/observation-channel.json").read_text())
+    assert record["profile"] == "default"
     assert intervals == [30]
     assert record["state"] == "stopped" and record["sequence"] == 3
     assert record["last_effect_sequence"] == 0
