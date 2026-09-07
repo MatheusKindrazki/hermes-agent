@@ -43,14 +43,33 @@ OK_RESPONSE = {
 }
 
 
+@pytest.mark.parametrize("configured,active,enabled", [
+    ("default", "default", True), (None, "default", False),
+    ("projetospessoais", "projetospessoais", False), ("default", "projetospessoais", False),
+    ("projetospessoais", "default", False), ("DEFAULT", "default", False),
+    ("", "default", False), ("other", "other", False),
+])
+def test_observe_requires_exact_configured_chief_profile(monkeypatch, configured, active, enabled):
+    monkeypatch.setenv(durable_admission.ENV_MODE, "observe")
+    monkeypatch.setattr(durable_admission, "_settings", lambda: {
+        "tenant": "personal", "machine": "mini", "profile": configured,
+    })
+    monkeypatch.setattr(durable_admission, "_active_profile", lambda: active)
+    origin = durable_admission.capture_effect_origin("chat-original", "telegram:123")
+    assert durable_admission.observation_enabled() is enabled
+    assert (origin is not None) is enabled
+    if enabled:
+        assert origin.profile == configured
+
+
 def test_observe_origin_is_sealed_scoped_and_never_admits(monkeypatch):
     from dataclasses import FrozenInstanceError, replace
 
     monkeypatch.setenv(durable_admission.ENV_MODE, "observe")
     monkeypatch.setattr(durable_admission, "_settings", lambda: {
-        "tenant": "personal", "machine": "mini",
+        "tenant": "personal", "machine": "mini", "profile": "default",
     })
-    monkeypatch.setattr(durable_admission, "_active_profile", lambda: "projetospessoais")
+    monkeypatch.setattr(durable_admission, "_active_profile", lambda: "default")
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("ingress subprocess"))
     assert durable_admission.resolve_mode() is False
     origin = durable_admission.capture_effect_origin("chat-original", "telegram:123")
@@ -75,8 +94,8 @@ def test_observe_origin_is_sealed_scoped_and_never_admits(monkeypatch):
 
 def test_observation_writer_reserves_once_and_latches_first_failure(tmp_path, monkeypatch):
     monkeypatch.setenv(durable_admission.ENV_MODE, "observe")
-    monkeypatch.setattr(durable_admission, "_settings", lambda: {"tenant": "personal", "machine": "mini"})
-    monkeypatch.setattr(durable_admission, "_active_profile", lambda: "projetospessoais")
+    monkeypatch.setattr(durable_admission, "_settings", lambda: {"tenant": "personal", "machine": "mini", "profile": "default"})
+    monkeypatch.setattr(durable_admission, "_active_profile", lambda: "default")
     root = tmp_path / "receipts"
     writer = durable_admission.ObservationWriter(root, code_sha="a" * 40)
     writer.checkpoint(now=1000)
@@ -171,8 +190,8 @@ writer.checkpoint(stopped=True)
 def test_observation_sequence_across_boots_and_concurrent_reservations(tmp_path, monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
     monkeypatch.setenv(durable_admission.ENV_MODE, "observe")
-    monkeypatch.setattr(durable_admission, "_settings", lambda: {"tenant": "personal", "machine": "mini"})
-    monkeypatch.setattr(durable_admission, "_active_profile", lambda: "projetospessoais")
+    monkeypatch.setattr(durable_admission, "_settings", lambda: {"tenant": "personal", "machine": "mini", "profile": "default"})
+    monkeypatch.setattr(durable_admission, "_active_profile", lambda: "default")
     root = tmp_path / "receipts"
     writer = durable_admission.ObservationWriter(root, code_sha="a" * 40)
     writer.checkpoint(now=1000)

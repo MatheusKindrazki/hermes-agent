@@ -13,15 +13,19 @@ from tui_gateway import server
 
 
 @pytest.mark.parametrize("replayed_text", [None, "fixture input", "different input"])
-@pytest.mark.parametrize("scenario", ["token", "ticket", "internal", "stdio", "missing", "malformed", "wrong-profile", "off", "fifo", "crossprofile"])
+@pytest.mark.parametrize("scenario", ["token", "ticket", "internal", "stdio", "missing", "malformed", "wrong-profile", "missing-profile", "mismatched-profile", "off", "fifo", "crossprofile"])
 def test_authenticated_prompt_reaches_executor_with_origin(tmp_path, monkeypatch, replayed_text, scenario):
-    profile = "other" if scenario == "wrong-profile" else "projetospessoais"
-    home = tmp_path / "profiles" / profile
+    profile = "other" if scenario == "wrong-profile" else "default"
+    home = tmp_path / ".hermes" if profile == "default" else tmp_path / ".hermes" / "profiles" / profile
     home.mkdir(parents=True)
     (home / "config.yaml").write_text(
-        "agent:\n  durable_admission:\n    mode: observe\n    tenant: personal\n    machine: mini\n"
+        "agent:\n  durable_admission:\n    mode: observe\n    tenant: personal\n    machine: mini\n    profile: default\n"
         "    observation:\n      code_sha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
     )
+    if scenario in {"missing-profile", "mismatched-profile"}:
+        config = (home / "config.yaml").read_text()
+        (home / "config.yaml").write_text(config.replace("    profile: default\n",
+            "" if scenario == "missing-profile" else "    profile: projetospessoais\n"))
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_KERNEL_V1_MODE", "off" if scenario == "off" else "observe")
     receipts = tmp_path / "receipts"
@@ -69,8 +73,8 @@ def test_authenticated_prompt_reaches_executor_with_origin(tmp_path, monkeypatch
     other_db = None
     other_session = None
     if scenario == "crossprofile":
-        other_home = tmp_path / "profiles" / "other"
-        other_home.mkdir()
+        other_home = tmp_path / ".hermes" / "profiles" / "other"
+        other_home.mkdir(parents=True)
         (other_home / "config.yaml").write_text((home / "config.yaml").read_text())
         other_db = SessionDB(db_path=other_home / "state.db")
         other_db.create_session("other-session-key", source="desktop")
@@ -100,17 +104,17 @@ def test_authenticated_prompt_reaches_executor_with_origin(tmp_path, monkeypatch
             assert reached.wait(15), "authenticated dispatch did not reach executor"
             if scenario not in {"token", "ticket", "fifo", "crossprofile"}:
                 assert observed[0] is None
-                if scenario in {"wrong-profile", "off"}:
+                if scenario in {"wrong-profile", "missing-profile", "mismatched-profile", "off"}:
                     assert not receipts.exists()
                 return
             assert observed[0] is not None
             assert observed[0].session_id == "native-origin-session"
-            assert observed[0].profile == "projetospessoais"
+            assert observed[0].profile == "default"
             assert checkpoints == [True], "serve observer must start before the model"
             if scenario == "crossprofile":
                 ws.send_json({"jsonrpc": "2.0", "id": "other", "method": "prompt.submit", "params": {
                     "session_id": "other-native", "text": "fixture input",
-                    "source_event_id": "22222222-2222-4222-8222-222222222222", "profile": "projetospessoais",
+                    "source_event_id": "22222222-2222-4222-8222-222222222222", "profile": "default",
                 }})
                 assert second_reached.wait(15)
                 assert observed[1] is None

@@ -112,23 +112,32 @@ def _origin_seal(parts: tuple[str, ...]) -> str:
     return hmac.new(_ORIGIN_KEY, json.dumps(parts, separators=(",", ":")).encode(), hashlib.sha256).hexdigest()
 
 
-def observation_enabled() -> bool:
+def _observation_profile() -> Optional[str]:
     if (os.environ.get(ENV_MODE) or "").strip().lower() != "observe":
-        return False
+        return None
     settings = _settings()
-    return (not _config_disarms(settings) and settings.get("tenant") == "personal" and settings.get("machine") == "mini"
-            and _active_profile() == "projetospessoais")
+    profile = settings.get("profile")
+    if (not _config_disarms(settings) and settings.get("tenant") == "personal"
+            and settings.get("machine") == "mini" and profile == "default"
+            and profile == _active_profile()):
+        return profile
+    return None
+
+
+def observation_enabled() -> bool:
+    return _observation_profile() is not None
 
 
 def capture_effect_origin(session_id: str, event_id: str) -> Optional[EffectOrigin]:
     """Called only after upstream authentication; never synthesizes identity."""
-    if not observation_enabled():
+    profile = _observation_profile()
+    if profile is None:
         return None
     if not isinstance(session_id, str) or not _SESSION_ID_RE.fullmatch(session_id):
         return None
     if not isinstance(event_id, str) or not _EVENT_ID_RE.fullmatch(event_id):
         return None
-    parts = (session_id, event_id, "personal", "projetospessoais", "mini")
+    parts = (session_id, event_id, "personal", profile, "mini")
     return EffectOrigin(*parts, _origin_seal(parts))
 
 
@@ -175,9 +184,10 @@ class ObservationWriter:
     observable by writing to it: the last checkpoint expires within 120s.
     """
 
-    def __init__(self, root: Path, *, code_sha: str, boot_id: Optional[str] = None):
-        if not root.is_absolute() or not re.fullmatch(r"[0-9a-f]{40}", code_sha):
+    def __init__(self, root: Path, *, code_sha: str, boot_id: Optional[str] = None, profile: str = "default"):
+        if profile != "default" or not root.is_absolute() or not re.fullmatch(r"[0-9a-f]{40}", code_sha):
             raise ValueError("observation configuration invalid")
+        self.profile = profile
         self.root = root
         self.code_sha = code_sha
         self.boot_id = boot_id or str(uuid.uuid4())
@@ -286,7 +296,7 @@ class ObservationWriter:
             records = [self._read(path) for path in (self.root / "observation-effects").glob("*.json")]
             last = max((r["sequence"] for r in records if r and r["boot_id"] == self.boot_id), default=0)
             self._write(self.root / "observation-channel.json", {
-                "schema": "hermes.kernel-observation-channel/v1", "profile": "projetospessoais", "machine": "mini",
+                "schema": "hermes.kernel-observation-channel/v1", "profile": self.profile, "machine": "mini",
                 "code_sha": self.code_sha, "pid": os.getpid(), "boot_id": self.boot_id,
                 "sequence": previous.get("sequence", 0) + 1,
                 "state": "broken" if self.broken else "stopped" if self.stopped else "healthy" if previous.get("boot_id") == self.boot_id else "starting",
@@ -373,7 +383,8 @@ def start_observation() -> Optional[ObservationWriter]:
 
 def _start_observation_locked() -> Optional[ObservationWriter]:
     global _OBSERVER
-    if not observation_enabled():
+    profile = _observation_profile()
+    if profile is None:
         return None
     try:
         from hermes_cli.build_info import get_code_identity
@@ -383,10 +394,10 @@ def _start_observation_locked() -> Optional[ObservationWriter]:
             raise ValueError("observation code pin mismatch")
         root = Path(os.environ.get("HERMES_KERNEL_SHADOW_RECEIPT_DIR", ""))
         if _OBSERVER is not None:
-            if _OBSERVER.root != root or _OBSERVER.code_sha != code_sha or _OBSERVER.stopped:
+            if _OBSERVER.root != root or _OBSERVER.code_sha != code_sha or _OBSERVER.profile != profile or _OBSERVER.stopped:
                 raise ValueError("observation owner cannot be rebound")
             return _OBSERVER
-        candidate = ObservationWriter(root, code_sha=code_sha)
+        candidate = ObservationWriter(root, code_sha=code_sha, profile=profile)
         candidate.checkpoint()
         _OBSERVER = candidate
     except Exception:

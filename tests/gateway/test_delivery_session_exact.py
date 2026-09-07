@@ -42,10 +42,10 @@ def test_observe_effect_four_stores_exact_release_and_ack_replay(tmp_path, monke
     monkeypatch.setenv(da.ENV_MODE, "observe")
     monkeypatch.setenv("HERMES_KERNEL_SHADOW_PRODUCER_ENABLED", "1")
     monkeypatch.setenv("HERMES_KERNEL_SHADOW_RECEIPT_DIR", str(spool))
-    monkeypatch.setattr(da, "_settings", lambda: {"tenant": "personal", "machine": "mini"})
-    monkeypatch.setattr(da, "_active_profile", lambda: "projetospessoais")
+    monkeypatch.setattr(da, "_settings", lambda: {"tenant": "personal", "machine": "mini", "profile": "default"})
+    monkeypatch.setattr(da, "_active_profile", lambda: "default")
     monkeypatch.setattr(bot_mode_dm.tempfile, "gettempdir", lambda: str(tmp_path))
-    identity = dict(_identity(), profile="projetospessoais", source="projetospessoais", origin_machine="mini")
+    identity = dict(_identity(), profile="default", source="default", origin_machine="mini")
     fence = {"fence_valid": True, "identity_sha256": bot_mode_dm._canonical_sha256(identity)}
     writer.checkpoint()
     receiver = SessionDB(tmp_path / "receiver.db")
@@ -139,7 +139,8 @@ def test_observe_effect_four_stores_exact_release_and_ack_replay(tmp_path, monke
     write_kernel_shadow_receipt(release_projection)
     assert collector._ingest(collector_db, spool, {"max_receipt_bytes": 65536}, int(time.time())) == (1, 1, 0)
     assert collector._settlement_correlated(collector_db, effect)
-    assert collector._observation_records(collector_db, spool, {"max_receipt_bytes": 65536}, int(time.time())) is None
+    config = collector._load_config(root / "config/hermes-kernel-shadow.v1.json")
+    assert collector._observation_records(collector_db, spool, config, int(time.time())) is None
     assert collector_db.execute("SELECT COUNT(*) FROM observation_effects").fetchone()[0] == 1
     collector_db.close()
     receiver.close()
@@ -175,7 +176,7 @@ def test_exact_release_pinned_cli_closed_wire_single_call(tmp_path, monkeypatch,
     from agent import durable_admission as da
     import subprocess
 
-    identity = dict(_identity(), profile="projetospessoais", source="projetospessoais", origin_machine="mini")
+    identity = dict(_identity(), profile="default", source="default", origin_machine="mini")
     event_id = "01a061a7-cea0-7503-b308-1f4029d450ca"
     response = {"schema_version": "work-control.effect-release.v1", "contract_version": "work-control.v1",
         "outcome": "released", "work_id": identity["work_id"], "origin_session_id": "origin-exact",
