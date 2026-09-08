@@ -1080,6 +1080,21 @@ def _delivery_lock(argv: list[str], *, stdin_file: bool):
     return acquire_turn_lock(_hermes_root(home), argv[2])
 
 
+def _delivery_runtime_env() -> dict[str, str]:
+    """Keep internal Hermes CLI children on the runner's selected release.
+
+    Terminal tools intentionally remove Hermes-owned PYTHONPATH entries. The
+    delivery runner restores its own source only for its internal transport;
+    otherwise a borrowed interpreter can import an older editable installation.
+    """
+    env = dict(os.environ)
+    root = str(Path(__file__).resolve().parents[1])
+    entries = [entry for entry in env.get("PYTHONPATH", "").split(os.pathsep)
+               if entry and entry != root]
+    env["PYTHONPATH"] = os.pathsep.join([root, *entries])
+    return env
+
+
 def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool) -> int:
     """Run one DM transport and remove its plaintext file after consumption.
 
@@ -1154,7 +1169,8 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool) -> int:
                 # after subprocess.run returns, not merely after stdin reaches EOF.
                 with open(dm_file, "r", encoding="utf-8") as stream:
                     proc = subprocess.run(
-                        transport_argv, stdin=stream, check=False, capture_output=True, text=True
+                        transport_argv, stdin=stream, check=False, capture_output=True, text=True,
+                        env=_delivery_runtime_env(),
                     )
                 returncode = proc.returncode
             else:
@@ -1163,6 +1179,7 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool) -> int:
                     check=False,
                     capture_output=True,
                     text=True,
+                    env=_delivery_runtime_env(),
                 )
                 returncode = proc.returncode
             if proc.returncode != 0 and not stdin_file:
@@ -1179,6 +1196,7 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool) -> int:
                         check=False,
                         capture_output=True,
                         text=True,
+                        env=_delivery_runtime_env(),
                     )
                     returncode = proc.returncode
             # Re-emit the transport's streams: stdout is the reply text the

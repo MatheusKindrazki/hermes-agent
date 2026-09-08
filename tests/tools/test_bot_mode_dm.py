@@ -684,6 +684,37 @@ def test_real_delivery_command_round_trip(tmp_path, stdin_file):
     assert not dm_file.exists()
 
 
+@pytest.mark.parametrize("stdin_file", [False, True])
+def test_delivery_child_imports_the_runner_release(tmp_path, monkeypatch, stdin_file):
+    """A borrowed venv must not send the envelope to its old editable install."""
+    stale = tmp_path / "stale"
+    (stale / "hermes_cli").mkdir(parents=True)
+    (stale / "hermes_cli" / "__init__.py").write_text("")
+    (stale / "user_extension.py").write_text("VALUE = 42")
+    child = tmp_path / "transport.py"
+    observed = tmp_path / "observed.json"
+    child.write_text(
+        "import importlib.util, json, pathlib, user_extension\n"
+        "pathlib.Path(" + repr(str(observed)) + ").write_text(json.dumps({"
+        "'origin': importlib.util.find_spec('hermes_cli').origin, "
+        "'extension': user_extension.VALUE}))\n"
+    )
+    dm_file = tmp_path / "message.txt"
+    dm_file.write_text("runtime canary")
+    monkeypatch.setenv("PYTHONPATH", str(stale))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    command = bot_mode_dm._delivery_command(
+        [sys.executable, str(child)], str(dm_file), stdin_file=stdin_file
+    )
+    result = subprocess.run(shlex.split(command), cwd=tmp_path, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    body = json.loads(observed.read_text())
+    expected = Path(bot_mode_dm.__file__).resolve().parents[1] / "hermes_cli" / "__init__.py"
+    assert Path(body["origin"]).resolve() == expected
+    assert body["extension"] == 42
+    assert not dm_file.exists()
+
+
 @pytest.mark.windows_only
 def test_delivery_command_round_trip_through_windows_local_shell(tmp_path):
     """Native runner paths must survive the Git Bash process boundary."""
