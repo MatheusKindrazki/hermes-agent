@@ -371,10 +371,10 @@ def _(rid, params: dict) -> dict:
                 source_event_id = candidate
         except ValueError:
             pass
-    from agent.durable_admission import observation_enabled, bind_native_prompt_source
+    from agent.durable_admission import native_input_enabled, bind_native_prompt_source
     native_home_token = set_hermes_home_override(session.get("profile_home")) if session.get("profile_home") else None
     try:
-        observe_input = observation_enabled() and not turn_isolation
+        observe_input = native_input_enabled() and not turn_isolation
         if not observe_input:
             source_event_id = None
         elif source_event_id and not bind_native_prompt_source(session["session_key"], source_event_id, text):

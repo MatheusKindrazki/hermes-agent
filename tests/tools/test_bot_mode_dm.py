@@ -531,8 +531,9 @@ def test_delivery_runner_preserves_child_failure_and_unlinks(tmp_path):
     assert not dm_file.exists()
 
 
+@pytest.mark.parametrize("enforced", [False, True])
 def test_unknown_toolset_warning_does_not_break_structured_delivery_ack(
-    tmp_path, monkeypatch, capsys
+    tmp_path, monkeypatch, capsys, enforced
 ):
     import cli
 
@@ -552,6 +553,7 @@ def test_unknown_toolset_warning_does_not_break_structured_delivery_ack(
         idempotency_key="a" * 64,
         turn_identity=identity,
         fence={"fence_valid": True},
+        enforced_effect=enforced,
     )
     ack = {
         "schema": bot_mode_dm.DELIVERY_ACK_SCHEMA,
@@ -590,6 +592,10 @@ def test_unknown_toolset_warning_does_not_break_structured_delivery_ack(
         ),
     )
 
+    settled = []
+    def settle(record, path, ack, *, ack_row_validated):
+        settled.append(ack_row_validated)
+    monkeypatch.setattr(bot_mode_dm, "_settle_enforced_delivery", settle)
     assert (
         bot_mode_dm._run_delivery(
             ["hermes", "-p", "researcher", "chat"],
@@ -598,6 +604,7 @@ def test_unknown_toolset_warning_does_not_break_structured_delivery_ack(
         )
         == 0
     )
+    assert settled == ([True] if enforced else [])
     delivered = capsys.readouterr()
     assert delivered.out == "ok"
     assert "Warning: Unknown toolsets: a2a" in delivered.err
@@ -681,6 +688,37 @@ def test_real_delivery_command_round_trip(tmp_path, stdin_file):
 
     assert result.returncode == 0
     assert observed.read_text(encoding="utf-8") == "secret λ\nsecond line"
+    assert not dm_file.exists()
+
+
+@pytest.mark.parametrize("stdin_file", [False, True])
+def test_delivery_child_imports_the_runner_release(tmp_path, monkeypatch, stdin_file):
+    """A borrowed venv must not send the envelope to its old editable install."""
+    stale = tmp_path / "stale"
+    (stale / "hermes_cli").mkdir(parents=True)
+    (stale / "hermes_cli" / "__init__.py").write_text("")
+    (stale / "user_extension.py").write_text("VALUE = 42")
+    child = tmp_path / "transport.py"
+    observed = tmp_path / "observed.json"
+    child.write_text(
+        "import importlib.util, json, pathlib, user_extension\n"
+        "pathlib.Path(" + repr(str(observed)) + ").write_text(json.dumps({"
+        "'origin': importlib.util.find_spec('hermes_cli').origin, "
+        "'extension': user_extension.VALUE}))\n"
+    )
+    dm_file = tmp_path / "message.txt"
+    dm_file.write_text("runtime canary")
+    monkeypatch.setenv("PYTHONPATH", str(stale))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    command = bot_mode_dm._delivery_command(
+        [sys.executable, str(child)], str(dm_file), stdin_file=stdin_file
+    )
+    result = subprocess.run(shlex.split(command), cwd=tmp_path, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    body = json.loads(observed.read_text())
+    expected = Path(bot_mode_dm.__file__).resolve().parents[1] / "hermes_cli" / "__init__.py"
+    assert Path(body["origin"]).resolve() == expected
+    assert body["extension"] == 42
     assert not dm_file.exists()
 
 
