@@ -76,6 +76,33 @@ def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path)
             assert kb.get_task(conn, tid).status == "blocked"
 
 
+def test_explicitly_created_blocked_task_waits_for_operator(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="External XIRP owns execution", initial_status="blocked")
+        for _ in range(3):
+            assert kb.recompute_ready(conn) == 0
+            assert kb.get_task(conn, tid).status == "blocked"
+            assert kb.claim_task(conn, tid) is None
+        assert kb.unblock_task(conn, tid)
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_explicit_promotion_releases_creation_hold(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="External execution finished", initial_status="blocked")
+        assert kb.promote_task(conn, tid, actor="operator") == (True, None)
+        assert not kb._has_sticky_block(conn, tid)
+
+
+def test_transient_block_of_ready_task_still_recovers(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="Transient failure")
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (tid,))
+        conn.commit()
+        assert kb.recompute_ready(conn) == 1
+        assert kb.get_task(conn, tid).status == "ready"
+
+
 
 
 # ---------------------------------------------------------------------------
