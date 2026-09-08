@@ -799,7 +799,7 @@ def _update_delivery_receipt(dm_file: str, state: str, *, ack: Optional[dict[str
                 return
             return _update_delivery_receipt_inner(dm_file, state, ack=ack, ack_row_validated=ack_row_validated)
     except Exception:
-        observation_gap(record["observation"], "ledger_failed")
+        observation_gap(record.get("observation"), "ledger_failed")
 
 
 def _update_delivery_receipt_inner(dm_file: str, state: str, *, ack=None, ack_row_validated=False):
@@ -1261,7 +1261,7 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool) -> int:
         state = "delivered" if returncode == 0 and (ack is not None or not structured) else "failed"
         if record.get("observation") and returncode == 0 and structured and ack is None:
             state = "unknown"
-        if record.get("observation"):
+        if record.get("observation") or record.get("enforced_effect"):
             _update_delivery_receipt(dm_file, state, ack=ack, ack_row_validated=ack_row_validated)
         else:
             _update_delivery_receipt(dm_file, state, ack=ack)

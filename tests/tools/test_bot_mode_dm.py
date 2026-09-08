@@ -531,8 +531,9 @@ def test_delivery_runner_preserves_child_failure_and_unlinks(tmp_path):
     assert not dm_file.exists()
 
 
+@pytest.mark.parametrize("enforced", [False, True])
 def test_unknown_toolset_warning_does_not_break_structured_delivery_ack(
-    tmp_path, monkeypatch, capsys
+    tmp_path, monkeypatch, capsys, enforced
 ):
     import cli
 
@@ -552,6 +553,7 @@ def test_unknown_toolset_warning_does_not_break_structured_delivery_ack(
         idempotency_key="a" * 64,
         turn_identity=identity,
         fence={"fence_valid": True},
+        enforced_effect=enforced,
     )
     ack = {
         "schema": bot_mode_dm.DELIVERY_ACK_SCHEMA,
@@ -590,6 +592,10 @@ def test_unknown_toolset_warning_does_not_break_structured_delivery_ack(
         ),
     )
 
+    settled = []
+    def settle(record, path, ack, *, ack_row_validated):
+        settled.append(ack_row_validated)
+    monkeypatch.setattr(bot_mode_dm, "_settle_enforced_delivery", settle)
     assert (
         bot_mode_dm._run_delivery(
             ["hermes", "-p", "researcher", "chat"],
@@ -598,6 +604,7 @@ def test_unknown_toolset_warning_does_not_break_structured_delivery_ack(
         )
         == 0
     )
+    assert settled == ([True] if enforced else [])
     delivered = capsys.readouterr()
     assert delivered.out == "ok"
     assert "Warning: Unknown toolsets: a2a" in delivered.err
