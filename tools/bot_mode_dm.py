@@ -720,7 +720,7 @@ def _write_delivery_receipt(
     dm_file: str, *, origin_session_id: str, origin_reason: str, route_reason: str,
     label: str, idempotency_key: str, turn_identity: Optional[Mapping[str, Any]] = None,
     fence: Optional[Mapping[str, Any]] = None,
-    observation: Optional[dict] = None, ledger_locked: bool = False,
+    observation: Optional[dict] = None, ledger_locked: bool = False, enforced_effect: bool = False,
 ) -> dict[str, Any]:
     """Persist the accepted-state receipt before spawning a child process.
 
@@ -752,10 +752,13 @@ def _write_delivery_receipt(
             "idempotency_key": idempotency_key, "state": "accepted",
             "accepted_at": int(time.time()),
         }
-        if observation is not None:
+        if observation is not None or enforced_effect:
             from agent.durable_admission import new_release_event_id
-            record["observation"] = observation
             record["release_event_id"] = new_release_event_id()
+        if observation is not None:
+            record["observation"] = observation
+        if enforced_effect:
+            record["enforced_effect"] = True
         if turn_identity is not None:
             record["turn_identity"] = dict(turn_identity)
             record["fence"] = dict(fence or {})
@@ -783,7 +786,7 @@ def _update_delivery_receipt(dm_file: str, state: str, *, ack: Optional[dict[str
             observation_gap(None, "ledger_failed")
             return
         record = {}
-    if not record.get("observation"):
+    if not record.get("observation") and not record.get("enforced_effect"):
         return _update_delivery_receipt_inner(dm_file, state, ack=ack, ack_row_validated=ack_row_validated)
     from agent.durable_admission import observation_gap
     try:
@@ -803,7 +806,7 @@ def _update_delivery_receipt_inner(dm_file: str, state: str, *, ack=None, ack_ro
     path = Path(dm_file + ".receipt.json")
     try:
         record = json.loads(path.read_text(encoding="utf-8"))
-        if record.get("observation") and record.get("adapter_ack") is not None:
+        if (record.get("observation") or record.get("enforced_effect")) and record.get("adapter_ack") is not None:
             return  # ACK/release replay: never fence, renew, resend or release.
         record["state"] = state
         record["updated_at"] = int(time.time())
@@ -818,6 +821,8 @@ def _update_delivery_receipt_inner(dm_file: str, state: str, *, ack=None, ack_ro
         if ack is not None and state == "delivered":
             if record.get("observation"):
                 _settle_observed_delivery(record, path, ack, ack_row_validated=ack_row_validated)
+            elif record.get("enforced_effect"):
+                _settle_enforced_delivery(record, path, ack, ack_row_validated=ack_row_validated)
             else:
                 _emit_delivery_shadow_receipt(record, state, ack_bytes=_canonical(ack))
         elif record.get("observation"):
@@ -829,6 +834,25 @@ def _update_delivery_receipt_inner(dm_file: str, state: str, *, ack=None, ack_ro
             observation_gap(record["observation"], "ledger_failed")
         else:
             logger.debug("delivery receipt update failed", exc_info=True)
+
+
+def _settle_enforced_delivery(record: dict, path: Path, ack: dict, *, ack_row_validated: bool):
+    """Only the independently persisted destination ACK releases our effect."""
+    if not ack_row_validated:
+        record["release_state"] = "ack_not_validated"
+    else:
+        from agent.durable_admission import release_observed_effect
+        _emit_delivery_shadow_receipt(record, "delivered", ack_bytes=_canonical(ack))
+        record["release_state"] = "requested"
+        _atomic_json(path, record)
+        _atomic_json(_delivery_ledger_path(record["idempotency_key"]), record)
+        try:
+            record["release_receipt"] = release_observed_effect(record["turn_identity"], record["release_event_id"])
+            record["release_state"] = "acknowledged"
+        except Exception:
+            record["release_state"] = "unknown"
+    _atomic_json(path, record)
+    _atomic_json(_delivery_ledger_path(record["idempotency_key"]), record)
 
 
 def _settle_observed_delivery(record: dict, path: Path, ack: dict, *, ack_row_validated: bool):
@@ -1121,7 +1145,7 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool) -> int:
         except (OSError, ValueError, TypeError):
             record = {}
         structured = isinstance(record.get("turn_identity"), dict)
-        if record.get("observation"):
+        if record.get("observation") or record.get("enforced_effect"):
             key = record["idempotency_key"]
             with _delivery_ledger_lock(key):
                 canonical = _read_delivery_ledger(_delivery_ledger_path(key), key)
@@ -1271,6 +1295,9 @@ def _start_delivery(
 ) -> str:
     from agent import durable_admission as da
 
+    if da.admission_enabled():
+        return _start_enforced_delivery(argv, content, label, stdin_file=stdin_file, task_id=task_id,
+            agent=agent, origin_session_id=origin_session_id, route_reason=route_reason)
     if not da.observation_enabled():
         return _start_delivery_inner(argv, content, label, stdin_file=stdin_file,
             task_id=task_id, agent=agent, origin_session_id=origin_session_id, route_reason=route_reason)
@@ -1311,6 +1338,39 @@ def _start_delivery(
     return _spawn_delivery(command, label, dm_file=dm_file, receipt=receipt, task_id=task_id, agent=agent)
 
 
+def _start_enforced_delivery(argv, content, label, *, stdin_file, task_id, agent,
+                             origin_session_id, route_reason):
+    from agent import durable_admission as da
+
+    parent = da.current_admitted_turn()
+    origin = str(origin_session_id or getattr(agent, "session_id", "") or "")
+    if parent is None or not origin or parent.session_id != origin or not parent.event_id:
+        return _err("Delivery authority refused: admitted input origin missing or mismatched.")
+    request = {"tool": "message_agent", "destination": label,
+               "content_sha256": da.content_sha256(content), "input_event_id": parent.event_id,
+               "profile": da._active_profile()}
+    scope = str(_hermes_root(Path(_agent_home(agent))))
+    key = _canonical_sha256(["hermes.enforced-delivery.v1", scope, origin, request])
+    with _delivery_ledger_lock(key):
+        existing = _read_delivery_ledger(_delivery_ledger_path(key), key)
+        if existing is not None:
+            return json.dumps({"status": existing["state"], "to": label,
+                "delivery": _public_delivery_receipt(existing),
+                "detail": "Exact effect already recorded; no resend or authority call."})
+        outcome = da.admit_execution(session_id=origin, request=request,
+                                     event_id=da.execution_event_id(origin, request))
+        if outcome.state != da.STATE_ADMITTED or not outcome.model_may_run:
+            return _err("Delivery authority refused: " + str(outcome.reason_code))
+        with da.admitted_turn_scope(outcome):
+            prepared = _start_delivery_inner(argv, content, label, stdin_file=stdin_file,
+                task_id=task_id, agent=agent, origin_session_id=origin, route_reason=route_reason,
+                _idempotency=key, _defer_spawn=True, _enforced=True)
+    if isinstance(prepared, str):
+        return prepared
+    command, dm_file, receipt = prepared
+    return _spawn_delivery(command, label, dm_file=dm_file, receipt=receipt, task_id=task_id, agent=agent)
+
+
 def _start_delivery_inner(
     argv: list[str],
     content: str,
@@ -1321,7 +1381,7 @@ def _start_delivery_inner(
     agent: Any,
     origin_session_id: Optional[str] = None,
     route_reason: str = "canonical_title_fallback",
-    _observation=None, _identity=None, _fence=None, _idempotency=None, _defer_spawn=False,
+    _observation=None, _identity=None, _fence=None, _idempotency=None, _defer_spawn=False, _enforced=False,
 ) -> str:
     """Create a DM file and transfer its cleanup ownership to the runner."""
     turn_identity = _identity
@@ -1365,7 +1425,7 @@ def _start_delivery_inner(
             turn_identity=turn_identity,
             fence=fence,
             observation=_observation,
-            ledger_locked=_idempotency is not None,
+            ledger_locked=_idempotency is not None, enforced_effect=_enforced,
         )
         if receipt.get("duplicate") and receipt.get("state") == "delivered":
             _unlink_dm_file(dm_file)

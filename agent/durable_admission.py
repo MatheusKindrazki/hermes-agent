@@ -128,9 +128,17 @@ def observation_enabled() -> bool:
     return _observation_profile() is not None
 
 
+def native_input_enabled() -> bool:
+    if observation_enabled():
+        return True
+    settings = _settings() if resolve_mode() else {}
+    return (not _config_disarms(settings) and settings.get("tenant") == "personal"
+            and settings.get("machine") == "mini" and settings.get("profile") == _active_profile())
+
+
 def capture_effect_origin(session_id: str, event_id: str) -> Optional[EffectOrigin]:
     """Called only after upstream authentication; never synthesizes identity."""
-    profile = _observation_profile()
+    profile = _active_profile() if native_input_enabled() else None
     if profile is None:
         return None
     if not isinstance(session_id, str) or not _SESSION_ID_RE.fullmatch(session_id):
@@ -439,9 +447,19 @@ def bind_native_prompt_source(session_id: str, source_event_id: str, text: str) 
     Called under the session's effective home. The ID is supplied by the
     authenticated ingress, never generated here or inferred from the text.
     """
-    if not observation_enabled() or not isinstance(text, str):
+    if not native_input_enabled() or not isinstance(text, str):
         return False
-    writer = start_observation_heartbeat()
+    if observation_enabled():
+        writer = start_observation_heartbeat()
+    else:
+        # Reuse the owned CAS file operations only; enforcement does not claim
+        # an observation channel or publish synthetic observer checkpoints.
+        from hermes_cli.build_info import get_code_identity
+        code_sha = get_code_identity().get("sha")
+        try:
+            writer = ObservationWriter(Path(_state_dir(_settings())) / "native-inputs", code_sha=code_sha)
+        except (TypeError, ValueError):
+            return False
     if writer is None or writer.broken or writer.stopped:
         return False
     try:
@@ -1173,6 +1191,16 @@ def bind_admitted_turn(outcome: Optional[AdmissionOutcome]) -> None:
     tool runs, so a previous turn's value can never release one.
     """
     _ADMITTED_TURN.set(outcome)
+
+
+@contextmanager
+def admitted_turn_scope(outcome: AdmissionOutcome):
+    """Give one tool its own admission without replacing its parent turn."""
+    token = _ADMITTED_TURN.set(outcome)
+    try:
+        yield
+    finally:
+        _ADMITTED_TURN.reset(token)
 
 
 def current_admitted_turn() -> Optional[AdmissionOutcome]:
@@ -2081,10 +2109,14 @@ def admit_turn_or_block(
     # the user's own, so this is the first and only admission for it.
     session_id = str(getattr(agent, "session_id", "") or "")
     text = _turn_text(user_message)
+    origin = current_effect_origin()
+    event_id = (origin.event_id if origin is not None and origin.session_id == session_id
+                and origin.profile == _active_profile() else
+                "turn.%s" % _digest(session_id, content_sha256(text))[:48])
     outcome = admit_input(
         session_id=session_id,
         request_text=text,
-        event_id="turn.%s" % _digest(session_id, content_sha256(text))[:48],
+        event_id=event_id,
     )
     if outcome.mode_off or outcome.model_may_run:
         bind_admitted_turn(outcome)
