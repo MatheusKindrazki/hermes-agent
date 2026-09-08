@@ -106,6 +106,7 @@ class EffectOrigin:
     profile: str
     machine: str
     seal: str = field(repr=False)
+    ingress_session_id: str = ""
 
 
 def _origin_seal(parts: tuple[str, ...]) -> str:
@@ -156,9 +157,29 @@ def current_effect_origin() -> Optional[EffectOrigin]:
 def publish_effect_origin(origin: Optional[EffectOrigin]) -> None:
     if origin is not None:
         parts = (origin.session_id, origin.event_id, origin.tenant, origin.profile, origin.machine)
+        if origin.ingress_session_id:
+            parts += (origin.ingress_session_id,)
         if not hmac.compare_digest(origin.seal, _origin_seal(parts)):
             raise ValueError("invalid effect origin seal")
     _EFFECT_ORIGIN.set(origin)
+
+
+def canonical_effect_origin(session_id: str) -> Optional[EffectOrigin]:
+    """Gateway-only mapping from authenticated ingress route to its resolved DB session."""
+    origin = current_effect_origin()
+    if origin is None or origin.session_id == session_id:
+        return origin
+    if not isinstance(session_id, str) or not _SESSION_ID_RE.fullmatch(session_id):
+        return None
+    parts = (origin.session_id, origin.event_id, origin.tenant, origin.profile, origin.machine)
+    if origin.ingress_session_id:
+        parts += (origin.ingress_session_id,)
+    if not hmac.compare_digest(origin.seal, _origin_seal(parts)):
+        return None
+    ingress = origin.ingress_session_id or origin.session_id
+    parts = (session_id, origin.event_id, origin.tenant, origin.profile, origin.machine, ingress)
+    return EffectOrigin(session_id, origin.event_id, origin.tenant, origin.profile, origin.machine,
+                        _origin_seal(parts), ingress)
 
 
 @contextmanager

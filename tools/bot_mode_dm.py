@@ -1344,7 +1344,11 @@ def _start_enforced_delivery(argv, content, label, *, stdin_file, task_id, agent
 
     parent = da.current_admitted_turn()
     origin = str(origin_session_id or getattr(agent, "session_id", "") or "")
-    if parent is None or not origin or parent.session_id != origin or not parent.event_id:
+    carrier = da.current_effect_origin()
+    mapped = (parent is not None and carrier is not None and carrier.session_id == origin
+              and carrier.ingress_session_id == parent.session_id and carrier.event_id == parent.event_id
+              and carrier.profile == da._active_profile())
+    if parent is None or not origin or (parent.session_id != origin and not mapped) or not parent.event_id:
         return _err("Delivery authority refused: admitted input origin missing or mismatched.")
     request = {"tool": "message_agent", "destination": label,
                "content_sha256": da.content_sha256(content), "input_event_id": parent.event_id,

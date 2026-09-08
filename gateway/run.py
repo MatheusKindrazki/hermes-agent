@@ -30334,10 +30334,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("K8 carrier pickup failed", exc_info=True)
             _k8_pre_admission = None
 
-        from agent.durable_admission import current_effect_origin
+        from agent.durable_admission import canonical_effect_origin
 
         turn_ctx = TurnContext(
-            effect_origin=current_effect_origin(),
+            effect_origin=canonical_effect_origin(session_id),
             k8_pre_admission=_k8_pre_admission,
             source=source,
             _run_still_current=_run_still_current,
