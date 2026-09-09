@@ -27,7 +27,7 @@ JOB_ID = re.compile(r"[a-f0-9-]{36}\Z")
 
 def enabled(home: Path) -> bool:
     path = home / "config.yaml"
-    config = yaml.safe_load(path.read_text()) if path.exists() else {}
+    config = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else {}
     return ((config or {}).get("bot_mode") or {}).get("durable_delivery_queue") is True
 
 
@@ -109,7 +109,7 @@ class Queue:
             return [dict(r) for r in db.execute("SELECT * FROM jobs ORDER BY created,id")]
 
     def request(self, job_id: str) -> dict:
-        return json.loads((self.folder(job_id) / "request.json").read_text())
+        return json.loads((self.folder(job_id) / "request.json").read_text(encoding="utf-8"))
 
     def enqueue(self, argv: list[str], content: str, record: dict, source_home: Path) -> dict:
         from tools import bot_mode_dm as dm
@@ -206,7 +206,7 @@ class Queue:
                     # queue never invokes its own retry of a dispatched effect.
                     self.state(job_id, "running")
                     try:
-                        with (folder / "reply.txt").open("w") as out, (folder / "error.txt").open("w") as err:
+                        with (folder / "reply.txt").open("w", encoding="utf-8") as out, (folder / "error.txt").open("w", encoding="utf-8") as err:
                             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                                 rc = dm._run_delivery(request["argv"], str(dm_file), stdin_file=False, lock_held=True, strict_authority=True)
                             for stream in (out, err):
@@ -220,7 +220,7 @@ class Queue:
                         # Process exit is not delivery evidence. In observation
                         # mode the transport may exit zero but persist unknown
                         # after an invalid/missing ACK. Keep that distinction.
-                        receipt = json.loads(Path(str(dm_file) + ".receipt.json").read_text())
+                        receipt = json.loads(Path(str(dm_file) + ".receipt.json").read_text(encoding="utf-8"))
                         final = receipt.get("state")
                         if final not in TERMINAL or (final == "delivered" and rc != 0):
                             final = "unknown"
@@ -261,7 +261,7 @@ def wait(queue: Queue, job_id: str) -> int:
             folder = queue.folder(job_id)
             if job["state"] == "delivered":
                 path = folder / "reply.txt"
-                reply = path.read_text() if path.exists() else ""
+                reply = path.read_text(encoding="utf-8") if path.exists() else ""
                 print(reply or json.dumps({"status": "delivered", "delivery_id": job_id, "reply_unavailable": True}))
                 return 0
             print(json.dumps({"status": job["state"], "delivery_id": job_id, "reason": job["reason"],
@@ -293,7 +293,7 @@ def serve(queue: Queue):
                         continue
                     env = dict(os.environ, HERMES_HOME=job["source_home"])
                     env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
-                    log = (queue.folder(job["id"]) / "worker.log").open("a")
+                    log = (queue.folder(job["id"]) / "worker.log").open("a", encoding="utf-8")
                     try:
                         children[job["id"]] = subprocess.Popen(
                             [sys.executable, "-m", "tools.bot_delivery_queue", "--root", str(queue.root), "run", job["id"]],
