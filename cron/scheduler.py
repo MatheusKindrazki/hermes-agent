@@ -3210,6 +3210,28 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     Returns None on success, or an error string on failure.
     """
+    # An explicit focus preference routes scheduled output to a separate
+    # profile-local transcript, before any connector or Bot Chat turn starts.
+    # Local jobs keep their existing output-only behavior.
+    from hermes_cli import notification_inbox
+    from hermes_constants import get_hermes_home
+
+    try:
+        home = get_hermes_home()
+        if notification_inbox.enabled(home) and _normalize_deliver_value(job.get("deliver", "local")) != "local":
+            claim = job.get("fire_claim") or {}
+            delivery_id = "cron-inbox:" + str(uuid.uuid5(uuid.NAMESPACE_URL, "\0".join((
+                str(job.get("id", "")), str(claim.get("at") or job.get("last_run_at") or "manual"), content,
+            ))))
+            notification_inbox.append(
+                home, f"[Cron: {job.get('name') or job.get('id')}]\n\n{content}",
+                delivery_id=delivery_id, source="cron",
+                origin_session=str((job.get("origin") or {}).get("chat_id") or ""),
+            )
+            return None
+    except Exception as exc:
+        return f"notification inbox delivery failed: {type(exc).__name__}: {exc}"
+
     targets = _resolve_delivery_targets(job)
     if not targets:
         deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
@@ -5300,6 +5322,15 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
     failures fail OPEN so a transient config hiccup never wedges delivery
     that would have worked.
     """
+    from hermes_cli import notification_inbox
+    from hermes_constants import get_hermes_home
+
+    try:
+        if notification_inbox.enabled(get_hermes_home()):
+            return None  # isolated delivery uses only this profile's local DB
+    except Exception as exc:
+        return f"notification inbox configuration failed: {type(exc).__name__}"
+
     deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
     platform_parts: list[str] = []
     for part in deliver_value.split(","):
