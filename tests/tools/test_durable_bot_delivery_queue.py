@@ -67,11 +67,14 @@ print('reply: '+body)
 ''')
     cli.chmod(0o700)
     q = Queue(root)
-    def enqueue(content='new request', identity=None):
+    def enqueue(content='new request', identity=None, observation=None):
         record = {'delivery_id': str(uuid.uuid4()), 'idempotency_key': uuid.uuid4().hex,
                   'origin_session_id': 'origin', 'state': 'accepted', 'accepted_at': int(time.time())}
         if identity:
             record['turn_identity'] = identity
+        if observation:
+            record['observation'] = observation
+        dm._atomic_json(dm._delivery_ledger_path(record['idempotency_key']), record)
         argv = [str(cli), '-p', 'staff', 'chat', '-c', 'Bot Chat', '-Q']
         return q.enqueue(argv, content, record, root)
     yield q, db, enqueue
@@ -117,15 +120,31 @@ def test_orphaned_dispatch_is_visible_unknown_and_never_replayed(queue_fixture):
     assert db.get_messages_as_conversation('recipient') == []
 
 
-def test_expired_authority_never_calls_transport(queue_fixture, monkeypatch):
+@pytest.mark.parametrize('observation', [None, {'effect': {}}])
+def test_expired_authority_never_calls_transport(queue_fixture, monkeypatch, observation):
     q, db, enqueue = queue_fixture
-    job = enqueue(identity={'request_key': 'expired-request'})
+    job = enqueue(identity={'request_key': 'expired-request'}, observation=observation)
     def refuse(*args):
         raise RuntimeError('turn_identity_stale')
     monkeypatch.setattr(dm, '_revalidate_delivery_identity', refuse)
     assert q.run_one(job['id']) == 'failed'
     assert db.get_messages_as_conversation('recipient') == []
     assert q.request(job['id'])['content'] == 'new request'
+
+
+def test_zero_exit_without_validated_ack_remains_unknown(queue_fixture, monkeypatch):
+    q, db, enqueue = queue_fixture
+    job = enqueue()
+    def ambiguous(argv, path, **kwargs):
+        receipt_path = Path(path + '.receipt.json')
+        receipt = json.loads(receipt_path.read_text())
+        receipt['state'] = 'unknown'
+        dm._atomic_json(receipt_path, receipt)
+        return 0
+    monkeypatch.setattr(dm, '_run_delivery', ambiguous)
+    assert q.run_one(job['id']) == 'unknown'
+    assert q.get(job['id'])['state'] == 'unknown'
+    assert db.get_messages_as_conversation('recipient') == []
 
 
 def test_completion_listener_failure_does_not_lose_enqueued_request(tmp_path, monkeypatch):

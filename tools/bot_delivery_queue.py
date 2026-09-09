@@ -208,8 +208,24 @@ class Queue:
                     try:
                         with (folder / "reply.txt").open("w") as out, (folder / "error.txt").open("w") as err:
                             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                                rc = dm._run_delivery(request["argv"], str(dm_file), stdin_file=False, lock_held=True)
-                        self.state(job_id, "delivered" if rc == 0 else "failed", "" if rc == 0 else "transport_failed; original request retained")
+                                rc = dm._run_delivery(request["argv"], str(dm_file), stdin_file=False, lock_held=True, strict_authority=True)
+                            for stream in (out, err):
+                                stream.flush()
+                                os.fsync(stream.fileno())
+                        directory_fd = os.open(folder, os.O_RDONLY)
+                        try:
+                            os.fsync(directory_fd)
+                        finally:
+                            os.close(directory_fd)
+                        # Process exit is not delivery evidence. In observation
+                        # mode the transport may exit zero but persist unknown
+                        # after an invalid/missing ACK. Keep that distinction.
+                        receipt = json.loads(Path(str(dm_file) + ".receipt.json").read_text())
+                        final = receipt.get("state")
+                        if final not in TERMINAL or (final == "delivered" and rc != 0):
+                            final = "unknown"
+                        reason = "" if final == "delivered" else "transport_" + final + "; original request and receipt retained"
+                        self.state(job_id, final, reason)
                     except BaseException as exc:
                         self.state(job_id, "unknown", "dispatch_interrupted:" + type(exc).__name__)
                         if not isinstance(exc, Exception):
@@ -245,7 +261,8 @@ def wait(queue: Queue, job_id: str) -> int:
             folder = queue.folder(job_id)
             if job["state"] == "delivered":
                 path = folder / "reply.txt"
-                print(path.read_text() if path.exists() else json.dumps({"status": "delivered", "delivery_id": job_id}))
+                reply = path.read_text() if path.exists() else ""
+                print(reply or json.dumps({"status": "delivered", "delivery_id": job_id, "reply_unavailable": True}))
                 return 0
             print(json.dumps({"status": job["state"], "delivery_id": job_id, "reason": job["reason"],
                               "detail": "Request retained. Do not blindly resend an ambiguous delivery."}))

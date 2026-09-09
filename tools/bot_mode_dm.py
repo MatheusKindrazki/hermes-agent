@@ -1119,7 +1119,7 @@ def _delivery_runtime_env() -> dict[str, str]:
     return env
 
 
-def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool, lock_held: bool = False) -> int:
+def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool, lock_held: bool = False, strict_authority: bool = False) -> int:
     """Run one DM transport and remove its plaintext file after consumption.
 
     The turn execution window (not the enqueue) holds the target profile's
@@ -1167,7 +1167,7 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool, lock_held:
                 ):
                     raise ValueError("delivery fence invalid")
             except Exception:
-                if record.get("observation"):
+                if record.get("observation") and not strict_authority:
                     from agent.durable_admission import observation_gap
                     observation_gap(record["observation"], "admission_failed")
                     structured = False
