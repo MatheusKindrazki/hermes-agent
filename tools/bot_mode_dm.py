@@ -1119,7 +1119,7 @@ def _delivery_runtime_env() -> dict[str, str]:
     return env
 
 
-def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool) -> int:
+def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool, lock_held: bool = False, strict_authority: bool = False) -> int:
     """Run one DM transport and remove its plaintext file after consumption.
 
     The turn execution window (not the enqueue) holds the target profile's
@@ -1167,7 +1167,7 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool) -> int:
                 ):
                     raise ValueError("delivery fence invalid")
             except Exception:
-                if record.get("observation"):
+                if record.get("observation") and not strict_authority:
                     from agent.durable_admission import observation_gap
                     observation_gap(record["observation"], "admission_failed")
                     structured = False
@@ -1187,7 +1187,7 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool) -> int:
                     encoding="utf-8",
                 )
                 os.chmod(dm_file, 0o600)
-        with _delivery_lock(argv, stdin_file=stdin_file):
+        with (contextlib.nullcontext() if lock_held else _delivery_lock(argv, stdin_file=stdin_file)):
             if stdin_file:
                 # Keep the file open until the transport exits; cleanup occurs
                 # after subprocess.run returns, not merely after stdin reaches EOF.
@@ -1443,6 +1443,30 @@ def _start_delivery_inner(
         _unlink_dm_file(dm_file)
         _unlink_dm_file(dm_file + ".receipt.json")
         raise
+    # Preserve the existing transport and completion listener, but put a
+    # durable queue between acceptance and local dispatch. Peer/relay routes
+    # retain their own protocol. A failed listener never deletes queued work.
+    if not stdin_file:
+        from tools import bot_delivery_queue as queue
+        source_home = Path(_agent_home(agent))
+        if queue.local_target(argv) and queue.enabled(source_home):
+            try:
+                store = queue.Queue(_hermes_root(source_home))
+                job = store.enqueue(argv, content, receipt, source_home)
+                if _idempotency is not None:
+                    # Enforced/observed callers already own this exact ledger
+                    # lock until the deferred spawn tuple has been prepared.
+                    _update_delivery_receipt_inner(dm_file, job["state"])
+                else:
+                    _update_delivery_receipt(dm_file, job["state"])
+                receipt = {**receipt, "state": job["state"], "queue_id": job["id"]}
+                command = queue.wait_command(store.root, job["id"])
+                _unlink_dm_file(dm_file)
+                _unlink_dm_file(dm_file + ".receipt.json")
+                _unlink_dm_file(str(_delivery_envelope_path(dm_file)))
+                dm_file = None  # the queue now owns its private payload copy
+            except Exception as exc:
+                return _err(f"Durable delivery could not be queued: {type(exc).__name__}: {exc}")
     if _defer_spawn:
         return command, dm_file, receipt
     return _spawn_delivery(
@@ -1471,6 +1495,11 @@ def _spawn_delivery(
     ``tools/bot_relay.py`` — there is no plaintext DM tempfile to reclaim.
     """
     transferred = False
+    queued = bool(receipt and receipt.get("queue_id"))
+    def queued_without_listener(detail):
+        return json.dumps({"status": receipt.get("state", "queued"), "to": label,
+                           "delivery": _public_delivery_receipt(receipt),
+                           "detail": "Request saved; destination has not received it yet. " + detail})
     try:
         from tools.terminal_tool import terminal_tool
 
@@ -1488,9 +1517,13 @@ def _spawn_delivery(
             parsed = {}
         proc_id = parsed.get("session_id") or ""
         if parsed.get("error"):
+            if queued:
+                return queued_without_listener("Completion listener unavailable; inspect the updates inbox.")
             _release_unspawned_delivery(dm_file)
             return _err(f"Delivery to {label} failed to start: {parsed['error']}")
         if not proc_id:
+            if queued:
+                return queued_without_listener("Completion listener unavailable; inspect the updates inbox.")
             _release_unspawned_delivery(dm_file)
             return _err(f"Delivery to {label} failed to start: no process id returned")
         # From this point the background runner owns the file and removes it
@@ -1498,9 +1531,11 @@ def _spawn_delivery(
         transferred = True
         return json.dumps(
             {
-                "status": "accepted",
+                "status": receipt.get("state", "queued") if queued else "accepted",
                 "to": label,
-                "detail": (
+                "detail": ("Request durably queued; NOT delivered or executing yet. "
+                           "Do not resend or poll. Finish this turn; its completion notification will carry the reply. "
+                           "Durable status is also available in the updates inbox.") if queued else (
                     f"Message dispatched to {label}. This is asynchronous — do NOT wait "
                     "or poll. Finish your turn now; when the delivery completes, its "
                     "notification carries the reply — relay it then, attributed to "
@@ -1512,6 +1547,8 @@ def _spawn_delivery(
             }
         )
     except Exception as exc:
+        if queued:
+            return queued_without_listener("Completion listener unavailable; inspect the updates inbox.")
         _release_unspawned_delivery(dm_file)
         logger.error("message_agent delivery spawn failed: %s", exc, exc_info=True)
         return _err(f"Delivery to {label} could not be started: {exc}")
