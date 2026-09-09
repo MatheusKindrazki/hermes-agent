@@ -590,13 +590,36 @@ def test_schema_file_hash_is_verified_against_the_pin(monkeypatch, tmp_path):
 
 
 @requires_k7
+def test_admission_waits_for_a_remote_reply_slower_than_two_seconds(monkeypatch, tmp_path):
+    """A live 2.05s refusal cut off K7 before its 10s HTTP budget elapsed.
+
+    Use a real delayed child, then ensure normal receipt validation still runs.
+    An invalid receipt must remain refused, not become a timeout or authority.
+    """
+    adapter = _adapter(
+        tmp_path,
+        "import sys, time\nsys.stdin.read()\ntime.sleep(2.25)\nprint('{}')\n",
+        "delayed_reply.py",
+    )
+    _arm_adapter(monkeypatch, tmp_path, adapter)
+    outcome = durable_admission.admit_execution(
+        session_id="delayed-execution", request={"tool": "message_agent"},
+        event_id="exec.delayed-budget-regression",
+    )
+    assert outcome.reason_code != "admitter_timeout"
+    assert outcome.model_may_run is False
+    assert outcome.effects_allowed is False
+
+
+@requires_k7
 def test_outer_budget_is_frozen_and_config_cannot_raise_it(monkeypatch, tmp_path):
-    """The 2.0s outer wait is a module constant with no config override."""
-    assert durable_admission.TIMEOUT_SECONDS == 2.0
+    """The bounded outer wait is not controlled by caller configuration."""
+    frozen_budget = durable_admission.TIMEOUT_SECONDS
+    assert frozen_budget <= 2.0, "gateway input admission must remain short"
 
     adapter = _adapter(tmp_path, "import sys\nsys.stdin.read()\nprint('{}')\n", "quick.py")
     _arm_adapter(
-        monkeypatch, tmp_path, adapter, {"timeout_ms": 30000, "state_dir": str(tmp_path / "st")}
+        monkeypatch, tmp_path, adapter, {"timeout_ms": 300000, "state_dir": str(tmp_path / "st")}
     )
     seen = {}
     real = subprocess.run
@@ -608,7 +631,7 @@ def test_outer_budget_is_frozen_and_config_cannot_raise_it(monkeypatch, tmp_path
 
     _admit()
 
-    assert seen["timeout"] == 2.0, "a config key raised the frozen outer budget"
+    assert seen["timeout"] == frozen_budget, "a config key raised the outer budget"
 
 
 @requires_k7
@@ -617,6 +640,7 @@ def test_external_timeout_is_ambiguous_never_dispatched(monkeypatch, tmp_path):
     wait on the subprocess. Expiring it says nothing about whether the kernel
     decided, so it is ambiguous and must not be re-asked from here."""
     _arm_adapter(monkeypatch, tmp_path, _slow_adapter(tmp_path))
+    monkeypatch.setattr(durable_admission, "TIMEOUT_SECONDS", 0.1)
 
     outcome = _admit()
 
