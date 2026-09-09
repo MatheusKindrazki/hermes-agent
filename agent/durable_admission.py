@@ -31,15 +31,15 @@ both files are hashed before anything is executed. A model argument, a tool
 argument and user text can reach none of it: argv is a fixed list, there is no
 shell, and the envelope rides stdin as one JSON document.
 
-The outer budget is exactly 2.0s and no setting can raise it
-------------------------------------------------------------
-K7's client owns its own remote timeout and decides, inside that window, whether
-the remote answered. ``TIMEOUT_SECONDS`` measures something different: how long
-THIS process waits on the admitter subprocess. Expiring it proves nothing about
-whether the kernel decided — the child may have died a millisecond before
-writing its receipt — so it is ambiguous, fail-closed, non-retryable, and never
-dispatched. Raising it would not make the answer safer, only the ambiguity
-rarer, so it is a module constant with no config override on purpose.
+Input admission stays short; execution admission covers remote round trips
+-------------------------------------------------------------------------
+Natural input admission keeps its fixed 2s budget: some gateways call it on
+their event loop. Execution admission runs on the tool path and gets 30s,
+because K7 permits 10s per HTTP request and may perform both ensure-work and
+sync-session. Killing it at 2s stranded otherwise valid replies as ambiguous.
+Revalidation and release retain their original 2s budget. Neither budget has
+a caller/config override. Any expiry remains ambiguous, fail-closed,
+non-retryable, and never dispatched.
 
 Default is OFF, and OFF costs nothing
 -------------------------------------
@@ -668,6 +668,7 @@ _SETTLED_STATES = (STATE_ADMITTED, STATE_NO_WORK_REQUIRED)
 
 # Frozen. See the module docstring: no config key reads this.
 TIMEOUT_SECONDS = 2.0
+EXECUTION_ADMISSION_TIMEOUT_SECONDS = 30.0
 
 # The envelope's own cap. Above it the input cannot be represented, so it is
 # refused by name rather than truncated into a different input.
@@ -1817,13 +1818,21 @@ def _run_admission(
         "session_id": session_id,
     }
 
+    # event_kind is chosen by the public Python seam, never by request text:
+    # admit_input uses chat_message even when it declares an execution;
+    # only admit_execution uses system_event. Keep the gateway path short.
+    outer_timeout = (
+        EXECUTION_ADMISSION_TIMEOUT_SECONDS
+        if event_kind == "system_event" else TIMEOUT_SECONDS
+    )
+
     try:
         completed = subprocess.run(  # noqa: S603 - fixed argv list, shell=False
             _argv(roots, settings, seam, now),
             input=json.dumps(envelope, ensure_ascii=False),
             capture_output=True,
             text=True,
-            timeout=TIMEOUT_SECONDS,
+            timeout=outer_timeout,
             cwd=roots.root_dir,
             env=_child_env(settings),
             shell=False,
@@ -1832,7 +1841,7 @@ def _run_admission(
         logger.warning(
             "durable admission expired the %.1fs outer budget (ambiguous, "
             "fail-closed): session=%s seam=%s",
-            TIMEOUT_SECONDS,
+            outer_timeout,
             session_id,
             seam,
         )
@@ -2157,6 +2166,7 @@ EXPORTED_CONTRACT: Dict[str, Any] = {
     "admitter_sha256": TURN_IDENTITY_ADMITTER_SHA256,
     "schema_sha256": SCHEMA_SHA256,
     "outer_timeout_seconds": TIMEOUT_SECONDS,
+    "execution_admission_timeout_seconds": EXECUTION_ADMISSION_TIMEOUT_SECONDS,
     "arming": "%s in %s" % (ENV_MODE, sorted(_ARMING_MODES)),
     "seams": {
         "gateway_ingress": "gateway.run.GatewayRunner._handle_message (before "
