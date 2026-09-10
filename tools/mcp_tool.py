@@ -8347,6 +8347,18 @@ def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
     except Exception:
         logger.debug("Context-engine tool re-injection skipped", exc_info=True)
 
+    # Bot Chat messaging is injected per turn rather than registered globally.
+    # Compaction runs after that injection, so reconstruct it on the staged
+    # snapshot as well. Keep the canonical-session/managed-install gate and
+    # append after memory/context tools, matching the original prefix order.
+    try:
+        from tools.bot_mode_dm import message_agent_tool_enabled, message_agent_tool_schema
+
+        if message_agent_tool_enabled(agent):
+            _add(message_agent_tool_schema()["function"])
+    except Exception:
+        logger.debug("Bot Chat tool re-injection skipped", exc_info=True)
+
     return staged_engine_names
 
 

@@ -155,6 +155,35 @@ def test_completion_listener_failure_does_not_lose_enqueued_request(tmp_path, mo
     assert 'not received' in result['detail']
 
 
+def test_durable_reply_does_not_spawn_a_sender_owned_waiter(queue_fixture, monkeypatch):
+    """The durable worker, not the sender's turn, owns reply completion.
+
+    A notify-on-complete waiter makes CLI shutdown hold the sender's lock
+    until the recipient finishes; a reply back to that sender cannot run.
+    """
+    from tools import terminal_tool
+    q, db, enqueue = queue_fixture
+    job = enqueue('durable reply')
+    calls = []
+    monkeypatch.setattr(terminal_tool, 'terminal_tool',
+                        lambda *a, **kw: calls.append(kw) or json.dumps({'session_id': 'waiter'}))
+    result = json.loads(dm._spawn_delivery(
+        'wait for durable job', '@staff',
+        receipt={**q.request(job['id'])['record'], 'state': 'queued', 'queue_id': job['id']},
+        task_id='source', agent=None,
+    ))
+    assert calls == [], 'sender-owned waiter pins the source turn during a reply'
+    assert result['status'] == 'queued'
+    assert q.get(job['id'])['state'] == 'queued'
+    # The separate worker can still deliver and notify after the sender returns.
+    assert q.run_one(job['id']) == 'delivered'
+    q.notify(q.get(job['id']))
+    assert q.get(job['id'])['notified'] == 1
+    assert len(db.get_messages_as_conversation('recipient')) == 1
+    assert q.run_one(job['id']) == 'delivered'
+    assert len(db.get_messages_as_conversation('recipient')) == 1
+
+
 @pytest.mark.timeout(5)
 def test_enforced_enqueue_under_existing_ledger_lock_does_not_deadlock(tmp_path, monkeypatch):
     home = tmp_path / '.hermes'
