@@ -158,6 +158,15 @@ def message_agent_tool_schema() -> dict:
     }
 
 
+def message_agent_tool_enabled(agent: Any) -> bool:
+    """The same session/install gate for turn injection and staged rebuilds."""
+    from tools.bot_mode_probe import BOT_CHAT_TITLE, is_bot_mode_managed
+
+    return (bool(getattr(agent, "_bot_mode_protocol", True))
+            and _session_title(agent) == BOT_CHAT_TITLE
+            and is_bot_mode_managed(_agent_home(agent)))
+
+
 def ensure_message_agent_tool(agent: Any) -> bool:
     """Inject the ``message_agent`` schema into a Bot Chat agent's tool list.
 
@@ -179,15 +188,11 @@ def ensure_message_agent_tool(agent: Any) -> bool:
                     and tool.get("function", {}).get("name") == MESSAGE_AGENT_TOOL_NAME
                 ):
                     return True
-        from tools.bot_mode_probe import BOT_CHAT_TITLE, is_bot_mode_managed
-
-        if _session_title(agent) != BOT_CHAT_TITLE:
-            return False
         # Managed-install check, NOT section non-emptiness: a profile whose
         # SOUL.md carries the legacy plugin-appended protocol text gets an
         # empty section (dedupe) but must still receive the tool — otherwise
         # upgraded installs silently lose A2A messaging (Aug 2026).
-        if not is_bot_mode_managed(_agent_home(agent)):
+        if not message_agent_tool_enabled(agent):
             return False
         if agent.tools is None:
             agent.tools = []
