@@ -85,7 +85,7 @@ _SAFE_ACTIONS = frozenset({
 # Actions that mutate user-visible state. Go through approval.
 _DESTRUCTIVE_ACTIONS = frozenset({
     "click", "double_click", "right_click", "middle_click",
-    "drag", "scroll", "type", "key", "set_value", "focus_app",
+    "drag", "scroll", "type", "key", "set_value",
 })
 
 # Hard-blocked key combinations. Mirrored from #4562 — these are destructive
@@ -558,6 +558,8 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
         err = _request_approval(action, args, session_id)
         if err is not None:
             return err
+    # focus_app without raise_window only selects an existing target; it
+    # performs no UI input or foreground change. Do not prompt for that read.
     # Persistent focus is a separate, visible side effect from the input
     # itself. Keep its approval scope distinct even when the input rung has
     # already been approved for this session.
