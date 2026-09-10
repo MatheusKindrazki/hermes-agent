@@ -1500,6 +1500,18 @@ def _spawn_delivery(
         return json.dumps({"status": receipt.get("state", "queued"), "to": label,
                            "delivery": _public_delivery_receipt(receipt),
                            "detail": "Request saved; destination has not received it yet. " + detail})
+    if queued:
+        # The durable worker owns both execution and completion notification.
+        # A sender-owned notify_on_complete waiter would make one-shot exit
+        # hold the source turn lock while waiting for a reply to that same
+        # source: Chief -> Staff -> Chief then stalls until the linger expires.
+        # The no-listener response is already supported; the queue/inbox is
+        # the receipt, not a transient process in this interpreter.
+        return queued_without_listener(
+            "The durable worker owns delivery. Finish this turn; completion "
+            "status will arrive in the updates inbox and the result is retained "
+            "in the delivery receipt. Do not resend or poll."
+        )
     try:
         from tools.terminal_tool import terminal_tool
 
