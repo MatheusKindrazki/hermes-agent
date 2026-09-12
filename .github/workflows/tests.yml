@@ -16,7 +16,9 @@ jobs:
     name: Run tests
     # Run the whole unsliced suite on a standard GitHub-hosted runner.
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # The full suite reached 95.6% at the previous 30-minute cutoff.
+    # Keep every test and worker isolation; allow setup and completion headroom.
+    timeout-minutes: 45
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

@@ -6,19 +6,24 @@ import os
 from pathlib import Path
 import uuid
 
-import yaml
-
 INBOX_TITLE = "Atualizações automáticas"
 INBOX_SOURCE = "automation_inbox"
 
 
 def enabled(home: Path) -> bool:
     """Read the destination profile on every delivery (no restart needed)."""
-    path = home / "config.yaml"
-    if not path.exists():
+    from hermes_cli.config import load_config_readonly_for_home
+
+    config = load_config_readonly_for_home(home)
+    section = config.get("notifications")
+    if section is None:
         return False
-    config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    return (config.get("notifications") or {}).get("isolated_inbox") is True
+    if not isinstance(section, dict):
+        raise ValueError("notifications must be a mapping")
+    value = section.get("isolated_inbox", False)
+    if not isinstance(value, bool):
+        raise ValueError("notifications.isolated_inbox must be a boolean")
+    return value
 
 
 def append(home: Path, content: str, *, delivery_id: str, source: str,
