@@ -18,17 +18,24 @@ if __name__ == "__main__" and not __package__:
     # import the same immutable release as the caller that enqueued it.
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import yaml
-
 TERMINAL = {"delivered", "failed", "unknown"}
 PROFILE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 JOB_ID = re.compile(r"[a-f0-9-]{36}\Z")
 
 
 def enabled(home: Path) -> bool:
-    path = home / "config.yaml"
-    config = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else {}
-    return ((config or {}).get("bot_mode") or {}).get("durable_delivery_queue") is True
+    from hermes_cli.config import load_config_readonly_for_home
+
+    config = load_config_readonly_for_home(home)
+    section = config.get("bot_mode")
+    if section is None:
+        return False
+    if not isinstance(section, dict):
+        raise ValueError("bot_mode must be a mapping")
+    value = section.get("durable_delivery_queue", False)
+    if not isinstance(value, bool):
+        raise ValueError("bot_mode.durable_delivery_queue must be a boolean")
+    return value
 
 
 def local_target(argv: list[str]) -> str | None:

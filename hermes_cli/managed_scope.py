@@ -112,11 +112,22 @@ def _cached_read(path: Path, cache: Dict[str, tuple], parse):
     return parsed
 
 
-def load_managed_config() -> dict:
-    """Parsed managed config.yaml, or {} when absent/malformed (fail-open)."""
+def load_managed_config(*, strict: bool = False) -> dict:
+    """Read managed config; strict delivery reads raise instead of dropping policy."""
     managed_dir = get_managed_dir()
     if managed_dir is None:
         return {}
+    if strict:
+        try:
+            with open(managed_dir / "config.yaml", encoding="utf-8") as stream:
+                parsed = yaml.safe_load(stream)
+        except FileNotFoundError:
+            return {}
+        if parsed is None:
+            return {}
+        if not isinstance(parsed, dict):
+            raise ValueError("Managed delivery configuration must be a mapping")
+        return parsed
     parsed = _cached_read(
         managed_dir / "config.yaml",
         _CONFIG_CACHE,
