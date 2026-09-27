@@ -289,7 +289,7 @@ class ObservationWriter:
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
         except FileNotFoundError:
             return None
-        with os.fdopen(fd, encoding="utf-8") as stream:
+        with os.fdopen(fd, encoding="utf-8-sig") as stream:
             info = os.fstat(stream.fileno())
             if (not stat.S_ISREG(info.st_mode) or info.st_uid != _observation_uid() or stat.S_IMODE(info.st_mode) != 0o600
                     or info.st_nlink != 1 or info.st_size > 65536):

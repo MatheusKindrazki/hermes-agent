@@ -30,6 +30,9 @@ behavior is restored at the new call sites. Preserve these boundaries:
 Run the standard Python test runner against a disposable PM-built environment,
 Desktop type checks, affected Vitest suites and the active-context Electron E2E.
 Use mock providers for integration tests. Record skipped platforms explicitly.
+The fork uses standard GitHub-hosted runners, not the upstream organization's
+private large-runner labels. Contributor checking excludes only the recorded
+upstream integration ancestor; new fork contributions still require attribution.
 
 ## Release contract
 
@@ -43,8 +46,13 @@ value matters: a plain `local` stamp with only `external` does not enforce the
 commit-build update refusal. Keep the legacy `.hermes_build_sha` only for older
 supervisor receipts; current runtime identity comes from `version_info`.
 
-Build Desktop with `GITHUB_REPOSITORY=MatheusKindrazki/hermes-agent` and
-`--publish never`; inspect the artifact's install stamp and update feed. A runtime
+Build a thin Desktop with `GITHUB_REPOSITORY=MatheusKindrazki/hermes-agent` and
+`--publish never`, without a public update-feed URL; inspect the artifact's stamp
+and ensure it has no upstream update feed. Keep the stable application identity
+so saved connections remain available. Pin its local backend with the private
+`backend-runtime.json` file in Electron userData (`version: 1`, absolute `root`,
+optional absolute `python`). A missing/invalid pinned installation must fail
+rather than bootstrap upstream. Remote connections do not use this pin. A runtime
 CLI upgrade does not upgrade the Electron application.
 
 Before promotion, preserve the old application, launch definitions, wrapper and

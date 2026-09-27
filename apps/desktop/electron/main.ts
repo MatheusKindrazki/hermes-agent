@@ -496,6 +496,7 @@ import {
 } from './session-windows'
 import { ensureLoginShellPath } from './shell-path'
 import { createSourcePythonBackend, resolveSourceInstallationBackend, type SourceBackend } from './source-backend'
+import { resolvePinnedLocalBackend } from './backend-runtime-pin'
 import { resolveSourcePython } from './source-python'
 import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
 import { collectSshConfigHosts, parseSshGOutput } from './ssh-config'
@@ -3288,6 +3289,13 @@ function writeZoomState(zoomLevel) {
 // Dev → SOURCE_REPO_ROOT. Packaged/CLI install → ACTIVE_HERMES_ROOT.
 // HERMES_DESKTOP_HERMES_ROOT always wins so devs can pin a worktree.
 function resolveUpdateRoot() {
+  // The validated local runtime is also the update authority; never choose the old git checkout.
+  if (!primaryBackendIsRemote()) {
+    const pinned = resolvePinnedLocalBackend({
+      userData: app.getPath('userData'), args: [], bundled: Boolean(bundledPayload(process.resourcesPath))
+    })
+    if (pinned) return pinned.root
+  }
   const candidates = [
     process.env.HERMES_DESKTOP_HERMES_ROOT && path.resolve(process.env.HERMES_DESKTOP_HERMES_ROOT),
     !IS_PACKAGED && isHermesSourceRoot(SOURCE_REPO_ROOT) ? SOURCE_REPO_ROOT : null,
@@ -4907,59 +4915,14 @@ const installedRuntimeGate = createInstalledRuntimeGate(process.env, rememberLog
 
 async function resolveHermesBackend(backendArgs: string[]): Promise<ResolvedHermesBackend> {
   const payload = bundledPayload(process.resourcesPath)
-
-  if (payload) {
-    if (!IS_WINDOWS) {
-      provisionCliLinks(payload.commands, path.join(os.homedir(), '.local', 'bin'), rememberLog)
-    }
-
-    return {
-      kind: 'python',
-      label: `bundled payload at ${payload.root}`,
-      command: payload.shim,
-      args: [...backendArgs],
-      env: { ...buildDesktopBackendEnv(), HERMES_RUNTIME_DIR: payload.toolsDir },
-      root: payload.repoDir,
-      bootstrap: false,
-      shell: false,
-      local: 'bundled'
-    }
+  const pinned = resolvePinnedLocalBackend({
+    userData: app.getPath('userData'), args: backendArgs, bundled: Boolean(payload)
+  })
+  if (pinned) {
+    return pinned
   }
 
-  // 1. Explicit override -- HERMES_DESKTOP_HERMES_ROOT points at a developer
-  //    checkout. Honour it as-is (no bootstrap; the user is driving).
-  const overrideRoot: string | undefined =
-    process.env.HERMES_DESKTOP_HERMES_ROOT && path.resolve(process.env.HERMES_DESKTOP_HERMES_ROOT)
-
-  if (overrideRoot && isHermesSourceRoot(overrideRoot)) {
-    const backend: SourceBackend | null = createSourcePythonBackend(
-      overrideRoot,
-      await findPythonForRoot(overrideRoot),
-      backendArgs
-    )
-
-    if (backend) {
-      return backend
-    }
-  }
-
-  // 2. Development source -- when running `npm run dev` from a checkout, the
-  //    cloned repo at SOURCE_REPO_ROOT takes precedence over ACTIVE and any
-  //    installed `hermes` on PATH so local Python edits are actually exercised.
-  //    (In dev with no checkout, SOURCE_REPO_ROOT won't pass isHermesSourceRoot.)
-  if (!IS_PACKAGED && isHermesSourceRoot(SOURCE_REPO_ROOT)) {
-    const backend: SourceBackend | null = createSourcePythonBackend(
-      SOURCE_REPO_ROOT,
-      await findPythonForRoot(SOURCE_REPO_ROOT),
-      backendArgs
-    )
-
-    if (backend) {
-      return backend
-    }
-  }
-
-  // 3. HERMES_DESKTOP_HERMES — an explicit deployment override (used by the
+  // Explicit HERMES_DESKTOP_HERMES — an explicit deployment override (used by the
   //    Nix wrapper), not a discovered PATH candidate. The pinned backend is
   //    the only valid runtime there. Resolve it before any mutable install,
   //    which may belong to an older release or a different Python environment.
@@ -5008,9 +4971,44 @@ async function resolveHermesBackend(backendArgs: string[]): Promise<ResolvedHerm
         }
 
         rememberLog(
-          `Ignoring existing Hermes CLI at ${hermesCommand}: --version probe failed; falling through to bootstrap.`
+          `Ignoring existing Hermes CLI at ${hermesCommand}: --version probe failed; refusing the explicit override.`
         )
       }
+    }
+    throw new Error('The explicit HERMES_DESKTOP_HERMES command is unavailable. Correct or remove that override; no automatic installation was started.')
+  }
+
+  if (payload) {
+    if (!IS_WINDOWS) {
+      provisionCliLinks(payload.commands, path.join(os.homedir(), '.local', 'bin'), rememberLog)
+    }
+
+    return {
+      kind: 'python',
+      label: `bundled payload at ${payload.root}`,
+      command: payload.shim,
+      args: [...backendArgs],
+      env: { ...buildDesktopBackendEnv(), HERMES_RUNTIME_DIR: payload.toolsDir },
+      root: payload.repoDir,
+      bootstrap: false,
+      shell: false,
+      local: 'bundled'
+    }
+  }
+
+  // Development source -- when running `npm run dev` from a checkout, the
+  //    cloned repo at SOURCE_REPO_ROOT takes precedence over ACTIVE and any
+  //    installed `hermes` on PATH so local Python edits are actually exercised.
+  //    (In dev with no checkout, SOURCE_REPO_ROOT won't pass isHermesSourceRoot.)
+  if (!IS_PACKAGED && isHermesSourceRoot(SOURCE_REPO_ROOT)) {
+    const backend: SourceBackend | null = createSourcePythonBackend(
+      SOURCE_REPO_ROOT,
+      await findPythonForRoot(SOURCE_REPO_ROOT),
+      backendArgs
+    )
+
+    if (backend) {
+      return backend
     }
   }
 
@@ -13023,7 +13021,14 @@ async function runHermesStart({ supervisorRecovery = false }: { supervisorRecove
     const setup = await runPrimaryBackendStartup({
       signal: localBackendLifecycle.signal,
       assertCurrentAttempt: () => backendConnectionState.assertCurrentAttempt(connectionAttempt),
-      attachHostBackend: attachToRunningHostBackend,
+      attachHostBackend: async () => {
+        // A persisted release owns this local launch. An older host backend must not bypass it.
+        const pinned = resolvePinnedLocalBackend({
+          userData: app.getPath('userData'), args: backendArgs,
+          bundled: Boolean(bundledPayload(process.resourcesPath))
+        })
+        return pinned ? null : attachToRunningHostBackend()
+      },
       connectRemote,
       ensureLocalRuntime: backend =>
         ensureRuntime(backend, () => backendConnectionState.assertCurrentAttempt(connectionAttempt)),

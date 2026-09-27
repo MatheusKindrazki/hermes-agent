@@ -116,7 +116,7 @@ class Queue:
             return [dict(r) for r in db.execute("SELECT * FROM jobs ORDER BY created,id")]
 
     def request(self, job_id: str) -> dict:
-        return json.loads((self.folder(job_id) / "request.json").read_text(encoding="utf-8"))
+        return json.loads((self.folder(job_id) / "request.json").read_text(encoding="utf-8-sig"))
 
     def enqueue(self, argv: list[str], content: str, record: dict, source_home: Path) -> dict:
         from tools import bot_mode_dm as dm
@@ -227,7 +227,7 @@ class Queue:
                         # Process exit is not delivery evidence. In observation
                         # mode the transport may exit zero but persist unknown
                         # after an invalid/missing ACK. Keep that distinction.
-                        receipt = json.loads(Path(str(dm_file) + ".receipt.json").read_text(encoding="utf-8"))
+                        receipt = json.loads(Path(str(dm_file) + ".receipt.json").read_text(encoding="utf-8-sig"))
                         final = receipt.get("state")
                         if final not in TERMINAL or (final == "delivered" and rc != 0):
                             final = "unknown"
@@ -268,7 +268,7 @@ def wait(queue: Queue, job_id: str) -> int:
             folder = queue.folder(job_id)
             if job["state"] == "delivered":
                 path = folder / "reply.txt"
-                reply = path.read_text(encoding="utf-8") if path.exists() else ""
+                reply = path.read_text(encoding="utf-8-sig") if path.exists() else ""
                 print(reply or json.dumps({"status": "delivered", "delivery_id": job_id, "reply_unavailable": True}))
                 return 0
             print(json.dumps({"status": job["state"], "delivery_id": job_id, "reason": job["reason"],

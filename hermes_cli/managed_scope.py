@@ -111,7 +111,7 @@ def load_managed_config(*, strict: bool = False) -> dict:
         return {}
     if strict:
         try:
-            with open(managed_dir / "config.yaml", encoding="utf-8") as stream:
+            with open(managed_dir / "config.yaml", encoding="utf-8-sig") as stream:
                 parsed = fast_safe_load(stream.read())
         except FileNotFoundError:
             return {}

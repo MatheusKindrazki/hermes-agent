@@ -64,7 +64,7 @@ def test_empty_title_with_idempotency_leaves_no_task_rows(monkeypatch, tmp_path)
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         with pytest.raises(ValueError, match="title is required"):
             kb.create_task(conn, title="  ", idempotency_key="empty-key")
@@ -95,7 +95,7 @@ def test_two_connections_same_idempotency_key_return_canonical_id(
     monkeypatch.setattr(kb, "write_txn", synchronized_write_txn)
 
     def create(workspace: str) -> str:
-        conn = kb.connect()
+        conn = kbc.connect()
         try:
             return kb.create_task(
                 conn,
@@ -112,7 +112,7 @@ def test_two_connections_same_idempotency_key_return_canonical_id(
         ids = list(pool.map(create, [str(tmp_path / "a"), str(tmp_path / "b")]))
 
     assert ids[0] == ids[1]
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         rows = conn.execute(
             "SELECT id, workspace_path FROM tasks WHERE idempotency_key = ?",

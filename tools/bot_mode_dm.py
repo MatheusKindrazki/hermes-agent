@@ -595,7 +595,7 @@ def _read_delivery_ledger(path: Path, idempotency_key: str) -> Optional[dict[str
                 or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600):
             raise RuntimeError("delivery_ledger_unsafe")
         try:
-            with os.fdopen(fd, "r", encoding="utf-8") as stream:
+            with os.fdopen(fd, "r", encoding="utf-8-sig") as stream:
                 fd = -1
                 document = json.load(stream)
         except (OSError, ValueError, TypeError) as exc:
@@ -678,7 +678,7 @@ def _write_delivery_receipt(
 def _update_delivery_receipt(dm_file: str, state: str, *, ack: Optional[dict[str, Any]] = None,
                              ack_row_validated: bool = False) -> None:
     try:
-        record = json.loads(Path(dm_file + ".receipt.json").read_text(encoding="utf-8"))
+        record = json.loads(Path(dm_file + ".receipt.json").read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, TypeError):
         from agent.durable_admission import observation_enabled, observation_gap
         if observation_enabled():
@@ -704,7 +704,7 @@ def _update_delivery_receipt(dm_file: str, state: str, *, ack: Optional[dict[str
 def _update_delivery_receipt_inner(dm_file: str, state: str, *, ack=None, ack_row_validated=False):
     path = Path(dm_file + ".receipt.json")
     try:
-        record = json.loads(path.read_text(encoding="utf-8"))
+        record = json.loads(path.read_text(encoding="utf-8-sig"))
         if (record.get("observation") or record.get("enforced_effect")) and record.get("adapter_ack") is not None:
             return  # ACK/release replay: never fence, renew, resend or release.
         record["state"] = state
@@ -783,7 +783,7 @@ def _settle_observed_delivery(record: dict, path: Path, ack: dict, *, ack_row_va
         observation_gap(observation, "release_ambiguous")
         return
     try:
-        spool_document = json.loads(spool.read_text(encoding="utf-8"))
+        spool_document = json.loads(spool.read_text(encoding="utf-8-sig"))
         record["release_state"] = "acknowledged"
         record["release_receipt"] = release
         _atomic_json(path, record)
@@ -957,7 +957,7 @@ def _release_unspawned_delivery(dm_file: Optional[str]) -> None:
         return
     path = Path(dm_file + ".receipt.json")
     try:
-        record = json.loads(path.read_text(encoding="utf-8"))
+        record = json.loads(path.read_text(encoding="utf-8-sig"))
         key = str(record.get("idempotency_key") or "")
         if key:
             _unlink_dm_file(str(_delivery_ledger_path(key)))
@@ -1149,7 +1149,7 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
     try:
         receipt_path = Path(dm_file + ".receipt.json")
         try:
-            record = json.loads(receipt_path.read_text(encoding="utf-8"))
+            record = json.loads(receipt_path.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError, TypeError):
             record = {}
         structured = isinstance(record.get("turn_identity"), dict)
@@ -1217,10 +1217,10 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
                 transport_argv += ["--delivery-envelope-file", str(_delivery_envelope_path(dm_file))]
                 transport_argv.append("--json")
             else:
-                message = Path(dm_file).read_text(encoding="utf-8")
+                message = Path(dm_file).read_text(encoding="utf-8-sig")
                 Path(dm_file).write_text(
                     _encode_delivery_query(
-                        json.loads(_delivery_envelope_path(dm_file).read_text(encoding="utf-8")),
+                        json.loads(_delivery_envelope_path(dm_file).read_text(encoding="utf-8-sig")),
                         message,
                     ),
                     encoding="utf-8",
@@ -1230,9 +1230,9 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
             if stdin_file:
                 # Keep the file open until the transport exits; cleanup occurs
                 # after subprocess.run returns, not merely after stdin reaches EOF.
-                with open(dm_file, "r", encoding="utf-8") as stream:
+                with open(dm_file, "r", encoding="utf-8-sig") as stream:
                     proc = subprocess.run(
-                        transport_argv, stdin=stream, check=False, capture_output=True, text=True,
+                        transport_argv, input=stream.read(), check=False, capture_output=True, text=True,
                         encoding="utf-8", errors="replace", env=env,
                     )
                 returncode = proc.returncode

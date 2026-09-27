@@ -265,7 +265,7 @@ class DurableCompressionTurnSpool:
                     raise RuntimeError(
                         f"compression spool path changed during validation: {name}"
                     )
-                with os.fdopen(fd, "r", encoding="utf-8") as handle:
+                with os.fdopen(fd, "r", encoding="utf-8-sig") as handle:
                     fd = -1
                     value = json.load(handle)
             finally:

@@ -40,7 +40,7 @@ def _load_delivery_envelope(path_value: str | None) -> dict | None:
     info = path.stat()
     if info.st_uid != getattr(os, "getuid", lambda: info.st_uid)() or (info.st_mode & 0o077):
         raise RuntimeError("delivery envelope permissions are invalid")
-    document = json.loads(path.read_text(encoding="utf-8"))
+    document = json.loads(path.read_text(encoding="utf-8-sig"))
     fields = {"schema", "delivery_id", "request_key", "turn_identity_sha256", "accepted_at"}
     if not isinstance(document, dict) or set(document) != fields:
         raise RuntimeError("delivery envelope fields are invalid")

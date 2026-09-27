@@ -237,7 +237,7 @@ def cmd_send(args: argparse.Namespace) -> None:
         suppress_file = get_hermes_home() / "outbound-suppress-prefixes.txt"
         prefixes = (
             line.strip()
-            for line in suppress_file.read_text(encoding="utf-8").splitlines()
+            for line in suppress_file.read_text(encoding="utf-8-sig").splitlines()
         ) if suppress_file.exists() else ()
         if any(message.lstrip().startswith(prefix) for prefix in prefixes if prefix and not prefix.startswith("#")):
             if not getattr(args, "quiet", False):

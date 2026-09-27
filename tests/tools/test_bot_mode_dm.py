@@ -1285,20 +1285,15 @@ def test_dm_dir_rejects_precreated_symlink(tmp_path, monkeypatch):
 
     with pytest.raises(PermissionError, match="not a directory"):
         bot_mode_dm._dm_dir()
-def test_delivery_receipt_reads_unicode_with_explicit_utf8(tmp_path, monkeypatch):
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-8-sig"])
+def test_delivery_receipt_reads_unicode_and_rewrites_without_bom(tmp_path, encoding):
     dm_file = tmp_path / "message.txt"
     receipt = Path(str(dm_file) + ".receipt.json")
-    receipt.write_text(json.dumps({"note": "ação 日本語"}, ensure_ascii=False), encoding="utf-8")
-    real_read = Path.read_text
-    def utf8_only(path, *args, **kwargs):
-        if path == receipt:
-            assert kwargs.get("encoding") == "utf-8"
-        return real_read(path, *args, **kwargs)
-    monkeypatch.setattr(Path, "read_text", utf8_only)
+    receipt.write_text(json.dumps({"note": "ação 日本語"}, ensure_ascii=False), encoding=encoding)
     bot_mode_dm._update_delivery_receipt(str(dm_file), "accepted")
-    assert json.loads(receipt.read_text(encoding="utf-8"))["note"] == "ação 日本語"
-
-
+    document = json.loads(receipt.read_text(encoding="utf-8"))
+    assert document == {"note": "ação 日本語", "state": "accepted", "updated_at": document["updated_at"]}
+    assert not receipt.read_bytes().startswith(b"\xef\xbb\xbf")
 
 
 def test_cleanup_sweeps_stale_live_intents_and_keeps_fresh_ones(tmp_path, monkeypatch):
@@ -1551,3 +1546,32 @@ def test_dispatch_rechecks_disabled_protocol_even_inside_bot_chat(tmp_path, monk
     monkeypatch.setattr(bot_mode_dm, "_start_delivery", lambda *a, **kw: pytest.fail("disabled dispatch"))
     result = json.loads(bot_mode_dm.message_agent_tool("researcher", "hello", agent=agent))
     assert "disabled" in result["error"]
+
+
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-8-sig"])
+def test_structured_peer_delivery_consumes_bom_before_stdin(tmp_path, monkeypatch, capsys, encoding):
+    monkeypatch.setattr(bot_mode_dm, "_dm_dir", lambda: tmp_path)
+    dm_file = tmp_path / "dm.txt"
+    dm_file.write_text("ação 日本語", encoding=encoding)
+    identity = {"request_key": "request-bom-1", "source": "default"}
+    record = bot_mode_dm._write_delivery_receipt(
+        str(dm_file), origin_session_id="origin", origin_reason="explicit",
+        route_reason="peer", label="@peer", idempotency_key="b" * 64,
+        turn_identity=identity, fence={"fence_valid": True},
+    )
+    sidecar = Path(str(dm_file) + ".receipt.json")
+    sidecar.write_text(sidecar.read_text(encoding="utf-8"), encoding=encoding)
+    monkeypatch.setattr(bot_mode_dm, "_revalidate_delivery_identity", lambda _: {
+        "fence_valid": True, "identity_sha256": bot_mode_dm._canonical_sha256(identity)})
+    ack = {"schema": bot_mode_dm.DELIVERY_ACK_SCHEMA, "delivery_id": record["delivery_id"],
+           "request_key": identity["request_key"], "turn_identity_sha256": bot_mode_dm._canonical_sha256(identity),
+           "target_session_id": "peer-session", "target_message_id": 1, "adapter": "api_server",
+           "state": "persisted", "accepted_at": record["accepted_at"], "persisted_at": record["accepted_at"] + 1}
+    def transport(argv, **kwargs):
+        assert "--delivery-envelope-file" in argv
+        assert kwargs.get("input") == "ação 日本語"
+        assert "stdin" not in kwargs  # passing a descriptor bypasses the BOM decoder
+        return subprocess.CompletedProcess(argv, 0, json.dumps({"reply": "ok", "session_id": "peer-session", "delivery_ack": ack}), "")
+    monkeypatch.setattr(bot_mode_dm.subprocess, "run", transport)
+    assert bot_mode_dm._run_delivery(["hermes", "peer", "dm", "peer"], str(dm_file), stdin_file=True) == 0
+    assert capsys.readouterr().out == "ok"

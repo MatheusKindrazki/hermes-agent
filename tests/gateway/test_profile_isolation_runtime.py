@@ -38,7 +38,7 @@ from gateway.turn_context import (
     request_context_v2_enabled,
 )
 from gateway.config import Platform
-from gateway.run import TurnRunner
+from gateway.run_turn_runner import TurnRunner
 
 
 @pytest.fixture

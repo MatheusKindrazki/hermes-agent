@@ -146,17 +146,16 @@ def test_observation_missing_ownership_latches_broken(tmp_path, monkeypatch, get
     assert not (writer.root / "observation-channel.json").exists()
 
 
-def test_observation_json_streams_use_explicit_utf8(tmp_path, monkeypatch):
+@pytest.mark.parametrize("with_bom", [False, True])
+def test_observation_json_reads_bom_and_writes_plain_utf8(tmp_path, with_bom):
     root = tmp_path / "unicode"
     root.mkdir(mode=0o700)
     writer = durable_admission.ObservationWriter(root, code_sha="a" * 40)
-    real_fdopen = os.fdopen
-    def utf8_only(fd, *args, **kwargs):
-        assert kwargs.get("encoding") == "utf-8"
-        return real_fdopen(fd, *args, **kwargs)
-    monkeypatch.setattr(os, "fdopen", utf8_only)
     path = root / "fixture.json"
     writer._write(path, {"note": "ação 日本語"})
+    assert not path.read_bytes().startswith(b"\xef\xbb\xbf")
+    if with_bom:
+        path.write_bytes(b"\xef\xbb\xbf" + path.read_bytes())
     assert writer._read(path) == {"note": "ação 日本語"}
 
 

@@ -90,7 +90,7 @@ def write_kernel_shadow_receipt(event: dict[str, Any]) -> Optional[Path]:
     spool.chmod(0o700)
     target = spool / (event["event_id"] + ".json")
     if target.exists():
-        persisted = json.loads(target.read_text(encoding="utf-8"))
+        persisted = json.loads(target.read_text(encoding="utf-8-sig"))
         if persisted != event:
             raise ValueError("kernel_shadow_event_conflict")
         return target

@@ -7,6 +7,7 @@ import subprocess
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 
 
@@ -24,14 +25,14 @@ def test_dispatch_by_id_spawns_only_requested_ready_card(monkeypatch, tmp_path):
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _: True)
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         first = _ready(conn, "first")
         second = _ready(conn, "second")
         third = _ready(conn, "third")
         spawned = []
 
-        result = kb.dispatch_once(
+        result = kbd.dispatch_once(
             conn,
             task_id=second,
             spawn_fn=lambda task, workspace: spawned.append(task.id) or 4242,
@@ -54,29 +55,29 @@ def test_dispatch_by_id_fails_closed_for_tenant_status_assignee_and_capacity(
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _: True)
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         foreign = _ready(conn, "foreign", tenant="tenant-b")
         monkeypatch.setenv("HERMES_TENANT", "tenant-a")
-        result = kb.dispatch_once(conn, task_id=foreign, reconcile_orphans=False)
+        result = kbd.dispatch_once(conn, task_id=foreign, reconcile_orphans=False)
         assert result.target_reason == "tenant_mismatch"
         assert kb.get_task(conn, foreign).status == "ready"
 
         monkeypatch.delenv("HERMES_TENANT")
         unassigned = _ready(conn, "unassigned", assignee=None)
-        result = kb.dispatch_once(conn, task_id=unassigned, reconcile_orphans=False)
+        result = kbd.dispatch_once(conn, task_id=unassigned, reconcile_orphans=False)
         assert result.target_reason == "assignee_required"
 
         blocked = _ready(conn, "blocked")
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (blocked,))
-        result = kb.dispatch_once(conn, task_id=blocked, reconcile_orphans=False)
+        result = kbd.dispatch_once(conn, task_id=blocked, reconcile_orphans=False)
         assert result.target_reason == "status_not_ready"
 
         capped = _ready(conn, "capped")
         running = _ready(conn, "running")
         assert kb.claim_task(conn, running) is not None
-        result = kb.dispatch_once(
+        result = kbd.dispatch_once(
             conn,
             task_id=capped,
             max_in_progress_per_profile=1,
@@ -92,10 +93,10 @@ def test_dispatch_by_id_rejects_connection_for_another_board(monkeypatch, tmp_pa
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
     kb._INITIALIZED_PATHS.clear()
     kb.init_db(board="one")
-    conn = kb.connect(board="one")
+    conn = kbc.connect(board="one")
     try:
         tid = _ready(conn, "one-card")
-        result = kb.dispatch_once(
+        result = kbd.dispatch_once(
             conn,
             task_id=tid,
             board="two",
@@ -137,7 +138,7 @@ def test_target_identity_is_revalidated_atomically_at_claim(monkeypatch, tmp_pat
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _: True)
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         target = _ready(conn, "target", tenant="tenant-a")
         stale = _ready(conn, "unrelated-stale")
@@ -154,7 +155,7 @@ def test_target_identity_is_revalidated_atomically_at_claim(monkeypatch, tmp_pat
             nonlocal mutated
             if not mutated and task_id == target:
                 mutated = True
-                other = kb.connect()
+                other = kbc.connect()
                 try:
                     other.execute(
                         "UPDATE tasks SET tenant = 'tenant-b' WHERE id = ?",
@@ -167,7 +168,7 @@ def test_target_identity_is_revalidated_atomically_at_claim(monkeypatch, tmp_pat
 
         monkeypatch.setattr(kb, "claim_task", mutate_then_claim)
         spawned = []
-        result = kb.dispatch_once(
+        result = kbd.dispatch_once(
             conn,
             task_id=target,
             spawn_fn=lambda task, workspace: spawned.append(task.id) or 7,
@@ -205,13 +206,13 @@ def test_invalid_worker_path_has_zero_dispatch_effects(
     )
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         target = _ready(conn, "target")
         before_events = conn.execute(
             "SELECT COUNT(*) FROM task_events WHERE task_id = ?", (target,)
         ).fetchone()[0]
-        result = kb.dispatch_once(
+        result = kbd.dispatch_once(
             conn,
             task_id=target if targeted else None,
             reconcile_orphans=False,
