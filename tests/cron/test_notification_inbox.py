@@ -1,3 +1,4 @@
+from cron.scheduler_preflight import _preflight_check_delivery
 from unittest.mock import patch
 
 import pytest
@@ -31,7 +32,7 @@ def test_automatic_delivery_never_enters_human_chat(tmp_path, monkeypatch, deliv
 def test_local_jobs_remain_local_and_inbox_needs_no_connector(tmp_path, monkeypatch):
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     (tmp_path / 'config.yaml').write_text('notifications:\n  isolated_inbox: true\n')
-    assert scheduler._preflight_check_delivery({'deliver': 'telegram:123'}) is None
+    assert _preflight_check_delivery({'deliver': 'telegram:123'}) is None
     assert scheduler._deliver_result({'id': 'local', 'deliver': 'local'}, 'saved by scheduler') is None
     assert not (tmp_path / 'state.db').exists()
 

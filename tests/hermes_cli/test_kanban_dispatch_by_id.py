@@ -7,6 +7,7 @@ import subprocess
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 def _ready(conn, title: str, *, assignee: str = "worker", tenant=None) -> str:
@@ -196,7 +197,7 @@ def test_invalid_worker_path_has_zero_dispatch_effects(
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _: True)
     retags = []
     popens = []
-    monkeypatch.setattr(kb, "_retag_legacy_worker_sessions", retags.append)
+    monkeypatch.setattr(kbd, "_retag_legacy_worker_sessions", retags.append)
     monkeypatch.setattr(
         subprocess,
         "Popen",

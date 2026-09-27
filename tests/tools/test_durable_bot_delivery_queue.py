@@ -13,7 +13,7 @@ from tools import bot_mode_dm as dm
 from tools.bot_delivery_queue import Queue
 from hermes_state import SessionDB
 
-pytestmark = pytest.mark.macos_only
+pytestmark = pytest.mark.platforms("macos")
 
 
 def test_local_acceptance_means_request_is_durably_queued(tmp_path, monkeypatch):

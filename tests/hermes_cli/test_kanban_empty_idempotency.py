@@ -9,6 +9,7 @@ import pytest
 
 from hermes_cli import kanban as kb_cli
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 from tools import kanban_tools
 
 
@@ -18,7 +19,7 @@ def test_empty_title_rejected_before_cli_connect(monkeypatch):
         raise AssertionError("empty title must be rejected before DB connect")
         yield
 
-    monkeypatch.setattr(kb, "connect_closing", forbidden_connect)
+    monkeypatch.setattr(kbc, "connect_closing", forbidden_connect)
     args = argparse.Namespace(
         title=" \t ",
         workspace="scratch",
@@ -48,7 +49,7 @@ def test_empty_title_rejected_before_cli_connect(monkeypatch):
 def test_empty_title_rejected_before_tool_connect(monkeypatch):
     monkeypatch.setattr(
         kanban_tools,
-        "_connect",
+        "_board",
         lambda *a, **kw: (_ for _ in ()).throw(
             AssertionError("empty title must be rejected before DB connect")
         ),

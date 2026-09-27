@@ -88,8 +88,10 @@ def _runner(monkeypatch, tmp_path, mode: str = "all") -> GatewayRunner:
 
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     runner = GatewayRunner(GatewayConfig())
+    async def accept(event):
+        event._gateway_accepted = True
     runner.adapters[Platform.TELEGRAM] = SimpleNamespace(
-        send=AsyncMock(), handle_message=AsyncMock(),
+        send=AsyncMock(), handle_message=AsyncMock(side_effect=accept),
     )
     for key, chat_id, thread_id in (
         (ROUTE_KEY, "123", "42"),
@@ -592,6 +594,7 @@ async def test_concurrent_equivalent_injections_produce_one_turn(
     async def _blocked(_event):
         entered.set()
         await release.wait()
+        _event._gateway_accepted = True
 
     adapter.handle_message = AsyncMock(side_effect=_blocked)
 
@@ -609,7 +612,7 @@ async def test_concurrent_equivalent_injections_produce_one_turn(
     release.set()
 
     assert await asyncio.wait_for(first, timeout=2.0) is True
-    assert await asyncio.wait_for(second, timeout=2.0) is None
+    assert await asyncio.wait_for(second, timeout=2.0) is True
     assert adapter.handle_message.await_count == 1
 
 
@@ -634,6 +637,7 @@ async def test_a_failed_first_injection_does_not_swallow_the_second(
             entered.set()
             await release.wait()
             raise RuntimeError("adapter blip")
+        _event._gateway_accepted = True
 
     adapter.handle_message = AsyncMock(side_effect=_first_fails)
 

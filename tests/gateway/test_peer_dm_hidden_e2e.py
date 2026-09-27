@@ -97,6 +97,7 @@ def peer_gateway(tmp_path, monkeypatch):
         yield SimpleNamespace(
             url=f"http://127.0.0.1:{state['port']}",
             db=db,
+            adapter=adapter,
             hidden_id=hidden_id,
         )
     finally:
@@ -171,3 +172,61 @@ def test_peer_delivery_returns_same_durable_ack_without_second_inbound(peer_gate
     assert first["delivery_ack"] == second["delivery_ack"]
     rows = peer_gateway.db.get_messages(peer_gateway.hidden_id)
     assert sum(1 for row in rows if row.get("role") == "user" and row.get("content") == "once") == 1
+@pytest.fixture()
+def peer_gateway_compressed_hidden(peer_gateway):
+    """Aged Bot Mode footprint: the hidden canonical Bot Chat has a live
+    compression tip (issue #106165). The tip is untitled and hidden via the
+    lineage; the title lives only on the ended root."""
+    db = peer_gateway.db
+    tip_id = db.create_session(
+        "botchat_tip_1", "gateway_botmode", parent_session_id=peer_gateway.hidden_id)
+    db.end_session(peer_gateway.hidden_id, "compression")
+    db.set_session_hidden(peer_gateway.hidden_id, True)  # lineage-hide root+tip
+    peer_gateway.tip_id = tip_id
+    return peer_gateway
+
+
+def test_peer_dm_reaches_compressed_hidden_bot_chat_e2e(
+        peer_gateway_compressed_hidden, monkeypatch, capsys):
+    """Hidden canonical Bot Chat under compression: the peer lookup must still
+    resolve (to the live tip) instead of missing it and colliding with
+    UNIQUE(title) on create (HTTP 400, issue #106165)."""
+    gw = peer_gateway_compressed_hidden
+    monkeypatch.setattr(peer_cmd, "_load_peers", lambda: {"spark": {"url": gw.url}})
+    monkeypatch.setattr(peer_cmd, "_peer_secret", lambda name: API_KEY)
+
+    rc = peer_cmd.cmd_peer(
+        SimpleNamespace(peer_action="dm", target="spark", message="disk status?", json=True)
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["reply"] == "e2e reply to: disk status?"
+    assert payload["session_id"] == gw.tip_id
+
+    # No duplicate "Bot Chat" row was minted; the title still lives on the root.
+    assert gw.db.get_session_by_title("Bot Chat")["id"] == gw.hidden_id
+
+
+def test_delivery_envelope_refuses_live_canonical_owner_without_agent_turn(peer_gateway, monkeypatch):
+    import urllib.error
+    import urllib.request
+    from unittest.mock import AsyncMock
+
+    run_agent = AsyncMock()
+    monkeypatch.setattr(peer_gateway.adapter, "_run_agent", run_agent)
+    monkeypatch.setattr("tools.bot_live_delivery.find_canonical_live_owner",
+                        lambda home: {"session_id": peer_gateway.hidden_id})
+    envelope = {"schema": "hermes.delivery-envelope.v1", "delivery_id": "busy-owner",
+                "request_key": "busy-request", "turn_identity_sha256": "b" * 64,
+                "accepted_at": 10}
+    request = urllib.request.Request(
+        f"{peer_gateway.url}/api/sessions/{peer_gateway.hidden_id}/chat",
+        data=json.dumps({"message": "must wait for owner", "delivery": envelope}).encode(),
+        headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"})
+    with pytest.raises(urllib.error.HTTPError) as raised:
+        urllib.request.urlopen(request, timeout=10)
+    assert raised.value.code == 503
+    assert json.loads(raised.value.read())["error"]["code"] == "delivery_owner_busy"
+    run_agent.assert_not_called()
+    assert peer_gateway.db.get_messages(peer_gateway.hidden_id) == []

@@ -254,8 +254,7 @@ def _agent(session_id="k8-session-alpha", **extra):
 
 def _write_config(tmp_path: Path, admission: dict) -> None:
     """Write a real ``config.yaml`` under the test's isolated HERMES_HOME."""
-    import yaml
-
+    import hermes_yaml as yaml
     home = Path(os.environ["HERMES_HOME"])
     home.mkdir(parents=True, exist_ok=True)
     (home / "config.yaml").write_text(

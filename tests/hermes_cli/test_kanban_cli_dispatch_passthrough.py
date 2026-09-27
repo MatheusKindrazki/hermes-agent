@@ -35,6 +35,7 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
     unreachable from the CLI even though it works from the gateway."""
     from hermes_cli import kanban as kb_cli
     from hermes_cli import kanban_db
+    from hermes_cli import kanban_db_dispatch as kbd
 
     # Configure max_in_progress in the loaded config.
     fake_config = {
@@ -55,7 +56,7 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
         captured.update(kwargs)
         return kanban_db.DispatchResult()
 
-    monkeypatch.setattr(kanban_db, "dispatch_once", fake_dispatch_once)
+    monkeypatch.setattr(kbd, "dispatch_once", fake_dispatch_once)
 
     args = argparse.Namespace(
         dry_run=True, max=None, failure_limit=2, json=False, task_id=None,
@@ -78,13 +79,14 @@ def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypat
     The CLI flag is the explicit operator signal; config is the default."""
     from hermes_cli import kanban as kb_cli
     from hermes_cli import kanban_db
+    from hermes_cli import kanban_db_dispatch as kbd
 
     fake_config = {"kanban": {"max_spawn": 10}}
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: fake_config)
 
     captured = {}
     monkeypatch.setattr(
-        kanban_db, "dispatch_once",
+        kbd, "dispatch_once",
         lambda conn, **kw: (captured.update(kw), kanban_db.DispatchResult())[1],
     )
 
@@ -102,11 +104,12 @@ def test_cli_dispatch_passes_explicit_task_id(isolated_kanban_home, monkeypatch)
     """An operator-targeted dispatch must reach the DB dispatcher unchanged."""
     from hermes_cli import kanban as kb_cli
     from hermes_cli import kanban_db
+    from hermes_cli import kanban_db_dispatch as kbd
 
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"kanban": {}})
     captured = {}
     monkeypatch.setattr(
-        kanban_db,
+        kbd,
         "dispatch_once",
         lambda conn, **kw: (captured.update(kw), kanban_db.DispatchResult())[1],
     )
@@ -140,12 +143,13 @@ def test_cli_targeted_dispatch_exit_code_tracks_result(
 ):
     from hermes_cli import kanban as kb_cli
     from hermes_cli import kanban_db
+    from hermes_cli import kanban_db_dispatch as kbd
 
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"kanban": {}})
     result = kanban_db.DispatchResult(target_reason=reason)
     if reason == "spawned":
         result.spawned.append(("t_target", "worker", ""))
-    monkeypatch.setattr(kanban_db, "dispatch_once", lambda conn, **kw: result)
+    monkeypatch.setattr(kbd, "dispatch_once", lambda conn, **kw: result)
 
     args = argparse.Namespace(
         dry_run=True,
@@ -162,10 +166,11 @@ def test_cli_global_dispatch_preserves_success_exit_code(
 ):
     from hermes_cli import kanban as kb_cli
     from hermes_cli import kanban_db
+    from hermes_cli import kanban_db_dispatch as kbd
 
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"kanban": {}})
     monkeypatch.setattr(
-        kanban_db,
+        kbd,
         "dispatch_once",
         lambda conn, **kw: kanban_db.DispatchResult(),
     )
