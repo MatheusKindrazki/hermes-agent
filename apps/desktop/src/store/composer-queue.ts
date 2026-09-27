@@ -2,6 +2,7 @@ import { SLASH_COMMAND_RE } from '@hermes/shared'
 import { atom } from 'nanostores'
 
 import { createPromptSourceEventId, isPromptSourceEventId } from '@/lib/prompt-source-event'
+
 import { type ComposerAttachment, revokeAttachmentPreviewUrls, revokeDiscardedAttachmentPreviews } from './composer'
 
 export interface RemoveQueuedPromptOptions {
@@ -62,6 +63,7 @@ const load = (): QueueState => {
     const seen = new Set<string>()
     const replacedIds = new Set<string>()
     let changed = false
+
     const migrated = Object.fromEntries(
       Object.entries(parsed).map(([key, queue]) => [
         key,
@@ -73,6 +75,7 @@ const load = (): QueueState => {
 
               if (isPromptSourceEventId(entry.id) && !seen.has(entry.id)) {
                 seen.add(entry.id)
+
                 return entry
               }
 
@@ -80,6 +83,7 @@ const load = (): QueueState => {
               replacedIds.add(entry.id)
               seen.add(id)
               changed = true
+
               return { ...entry, id }
             })
           : queue
@@ -96,6 +100,7 @@ const load = (): QueueState => {
         for (const id of replacedIds) {
           uncommittedIdentityIds.add(id)
         }
+
         return parsed as QueueState
       }
     }

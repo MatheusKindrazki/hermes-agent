@@ -80,6 +80,7 @@ import { waitForDashboardPortAnnouncement } from './backend-ready'
 import { recycleOwnedBackend } from './backend-recycle'
 import { isPidAliveWindows, waitForBackendRelease } from './backend-release-gate'
 import { createInstalledRuntimeGate } from './backend-resolution'
+import { resolvePinnedLocalBackend } from './backend-runtime-pin'
 import { createBackendServeSupportResolver } from './backend-serve-support'
 import {
   isHostKeyChangedBootFailure,
@@ -496,7 +497,6 @@ import {
 } from './session-windows'
 import { ensureLoginShellPath } from './shell-path'
 import { createSourcePythonBackend, resolveSourceInstallationBackend, type SourceBackend } from './source-backend'
-import { resolvePinnedLocalBackend } from './backend-runtime-pin'
 import { resolveSourcePython } from './source-python'
 import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
 import { collectSshConfigHosts, parseSshGOutput } from './ssh-config'
@@ -3294,8 +3294,10 @@ function resolveUpdateRoot() {
     const pinned = resolvePinnedLocalBackend({
       userData: app.getPath('userData'), args: [], bundled: Boolean(bundledPayload(process.resourcesPath))
     })
-    if (pinned) return pinned.root
+
+    if (pinned) {return pinned.root}
   }
+
   const candidates = [
     process.env.HERMES_DESKTOP_HERMES_ROOT && path.resolve(process.env.HERMES_DESKTOP_HERMES_ROOT),
     !IS_PACKAGED && isHermesSourceRoot(SOURCE_REPO_ROOT) ? SOURCE_REPO_ROOT : null,
@@ -4915,9 +4917,11 @@ const installedRuntimeGate = createInstalledRuntimeGate(process.env, rememberLog
 
 async function resolveHermesBackend(backendArgs: string[]): Promise<ResolvedHermesBackend> {
   const payload = bundledPayload(process.resourcesPath)
+
   const pinned = resolvePinnedLocalBackend({
     userData: app.getPath('userData'), args: backendArgs, bundled: Boolean(payload)
   })
+
   if (pinned) {
     return pinned
   }
@@ -4975,6 +4979,7 @@ async function resolveHermesBackend(backendArgs: string[]): Promise<ResolvedHerm
         )
       }
     }
+
     throw new Error('The explicit HERMES_DESKTOP_HERMES command is unavailable. Correct or remove that override; no automatic installation was started.')
   }
 
@@ -13027,6 +13032,7 @@ async function runHermesStart({ supervisorRecovery = false }: { supervisorRecove
           userData: app.getPath('userData'), args: backendArgs,
           bundled: Boolean(bundledPayload(process.resourcesPath))
         })
+
         return pinned ? null : attachToRunningHostBackend()
       },
       connectRemote,

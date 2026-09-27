@@ -188,8 +188,8 @@ import {
 import { buildSessionByAnyId, resolvePinnedSessions } from './session-index'
 import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
 import { CONTEXT_SPLIT_KIT, SplitSubmenu } from './split-submenu'
-import { WorkControlSection } from './work-control-section'
 import { useEnteredProjectSessions } from './use-entered-project-sessions'
+import { WorkControlSection } from './work-control-section'
 
 // Non-session groups (messaging platforms) stay compact: show a few rows up
 // front, reveal more in larger steps on demand. Keeps a busy platform from

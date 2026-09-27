@@ -1081,9 +1081,9 @@ const ChatViewContent = memo(function ChatViewContent({
           <FloatingComposerSurface>
             <Suspense fallback={<ChatBarFallback />}>
               <ChatBar
+                allowDraftingWhileDisabled={gatewayOpen && !contextAllowsSubmit}
                 busy={busy}
                 cwd={currentCwd}
-                allowDraftingWhileDisabled={gatewayOpen && !contextAllowsSubmit}
                 disabled={!gatewayOpen || !contextAllowsSubmit}
                 focusKey={activeSessionId}
                 gateway={gateway}
