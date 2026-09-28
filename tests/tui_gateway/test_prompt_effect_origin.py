@@ -13,7 +13,7 @@ from tui_gateway import server
 
 
 @pytest.mark.parametrize("replayed_text", [None, "fixture input", "different input"])
-@pytest.mark.parametrize("scenario", ["token", "ticket", "internal", "stdio", "missing", "malformed", "wrong-profile", "missing-profile", "mismatched-profile", "off", "fifo", "crossprofile"])
+@pytest.mark.parametrize("scenario", ["token", "ticket", "internal", "stdio", "missing", "malformed", "wrong-profile", "missing-profile", "mismatched-profile", "off", "fifo", "crossprofile", "resume"])
 def test_authenticated_prompt_reaches_executor_with_origin(tmp_path, monkeypatch, replayed_text, scenario):
     profile = "other" if scenario == "wrong-profile" else "default"
     home = tmp_path / ".hermes" if profile == "default" else tmp_path / ".hermes" / "profiles" / profile
@@ -33,8 +33,8 @@ def test_authenticated_prompt_reaches_executor_with_origin(tmp_path, monkeypatch
     monkeypatch.setattr(admission, "_OBSERVER", None)
     monkeypatch.setattr(admission, "_OBSERVER_HEARTBEAT", None)
     monkeypatch.setattr(admission, "_OBSERVER_STOP", threading.Event())
-    from hermes_cli import build_info
-    monkeypatch.setattr(build_info, "get_code_identity", lambda: {"sha": "a" * 40})
+    from hermes_cli import version_info
+    monkeypatch.setattr(version_info, "get_code_identity", lambda: {"sha": "a" * 40})
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr(web_server.app.state, "auth_required", scenario in {"ticket", "internal"}, raising=False)
     monkeypatch.setattr(web_server.app.state, "bound_host", "127.0.0.1", raising=False)
@@ -95,14 +95,19 @@ def test_authenticated_prompt_reaches_executor_with_origin(tmp_path, monkeypatch
             ws.receive_json()
             request = {"jsonrpc": "2.0", "id": "submit", "method": "prompt.submit", "params": {
                 "session_id": "native-origin", "text": "fixture input",
-                "source_event_id": source_id, "profile": "forged-profile", "source": "forged",
+                "source_event_id": source_id, "profile": "forged-profile",
             }}
             if scenario == "stdio":
                 server.handle_request(request)
             else:
                 ws.send_json(request)
-            assert reached.wait(15), "authenticated dispatch did not reach executor"
-            if scenario not in {"token", "ticket", "fifo", "crossprofile"}:
+                while True:
+                    dispatch_response = ws.receive_json()
+                    if dispatch_response.get("id") == "submit":
+                        assert "error" not in dispatch_response, dispatch_response
+                        break
+            assert reached.wait(5), ("authenticated dispatch did not reach executor", session.get("inflight_turn"), session.get("agent_error"), session.get("running"))
+            if scenario not in {"token", "ticket", "fifo", "crossprofile", "resume"}:
                 assert observed[0] is None
                 if scenario in {"wrong-profile", "missing-profile", "mismatched-profile", "off"}:
                     assert not receipts.exists()
@@ -111,6 +116,18 @@ def test_authenticated_prompt_reaches_executor_with_origin(tmp_path, monkeypatch
             assert observed[0].session_id == "native-origin-session"
             assert observed[0].profile == "default"
             assert checkpoints == [True], "serve observer must start before the model"
+            if scenario == "resume":
+                session["_run_thread"].join(15)
+                reached.clear()
+                session["running"] = True
+                session["_auto_continue_prompt"] = "fixture input"
+                server._run_prompt_submit("resume", "native-origin", session,
+                    "Continue the interrupted turn: fixture input", display_kind="auto_continue",
+                    source_event_id=source_id)
+                assert reached.wait(5)
+                assert observed[1] == observed[0]
+                assert not admission._OBSERVER.broken
+                return
             if scenario == "crossprofile":
                 ws.send_json({"jsonrpc": "2.0", "id": "other", "method": "prompt.submit", "params": {
                     "session_id": "other-native", "text": "fixture input",
@@ -163,3 +180,12 @@ def test_authenticated_prompt_reaches_executor_with_origin(tmp_path, monkeypatch
             other_db.close()
         db.close()
         admission.stop_observation_heartbeat()
+
+
+def test_prompt_schema_rejects_client_claimed_source():
+    response = server.dispatch({"jsonrpc": "2.0", "id": "forged", "method": "prompt.submit", "params": {
+        "session_id": "unused", "text": "fixture input", "source": "desktop",
+        "source_event_id": "11111111-1111-4111-8111-111111111111",
+    }})
+    assert response["error"]["code"] == 4000
+    assert "source" in response["error"]["message"]

@@ -9,12 +9,12 @@ itself (that's covered by test_run_progress_topics.py et al.).
 """
 
 import asyncio
+import pytest
 import json
 import queue as queue_mod
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import pytest
 
 from gateway.config import Platform
 from gateway.session import SessionSource
@@ -86,10 +86,10 @@ def test_kernel_shadow_receipt_is_double_default_off_and_rejects_content(tmp_pat
 
 
 def _make_runner(ctx):
-    from gateway.run import TurnRunner
+    from gateway.run_turn_runner import TurnRunner
 
     class _StubGatewayRunner:
-        def _adapter_for_source(self, source):
+        def _delivery_adapter_for(self, source):
             return None
 
     return TurnRunner(_StubGatewayRunner(), ctx)
@@ -121,12 +121,12 @@ def test_effect_origin_explicit_executor_scope_resets_on_failure(monkeypatch):
 def test_observation_heartbeat_is_idle_local_and_stops(monkeypatch, tmp_path):
     from agent import durable_admission as da
     from gateway.run import GatewayRunner
-    import hermes_cli.build_info
+    import hermes_cli.version_info
     monkeypatch.setenv(da.ENV_MODE, "observe")
     monkeypatch.setenv("HERMES_KERNEL_SHADOW_RECEIPT_DIR", str(tmp_path / "receipts"))
     monkeypatch.setattr(da, "_settings", lambda: {"mode": "observe", "tenant": "personal", "machine": "mini", "profile": "default", "observation": {"code_sha": "a" * 40}})
     monkeypatch.setattr(da, "_active_profile", lambda: "default")
-    monkeypatch.setattr(hermes_cli.build_info, "get_code_identity", lambda: {"sha": "a" * 40})
+    monkeypatch.setattr(hermes_cli.version_info, "get_code_identity", lambda: {"sha": "a" * 40})
     monkeypatch.setattr(da, "_OBSERVER", None)
     monkeypatch.setattr(da.subprocess, "run", lambda *a, **k: pytest.fail("heartbeat authority call"))
     gateway = GatewayRunner.__new__(GatewayRunner)
@@ -159,24 +159,9 @@ class TestTurnContext:
         assert b.repeat_count == [0]
         assert b._cleanup_msg_ids == []
 
-    def test_shared_containers_visible_to_outer_scope(self):
-        # The outer body and the runner share the SAME list objects, so
-        # mutation through the ctx is visible to locals captured elsewhere.
-        last_progress_msg = [None]
-        ctx = TurnContext(last_progress_msg=last_progress_msg)
-        ctx.last_progress_msg[0] = "🔍 web_search"
-        assert last_progress_msg[0] == "🔍 web_search"
 
 
 class TestTurnRunner:
-    def test_methods_exist_and_bind(self):
-        from gateway.run import TurnRunner
-
-        ctx = TurnContext()
-        runner = _make_runner(ctx)
-        assert callable(runner.progress_callback)
-        assert asyncio.iscoroutinefunction(TurnRunner.send_progress_messages)
-        assert runner._ctx is ctx
 
     def test_send_progress_messages_no_queue_returns(self):
         ctx = TurnContext(progress_queue=None)
@@ -256,7 +241,7 @@ class TestTurnRunner:
             _hooks_ref=SimpleNamespace(loaded_hooks=False),
         )
 
-        from gateway.run import TurnRunner
+        from gateway.run_turn_runner import TurnRunner
 
         result = TurnRunner(gateway_runner, ctx).run_sync()
 

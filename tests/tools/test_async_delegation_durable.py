@@ -55,8 +55,7 @@ def _clean():
 
 
 def _arm(monkeypatch, tmp_path, responses=(OK_RESPONSE,)):
-    import yaml
-
+    import hermes_yaml as yaml
     fixture = tmp_path / "fixture.json"
     fixture.write_text(json.dumps({"responses": list(responses)}), encoding="utf-8")
     monkeypatch.setenv("HERMES_KERNEL_V1_MODE", "enforce")

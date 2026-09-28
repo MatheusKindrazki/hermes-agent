@@ -12,11 +12,13 @@ import sys
 import types
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from urllib.parse import quote, unquote
 
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.base import BasePlatformAdapter, SendResult
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource, build_session_key
 
@@ -81,6 +83,7 @@ async def test_base_adapter_routes_voice_tagged_telegram_ogg_media_tag_to_voice_
     adapter.send_voice.assert_awaited_once_with(
         chat_id="chat-1",
         audio_path=str(media_file),
+        is_voice=True,
         metadata={"notify": True},
     )
     adapter.send_document.assert_not_awaited()
@@ -89,10 +92,9 @@ async def test_base_adapter_routes_voice_tagged_telegram_ogg_media_tag_to_voice_
 def _fake_runner(thread_meta):
     """Build a fake GatewayRunner-like object with the helper methods needed by
     _deliver_media_from_response."""
-    runner = SimpleNamespace(
-        _thread_metadata_for_source=lambda source, anchor=None: thread_meta,
-        _reply_anchor_for_event=lambda event: None,
-    )
+    runner = object.__new__(GatewayRunner)
+    runner._thread_metadata_for_source = lambda source, anchor=None: thread_meta
+    runner._reply_anchor_for_event = lambda event: None
     return runner
 
 
@@ -239,7 +241,7 @@ async def test_queued_followup_delivery_strips_media_tag_from_text_and_sends_ima
     )
     adapter.send_multiple_images.assert_awaited_once_with(
         chat_id="chat-1",
-        images=[(f"file://{media_file.as_posix()}", "")],
+        images=[(f"file://{quote(str(media_file))}", "")],
         metadata={"thread_id": "topic-1"},
     )
 
@@ -289,7 +291,7 @@ async def test_queued_followup_delivery_reuses_routing_metadata_for_media(
     )
     adapter.send_multiple_images.assert_awaited_once_with(
         chat_id="chat-1",
-        images=[(f"file://{media_file.as_posix()}", "")],
+        images=[(f"file://{quote(str(media_file))}", "")],
         metadata=routing_metadata,
     )
 
@@ -492,7 +494,7 @@ class _QueuedMediaAgent:
     def __init__(self, **kwargs):
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         type(self).calls += 1
         if type(self).calls == 1:
             return {
@@ -577,6 +579,6 @@ async def test_queued_resend_branch_delivers_media_and_preserves_protected_examp
     assert first_texts, f"expected queued resend of first response, got: {adapter.sent!r}"
     assert f"MEDIA:{media_file}" not in first_texts[0]
     assert "`MEDIA:/tmp/example.png`" in first_texts[0]
-    assert any(str(media_file) in img["image_path"] for img in adapter.images), (
+    assert any(str(media_file) in unquote(img["image_path"]) for img in adapter.images), (
         f"expected native image delivery via queued resend, got: {adapter.images!r}"
     )

@@ -289,7 +289,7 @@ class ObservationWriter:
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
         except FileNotFoundError:
             return None
-        with os.fdopen(fd, encoding="utf-8") as stream:
+        with os.fdopen(fd, encoding="utf-8-sig") as stream:
             info = os.fstat(stream.fileno())
             if (not stat.S_ISREG(info.st_mode) or info.st_uid != _observation_uid() or stat.S_IMODE(info.st_mode) != 0o600
                     or info.st_nlink != 1 or info.st_size > 65536):
@@ -416,7 +416,7 @@ def _start_observation_locked() -> Optional[ObservationWriter]:
     if profile is None:
         return None
     try:
-        from hermes_cli.build_info import get_code_identity
+        from hermes_cli.version_info import get_code_identity
         code_sha = get_code_identity().get("sha")
         configured = (_settings().get("observation") or {}).get("code_sha")
         if code_sha != configured:
@@ -475,7 +475,7 @@ def bind_native_prompt_source(session_id: str, source_event_id: str, text: str) 
     else:
         # Reuse the owned CAS file operations only; enforcement does not claim
         # an observation channel or publish synthetic observer checkpoints.
-        from hermes_cli.build_info import get_code_identity
+        from hermes_cli.version_info import get_code_identity
         code_sha = get_code_identity().get("sha")
         try:
             writer = ObservationWriter(Path(_state_dir(_settings())) / "native-inputs", code_sha=code_sha)

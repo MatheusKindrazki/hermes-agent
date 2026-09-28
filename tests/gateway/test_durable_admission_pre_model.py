@@ -51,8 +51,7 @@ def _clean_admission_state():
 
 
 def _arm(monkeypatch, tmp_path, responses=(OK_RESPONSE,)):
-    import yaml
-
+    import hermes_yaml as yaml
     fixture = tmp_path / "fixture.json"
     fixture.write_text(json.dumps({"responses": list(responses)}), encoding="utf-8")
     monkeypatch.setenv("HERMES_KERNEL_V1_MODE", "enforce")
@@ -300,7 +299,7 @@ def _background_runner(tmp_path, monkeypatch, *, adapter_absent=False):
         reached.append(source)
         return None
 
-    runner._adapter_for_source = _adapter_for_source
+    runner._delivery_adapter_for = _adapter_for_source
     return runner, reached
 
 

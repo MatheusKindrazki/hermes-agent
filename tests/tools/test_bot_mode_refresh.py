@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from tools.bot_mode_dm import ensure_message_agent_tool
-from tools.mcp_tool import refresh_agent_mcp_tools
+from tools.mcp_tool_agent import refresh_agent_mcp_tools
 
 
 @pytest.mark.parametrize('content_aware', [False, True])

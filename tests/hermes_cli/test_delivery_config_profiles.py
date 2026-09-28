@@ -2,8 +2,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
-import yaml
-
+import hermes_yaml as yaml
 from hermes_cli.notification_inbox import enabled as inbox_enabled
 from tools.bot_delivery_queue import enabled as queue_enabled
 from hermes_constants import get_hermes_home
