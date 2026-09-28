@@ -80,7 +80,7 @@ import { waitForDashboardPortAnnouncement } from './backend-ready'
 import { recycleOwnedBackend } from './backend-recycle'
 import { isPidAliveWindows, waitForBackendRelease } from './backend-release-gate'
 import { createInstalledRuntimeGate } from './backend-resolution'
-import { resolvePinnedLocalBackend } from './backend-runtime-pin'
+import { resolveLocalUpdateRoot, resolvePinnedLocalBackend } from './backend-runtime-pin'
 import { createBackendServeSupportResolver } from './backend-serve-support'
 import {
   isHostKeyChangedBootFailure,
@@ -3289,22 +3289,19 @@ function writeZoomState(zoomLevel) {
 // Dev → SOURCE_REPO_ROOT. Packaged/CLI install → ACTIVE_HERMES_ROOT.
 // HERMES_DESKTOP_HERMES_ROOT always wins so devs can pin a worktree.
 function resolveUpdateRoot() {
-  // The validated local runtime is also the update authority; never choose the old git checkout.
-  if (!primaryBackendIsRemote()) {
-    const pinned = resolvePinnedLocalBackend({
-      userData: app.getPath('userData'), args: [], bundled: Boolean(bundledPayload(process.resourcesPath))
-    })
+  return resolveLocalUpdateRoot({
+    userData: app.getPath('userData'),
+    bundled: Boolean(bundledPayload(process.resourcesPath)),
+    fallback: () => {
+      const candidates = [
+        process.env.HERMES_DESKTOP_HERMES_ROOT && path.resolve(process.env.HERMES_DESKTOP_HERMES_ROOT),
+        !IS_PACKAGED && isHermesSourceRoot(SOURCE_REPO_ROOT) ? SOURCE_REPO_ROOT : null,
+        isHermesSourceRoot(ACTIVE_HERMES_ROOT) ? ACTIVE_HERMES_ROOT : null
+      ].filter(Boolean)
 
-    if (pinned) {return pinned.root}
-  }
-
-  const candidates = [
-    process.env.HERMES_DESKTOP_HERMES_ROOT && path.resolve(process.env.HERMES_DESKTOP_HERMES_ROOT),
-    !IS_PACKAGED && isHermesSourceRoot(SOURCE_REPO_ROOT) ? SOURCE_REPO_ROOT : null,
-    isHermesSourceRoot(ACTIVE_HERMES_ROOT) ? ACTIVE_HERMES_ROOT : null
-  ].filter(Boolean)
-
-  return candidates.find(isGitCheckout) || candidates[0] || ACTIVE_HERMES_ROOT
+      return candidates.find(isGitCheckout) || candidates[0] || ACTIVE_HERMES_ROOT
+    }
+  })
 }
 
 function runGit(args, options: any = {}): Promise<{ code: number; stdout: string; stderr: string }> {

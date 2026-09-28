@@ -5,7 +5,7 @@ import path from 'node:path'
 
 import { afterEach, test } from 'vitest'
 
-import { resolvePinnedLocalBackend } from './backend-runtime-pin'
+import { resolveLocalUpdateRoot, resolvePinnedLocalBackend } from './backend-runtime-pin'
 import { runPrimaryBackendStartup } from './primary-backend-startup'
 
 const temporary: string[] = []
@@ -136,4 +136,73 @@ test.skipIf(process.platform === 'win32')('shared-writable and symlink pins are 
   writeFileSync(target, JSON.stringify({ version: 1, root: f.root }), { mode: 0o600 })
   symlinkSync(target, f.file)
   assert.throws(() => resolvePinnedLocalBackend({ userData: f.dir, args: [], env: {} }), /regular file/)
+})
+
+test.each(['remote', 'ssh'])('local update keeps its pin after %s primary startup', async kind => {
+  const f = fixture()
+  f.pin({ version: 1, root: f.root, python: f.python })
+  let localStarts = 0
+  let fallbacks = 0
+
+  const result = await runPrimaryBackendStartup({
+    assertCurrentAttempt: () => {},
+    connectRemote: async (remote: { kind: string }) => remote,
+    ensureLocalRuntime: async backend => backend,
+    prepareLocalBackend: () => {
+      localStarts++
+
+      return null
+    },
+    resolveRemote: async () => ({ kind }),
+    waitForDecision: async () => 'continue-local' as const,
+    waitForLocalStart: async () => {}
+  })
+
+  assert.equal(result.kind, 'remote')
+  assert.equal(localStarts, 0)
+
+  const root = resolveLocalUpdateRoot({
+    userData: f.dir,
+    env: {},
+    fallback: () => {
+      fallbacks++
+
+      return path.join(f.dir, 'old-upstream-checkout')
+    }
+  })
+
+  assert.equal(root, f.root)
+  assert.equal(fallbacks, 0)
+})
+
+test('invalid local update pin refuses fallback even though remote startup does not need it', () => {
+  const f = fixture()
+  f.pin({ version: 99 })
+  let fallbacks = 0
+  assert.throws(
+    () =>
+      resolveLocalUpdateRoot({
+        userData: f.dir,
+        env: {},
+        fallback: () => {
+          fallbacks++
+
+          return '/old-upstream-checkout'
+        }
+      }),
+    /unsupported pin schema/
+  )
+  assert.equal(fallbacks, 0)
+})
+
+test('local updates retain normal checkout discovery when no pin exists', () => {
+  const f = fixture()
+  assert.equal(
+    resolveLocalUpdateRoot({
+      userData: f.dir,
+      env: {},
+      fallback: () => '/existing-checkout'
+    }),
+    '/existing-checkout'
+  )
 })

@@ -100,3 +100,20 @@ export function resolvePinnedLocalBackend(options: {
 
   return backend
 }
+
+/** The Desktop client updates a local installation even while its active chat is remote. */
+export function resolveLocalUpdateRoot(options: {
+  userData: string
+  env?: NodeJS.ProcessEnv
+  bundled?: boolean
+  fallback: () => string
+}): string {
+  const pinned = resolvePinnedLocalBackend({
+    userData: options.userData,
+    env: options.env,
+    bundled: options.bundled,
+    args: []
+  })
+
+  return pinned?.root ?? options.fallback()
+}
