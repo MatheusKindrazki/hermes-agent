@@ -31,6 +31,7 @@ from pathlib import Path
 import pytest
 
 from tests.e2e.core._pending_fixes import known_failure
+from tests.e2e.core._worker_path import signed_worker_path_env
 from tests.e2e.core.upgrade import _helpers as H
 from tests.e2e.core.upgrade import _install_helpers as I
 from tests.e2e.core.upgrade.pm import _pm as P
@@ -176,13 +177,15 @@ def test_kanban_worker_spawned_after_update_boots(updated, provider):
     sb, mark = updated["sb"], _marks(updated["logs"])
     n = len(provider.main_requests())
     log = sb.root / "kanban-dispatch.log"
+    worker_env = P.lazy_env(sb)
+    worker_env.update(signed_worker_path_env(sb.root, worker_env))
     # One sandbox for dispatcher + worker (the worker outlives `kanban dispatch`, as on a real host);
     # the sandbox stays up until the worker's first model call is observed, then is torn down.
     script = (f'H="{sb.hermes}"\n"$H" kanban init >/dev/null\n'
               '"$H" kanban create "pm hygiene kanban probe" --assignee default --json\n'
               '"$H" kanban dispatch --json\nsleep 600\n')
     with log.open("w") as out:
-        proc = subprocess.Popen(H.sandbox_argv(["/bin/sh", "-c", script], writable=[sb.root]), env=P.lazy_env(sb),
+        proc = subprocess.Popen(H.sandbox_argv(["/bin/sh", "-c", script], writable=[sb.root]), env=worker_env,
                                 cwd=str(sb.root), stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
                                 text=True, start_new_session=True)
         try:

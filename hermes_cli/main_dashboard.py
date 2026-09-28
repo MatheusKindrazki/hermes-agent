@@ -384,6 +384,10 @@ def _respawn_dashboard_processes(commands: list[list[str]]) -> list[list[str]]:
     See #78821.
     """
     from hermes_constants import get_hermes_home
+    from hermes_cli._launchers import installation_command
+    from hermes_cli.dashboard_procs import _normalize_dashboard_cmdline
+    from hermes_cli.main import PROJECT_ROOT
+
     respawned: list[list[str]] = []
     failed: list[tuple[list[str], str]] = []
     log_path = get_hermes_home() / "logs" / "dashboard-restart.log"
@@ -391,7 +395,13 @@ def _respawn_dashboard_processes(commands: list[list[str]]) -> list[list[str]]:
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
     for command in commands:
+        original_command = command
         try:
+            # The update can replace a Python console script with a shell launcher.
+            # Preserve CLI routing, but resolve the updated installation at spawn.
+            command = installation_command(
+                PROJECT_ROOT, _normalize_dashboard_cmdline(command)
+            )
             # Keep restarted dashboards headless; reopening a browser after a
             # background update is noisy and fails in SSH/headless sessions.
             if "dashboard" in command and "--no-open" not in command:
@@ -402,7 +412,7 @@ def _respawn_dashboard_processes(commands: list[list[str]]) -> list[list[str]]:
                     start_new_session=True, close_fds=True)
             respawned.append(command)
         except (OSError, ValueError) as exc:
-            failed.append((command, str(exc)))
+            failed.append((original_command, str(exc)))
 
     for command in respawned:
         print(f"    ✓ restarted: {shlex.join(command)}")

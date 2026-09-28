@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from tests.e2e.core._worker_path import signed_worker_path_env
+
 REPO = Path(__file__).resolve().parents[4]
 PY = sys.executable
 
@@ -87,6 +89,7 @@ class Board:
             "#!/bin/sh\n"
             f"PYTHONPATH={REPO} exec {PY} -m hermes_cli.main \"$@\"\n", encoding="utf-8")
         self.hermes_bin.chmod(0o755)
+        self.worker_path_env = signed_worker_path_env(self.root, os.environ)
 
     # env / processes -------------------------------------------------------
     def env(self) -> dict[str, str]:
@@ -101,7 +104,7 @@ class Board:
             # HOME's own state.db; the whole tree is under ``root`` (asserted below), so let workers
             # open their real session store.
             "HERMES_STATE_DB_GUARD_BYPASS": "1",
-            **FAST_ENV, **self.env_extra,
+            **FAST_ENV, **self.worker_path_env, **self.env_extra,
         })
         assert env["HERMES_HOME"].startswith(str(self.root))
         return env

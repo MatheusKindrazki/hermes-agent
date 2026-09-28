@@ -129,7 +129,7 @@ def _upgrade_prerequisites() -> None:
 
 
 IMPORT_PROBE = r"""
-import importlib, subprocess, sys, tomllib
+import importlib, importlib.util, subprocess, sys, tomllib
 from pathlib import Path
 root, base = Path(sys.argv[1]), sys.argv[2]
 cfg = tomllib.load(open(root / "pyproject.toml", "rb"))
@@ -138,7 +138,7 @@ added = subprocess.run(["git", "-C", str(root), "diff", "--name-only", "--diff-f
                         *[f"{t}/*.py" for t in tops]], capture_output=True, text=True).stdout.split()
 added = [a[:-3].replace("/", ".") for a in added if "/tests/" not in a and not a.endswith("__init__.py")][:3]
 bad = []
-for name in tops + ["hermes_cli.main", "run_agent", "hermes_state"] + added:
+for name in tops + ["hermes_cli.main", "run_agent", "hermes_state"]:
     try:
         mod = importlib.import_module(name)
     except BaseException as exc:
@@ -152,6 +152,26 @@ for name in tops + ["hermes_cli.main", "run_agent", "hermes_state"] + added:
         bad.append(f"{name}: resolved outside the checkout and PM workspace: {where}")
     elif where.read_bytes() != (root / where.relative_to(workspace)).read_bytes():
         bad.append(f"{name}: PM workspace differs from the updated checkout: {where}")
+# Added modules prove source publication, not activation of every optional integration.
+# For example acp_adapter's new modules require the separately selected `acp` extra.
+# Resolve their source without executing their bodies; missing or stale sources still fail.
+for name in added:
+    try:
+        spec = importlib.util.find_spec(name)
+        if spec is None or not spec.origin:
+            raise ImportError(f"no source spec for {name}")
+        where = Path(spec.origin).resolve()
+        if where.is_relative_to(root.resolve()):
+            if not where.is_file():
+                raise ImportError(f"source missing: {where}")
+            continue
+        workspace = Path(sys.prefix).resolve().parent / "workspace"
+        if not where.is_relative_to(workspace) or not (root / where.relative_to(workspace)).is_file():
+            bad.append(f"{name}: resolved outside the checkout and PM workspace: {where}")
+        elif where.read_bytes() != (root / where.relative_to(workspace)).read_bytes():
+            bad.append(f"{name}: PM workspace differs from the updated checkout: {where}")
+    except BaseException as exc:
+        bad.append(f"{name}: {type(exc).__name__}: {exc}")
 if bad:
     sys.exit("\n".join(bad))
 """

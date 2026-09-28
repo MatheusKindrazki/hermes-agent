@@ -35,6 +35,7 @@ from pathlib import Path
 
 import hermes_yaml as yaml
 
+from tests.e2e.core._worker_path import signed_worker_path_env
 from tests.e2e.core.upgrade import _helpers as H
 from tests.e2e.core.upgrade import _install_helpers as I
 from tests.e2e.core.upgrade.handoff._nshost import NamespaceHost
@@ -208,7 +209,9 @@ def stage_head(root: Path) -> Install:
 
 
 def stage(column: str, root: Path) -> Install:
-    return stage_n1(root) if column == "n1" else stage_head(root)
+    inst = stage_n1(root) if column == "n1" else stage_head(root)
+    inst.env.update(signed_worker_path_env(inst.root, inst.env))
+    return inst
 
 
 def publish_target(inst: Install) -> str:

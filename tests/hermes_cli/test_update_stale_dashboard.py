@@ -496,15 +496,34 @@ class TestManualBackendRespawn:
             def __init__(self, cmd, **kwargs):
                 spawned.append(list(cmd))
 
-        with patch.object(live.subprocess, "Popen", _FakePopen):
+        with patch.object(live.subprocess, "Popen", _FakePopen), \
+             patch("hermes_cli._launchers.installation_command",
+                   side_effect=lambda root, args: ["new-install-launcher", *args]):
             failed = live._respawn_dashboard_processes([
                 ["hermes", "dashboard", "--port", "8300"],
                 ["hermes", "serve", "--host", "0.0.0.0"],
             ])
 
         assert failed == []
-        assert spawned[0] == ["hermes", "dashboard", "--port", "8300", "--no-open"]
-        assert spawned[1] == ["hermes", "serve", "--host", "0.0.0.0"]
+        assert spawned[0] == ["new-install-launcher", "dashboard", "--port", "8300", "--no-open"]
+        assert spawned[1] == ["new-install-launcher", "serve", "--host", "0.0.0.0"]
+
+    def test_respawn_replaces_stale_python_console_script(self, tmp_path, monkeypatch):
+        """A user command changed to a shell shim must never be fed to old Python."""
+        live = self._live()
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        shim = tmp_path / "hermes"
+        shim.write_text('#!/bin/sh\nexit 0\n', encoding="utf-8")
+        captured = ["/old/python", str(shim), "--profile", "research",
+                    "dashboard", "--port", "8300"]
+        with patch("hermes_cli._launchers.installation_command",
+                   return_value=["/updated/.hermes/bin/hermes", "--profile", "research",
+                                 "dashboard", "--port", "8300"]) as resolve, \
+             patch.object(live.subprocess, "Popen") as spawn:
+            assert live._respawn_dashboard_processes([captured]) == []
+        assert resolve.call_args.args[1] == ("--profile", "research", "dashboard", "--port", "8300")
+        assert spawn.call_args.args[0] == ["/updated/.hermes/bin/hermes", "--profile", "research",
+                                           "dashboard", "--port", "8300", "--no-open"]
 
     def test_respawn_failure_returned(self, tmp_path, monkeypatch, capsys):
         live = self._live()
