@@ -1,18 +1,23 @@
 import { useStore } from '@nanostores/react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo } from 'react'
 
 import { ComputerUsePanel } from '@/app/settings/computer-use-panel'
 import { ToolsetConfigPanel } from '@/app/settings/toolset-config-panel'
-import { Button } from '@/components/ui/button'
-import { Codicon } from '@/components/ui/codicon'
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { $localApplications, loadLocalApplications } from '@/lib/local-applications'
 import { resolveBotConnectionRoute } from '@/plugins/hermes-bots/routing'
 
 import { useChatPersona } from './bot-persona'
 
-export function ComputerUseMenu({ sessionId }: { sessionId?: string | null }) {
-  const [open, setOpen] = useState(false)
+export function ComputerUseMenu({
+  sessionId,
+  open,
+  onOpenChange
+}: {
+  sessionId?: string | null
+  open: boolean
+  onOpenChange: (open: boolean) => void
+}) {
   const catalog = useStore($localApplications)
   const persona = useChatPersona(sessionId ?? null)
   const route = persona ? resolveBotConnectionRoute(persona.bot).route : null
@@ -33,16 +38,7 @@ export function ComputerUseMenu({ sessionId }: { sessionId?: string | null }) {
 
   return (
     <>
-      <Button
-        aria-label="Computer Use"
-        className="gap-1.5 text-xs text-muted-foreground"
-        onClick={() => setOpen(true)}
-        size="sm"
-        variant="ghost"
-      >
-        <Codicon name="device-desktop" size="0.875rem" /> Computer Use
-      </Button>
-      <Dialog onOpenChange={setOpen} open={open}>
+      <Dialog onOpenChange={onOpenChange} open={open}>
         <DialogContent className="max-h-[80vh] max-w-lg overflow-y-auto">
           <DialogHeader>
             <DialogTitle>Computer Use</DialogTitle>

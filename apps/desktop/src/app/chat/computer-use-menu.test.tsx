@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react'
+import { render, screen } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 
 import { ComputerUseMenu } from './computer-use-menu'
@@ -23,9 +23,9 @@ vi.mock('@/app/settings/toolset-config-panel', () => ({
 }))
 describe('Computer Use entry', () => {
   it('opens on demand and pins both status and configuration to the conversation owner', () => {
-    render(<ComputerUseMenu sessionId="canonical-chat" />)
+    const { rerender } = render(<ComputerUseMenu onOpenChange={() => {}} open={false} sessionId="canonical-chat" />)
     expect(seen.status).not.toHaveBeenCalled()
-    fireEvent.click(screen.getByRole('button', { name: 'Computer Use' }))
+    rerender(<ComputerUseMenu onOpenChange={() => {}} open sessionId="canonical-chat" />)
     expect(screen.getByRole('dialog')).toBeTruthy()
     expect(screen.getByText('Mac mini')).toBeTruthy()
     expect(seen.status).toHaveBeenLastCalledWith({ profile: { connectionId: 'mini-connection', profile: 'default' } })

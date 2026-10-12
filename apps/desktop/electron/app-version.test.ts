@@ -123,3 +123,23 @@ describe('artifact version identity', (): void => {
     expect(nativeAboutVersion({ appVersion: '' })).toBe('unknown')
   })
 })
+
+it('shows a versioned local fork independently of the remote backend release', () => {
+  const stamp = {
+    schemaVersion: 1,
+    commit: 'a'.repeat(40),
+    branch: 'codex/kindra',
+    commitDate: null,
+    distance: null,
+    tag: null,
+    dirty: false,
+    builtAt: '',
+    source: 'local',
+    payload: 'bootstrap',
+    distribution: 'desktop-app',
+    updateMechanism: 'self',
+    displayVersion: '0.21.7',
+    baseVersion: '0.21.7'
+  } as const
+  expect(appVersionInfo(stamp, '0.20.6', '0.21.7').appVersion).toBe('0.21.7')
+})
