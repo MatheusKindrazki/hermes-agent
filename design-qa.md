@@ -28,3 +28,13 @@ Backup: /Users/matheuskindrazki/.hermes/backups/clean-prose-20261012/Hermes.app
 
 ## Residual gaps
 Light theme and narrow panes were not separately captured; this is a scoped background/inset change, not a layout or interaction redesign. No new P3 refinement required for this request. Local installation only, no upstream release claimed.
+
+## Kindra v0.21.7 native install — 2026-10-12
+
+- Ported the personalized fork to official stable v0.21.7; retained the original fork and recoverable installed-app backups.
+- Native macOS menu and About panel say Kindra 0.21.7. Client and backend versions remain distinct; backend remains 0.20.6.
+- Computer Use opens from Add context. No inline composer control overlaps the placeholder.
+- Checked the readiness dialog and local @Slack suggestion labeled kindrinha.local without granting access or sending messages. Cleared the test draft.
+- Renderer/electron types, focused UI and native tests, packaging and deep strict signing passed.
+- Separate runtime repair: expired voice attempt was cleared using the controller's existing guarded expiry operation and CAS, after native writer inspection. No session resumed and no iPhone build changed.
+- Native verification receipt: /Users/matheuskindrazki/.codex/visualizations/2026/10/11/hermes-avatars/kindra-v0217-installed-receipt.json
