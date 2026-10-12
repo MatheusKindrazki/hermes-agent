@@ -16,4 +16,12 @@ describe('activity previews', () => {
     expect(activityPreview(bot, 'think', {}, {}, true)).toBe('Precisa da sua atenção')
     expect(activityPreview(bot, 'idle', {}, {})).toBeNull()
   })
+  it('names explicit operations without inventing what a shell command does', () => {
+    expect(activityPreview(bot, 'work', {}, { tip: ['apply_patch'] })).toBe('Editando um arquivo')
+    expect(activityPreview(bot, 'work', {}, { tip: ['mcp__cua__click'] })).toBe('Operando um aplicativo')
+    expect(activityPreview(bot, 'work', {}, { tip: ['run_tests'] })).toBe('Rodando testes')
+    expect(activityPreview(bot, 'work', {}, { tip: ['terminal'] })).toBe('Executando um comando')
+    expect(activityPreview(bot, 'work', {}, { tip: ['read_file', 'terminal'] })).toBe('Executando 2 ações')
+    expect(activityPreview(bot, 'think', { tip: 'stalled' }, {})).toBe('Sem progresso recente')
+  })
 })

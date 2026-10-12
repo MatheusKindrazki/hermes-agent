@@ -43,7 +43,7 @@ it('shows the persona and changes its avatar from thought bubble to tablet and i
   expect(screen.getByRole('heading', { name: 'Chief' })).toBeTruthy()
   expect(result.container.querySelector('[data-hb-thinking-bubble]')).toBeTruthy()
   act(() => recordExecutingTool('runtime', 'tool', 'terminal', true))
-  expect(screen.getByText('Trabalhando')).toBeTruthy()
+  expect(screen.getByText('Executando um comando')).toBeTruthy()
   expect(result.container.querySelector('[data-hb-tablet]')).toBeTruthy()
   act(() => publishSessionState('runtime', { ...state, needsInput: true }))
   expect(screen.getByText('Aguardando sua resposta')).toBeTruthy()
@@ -67,6 +67,6 @@ it('uses the same delegated-worker activity as the roster', () => {
   }
 
   const result = render(<Header />)
-  expect(screen.getByText('Trabalhando')).toBeTruthy()
+  expect(screen.getByText('Trabalhando em segundo plano')).toBeTruthy()
   expect(result.container.querySelector('[data-hb-tablet]')).toBeTruthy()
 })

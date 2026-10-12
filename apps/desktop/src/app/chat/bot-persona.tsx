@@ -3,6 +3,7 @@ import type { CSSProperties } from 'react'
 import { useState } from 'react'
 
 import { useStoreSelector } from '@/lib/use-session-slice'
+import { activityPreview } from '@/plugins/hermes-bots/activity-preview'
 import { avatarColor, botAppearance, BotFace, personaFor } from '@/plugins/hermes-bots/avatar'
 import { $botMeta, $lastRoster } from '@/plugins/hermes-bots/data'
 import { displayName } from '@/plugins/hermes-bots/labels'
@@ -10,7 +11,7 @@ import { paintedPersonaColor } from '@/plugins/hermes-bots/painted-avatar'
 import { botRosterMeta } from '@/plugins/hermes-bots/routing'
 import { botWorkingMood } from '@/plugins/hermes-bots/row-helpers'
 import type { RosterRow } from '@/plugins/hermes-bots/types'
-import { $sessionWorkById } from '@/sdk/session-activity'
+import { $sessionToolsById, $sessionWorkById } from '@/sdk/session-activity'
 import { $sessionDotStateById } from '@/store/session-dot-state'
 
 /** Resolve the exact canonical conversation, never the profile's latest activity. */
@@ -56,16 +57,10 @@ export function ChatPersonaHeader({ persona }: { persona: NonNullable<ReturnType
   )
 
   const status = useStoreSelector($sessionDotStateById, values => values[id] || 'idle')
+  const tools = useStore($sessionToolsById)
   const [hovered, setHovered] = useState(false)
 
-  const label =
-    status === 'needs-input'
-      ? 'Aguardando sua resposta'
-      : mood === 'work'
-        ? 'Trabalhando'
-        : mood === 'think'
-          ? 'Pensando'
-          : 'Pronto para conversar'
+  const label = activityPreview(bot, mood, { [id]: status }, tools) || 'Pronto para conversar'
 
   return (
     <header className="chat-persona-header" data-status={status}>
@@ -87,7 +82,7 @@ export function ChatPersonaHeader({ persona }: { persona: NonNullable<ReturnType
         </div>
         <div className="min-w-0">
           <h1 className="truncate text-[0.9375rem] font-semibold text-(--ui-text-primary)">{title}</h1>
-          <p className="mt-1 text-[0.6875rem] text-(--ui-text-tertiary)">{label}</p>
+          <p aria-atomic="true" aria-live="polite" className="mt-1 text-[0.6875rem] text-(--ui-text-tertiary)">{label}</p>
         </div>
       </div>
       <span className="chat-persona-header__source" title={bot.connectionLabel || ''}>
