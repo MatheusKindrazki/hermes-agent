@@ -24,6 +24,7 @@ import { useMemo } from 'react'
 
 import { useContributions } from '@/contrib/react/use-contributions'
 import { registry } from '@/contrib/registry'
+import { $localApplications, loadLocalApplications, localApplicationContext } from '@/lib/local-applications'
 import type { TodoItem } from '@/lib/todos'
 import type { ComposerAttachment } from '@/store/composer'
 import type { ComposerAction } from '@/store/composer-actions'
@@ -119,6 +120,11 @@ export async function runComposerMiddleware(draft: ComposerDraft): Promise<Compo
     } catch {
       // Pass-through: a faulty middleware must never swallow the message.
     }
+  }
+
+  if (/(?:^|\s)@app\//.test(current.text)) {
+    await loadLocalApplications()
+    current = { ...current, text: localApplicationContext(current.text, $localApplications.get()) }
   }
 
   return current

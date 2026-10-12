@@ -77,6 +77,7 @@ export function ReasoningPill({ disabled, model }: { disabled: boolean; model: C
           <Button
             aria-label={title}
             className={PILL}
+            data-slot="composer-effort"
             data-testid="reasoning-pill"
             disabled={disabled}
             type="button"

@@ -347,6 +347,7 @@ import {
   shouldRelaunchForNvidiaGpuDeath,
   writeNvidiaEglMarker
 } from './linux-nvidia-egl-fallback'
+import { discoverLocalApplications } from './local-apps'
 import { createLocalBackendLifecycle, waitForTeardown } from './local-backend-lifecycle'
 import { resolveIpcFileReadPath, resolveMediaStreamFile, resolvePreviewTargetPath } from './local-read-path'
 import { localSkinProfileKey, readLocalSkinPayload } from './local-skin'
@@ -716,6 +717,8 @@ import { isPackagedInstallPath as isPackagedInstallPathUnderRoots } from './work
 import { readWslWindowsClipboardImage } from './wsl-clipboard-image'
 import { resolvePickerDefaultPath, setActiveGatewayProfile, setWslBridgeProfileState } from './wsl-path-bridge'
 
+// Keep the installed store independent of the display name in Info.plist.
+app.setPath('userData', path.join(app.getPath('appData'), PRODUCT_IDENTITY.appNamePascal))
 const IDENTITY_APP_NAME: string | null = applyDesktopIdentity(app)
 const USER_DATA_OVERRIDE: string | undefined = process.env.HERMES_DESKTOP_USER_DATA_DIR
 
@@ -1421,7 +1424,7 @@ const BOOT_FAKE_STEP_MS = (() => {
   return Math.max(120, raw)
 })()
 
-const APP_NAME: string = IDENTITY_APP_NAME || process.env.HERMES_DESKTOP_APP_NAME || 'Hermes'
+const APP_NAME: string = 'Kindra'
 const HUD_WINDOW_TITLE = `${APP_NAME} HUD`
 const TITLEBAR_HEIGHT = 34
 const MACOS_TRAFFIC_LIGHTS_HEIGHT = 14
@@ -1810,6 +1813,8 @@ function previewFileMetadata(filePath, mimeType) {
   }
 }
 
+// Display branding must never redirect the existing connection/session store.
+app.setPath('userData', app.getPath('userData'))
 app.setName(APP_NAME)
 
 // No application menu until the first window exists. Electron would otherwise
@@ -12358,7 +12363,7 @@ function spawnSecondaryWindow({
     height: SESSION_WINDOW_MIN_HEIGHT,
     minWidth: SESSION_WINDOW_MIN_WIDTH,
     minHeight: SESSION_WINDOW_MIN_HEIGHT,
-    title: 'Hermes',
+    title: APP_NAME,
     titleBarStyle: 'hidden',
     titleBarOverlay: getTitleBarOverlayOptions(),
     trafficLightPosition: IS_MAC ? WINDOW_BUTTON_POSITION : undefined,
@@ -12463,7 +12468,7 @@ function spawnBrowserWindow(tabId) {
     height: BROWSER_WINDOW_HEIGHT,
     minWidth: BROWSER_WINDOW_MIN_WIDTH,
     minHeight: BROWSER_WINDOW_MIN_HEIGHT,
-    title: 'Hermes',
+    title: APP_NAME,
     titleBarStyle: 'hidden',
     titleBarOverlay: getTitleBarOverlayOptions(),
     trafficLightPosition: IS_MAC ? WINDOW_BUTTON_POSITION : undefined,
@@ -12575,7 +12580,7 @@ function createInstanceWindow(
     ...nextInstanceBounds(source),
     minWidth: WINDOW_MIN_WIDTH,
     minHeight: WINDOW_MIN_HEIGHT,
-    title: 'Hermes',
+    title: APP_NAME,
     titleBarStyle: 'hidden',
     titleBarOverlay: getTitleBarOverlayOptions(),
     trafficLightPosition: IS_MAC ? WINDOW_BUTTON_POSITION : undefined,
@@ -13660,7 +13665,7 @@ function createWindow() {
     ),
     minWidth: WINDOW_MIN_WIDTH,
     minHeight: WINDOW_MIN_HEIGHT,
-    title: 'Hermes',
+    title: APP_NAME,
     // Frameless title bar on every platform so the renderer can paint the
     // "hide sidebar" button (and other left-side titlebar tools) flush with
     // the top edge — matching the macOS layout where the traffic lights sit
@@ -15121,6 +15126,16 @@ async function enumerateRegistryAgentSources(registry = readDesktopConnectionsRe
     )
   )
 }
+
+let localAppsCache: Promise<{ machine: string; apps: Awaited<ReturnType<typeof discoverLocalApplications>> }> | null = null
+ipcMain.handle('hermes:local-apps:list', () => {
+  localAppsCache ??= discoverLocalApplications(
+    ['/Applications', '/System/Applications', path.join(os.homedir(), 'Applications')],
+    path.resolve(app.getAppPath(), '../../..')
+  ).then(apps => ({ machine: os.hostname(), apps: apps.map(application => application.bundleId === PRODUCT_IDENTITY.appId ? { ...application, name: APP_NAME } : application) }))
+
+  return localAppsCache
+})
 
 ipcMain.handle('hermes:agents:roster', async () => {
   const registry = readDesktopConnectionsRegistry()

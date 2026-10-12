@@ -83,6 +83,7 @@ import {
   setTurnStartedAt
 } from './session'
 import { secondaryProfileOwnerForEvent } from './session-event-provenance'
+import { $executingToolsByRuntime, clearExecutingTools } from './session-executing-tools'
 import { $focusedStoredSessionId, TILE_PANE_PREFIX } from './session-focus'
 import { turnHasReply, withNoReplyNotice } from './session-no-reply'
 import { assertSessionOwnerResolved } from './session-owner-resolution'
@@ -864,6 +865,10 @@ function evictable(runtimeId: string, state: ClientSessionState): boolean {
  *  FIRST publish always lands in full because a resume can publish its idle
  *  state a beat before `$activeSessionId` / the tile binding points at it. */
 export function publishSessionState(runtimeId: string, state: ClientSessionState) {
+  if (!state.busy || state.needsInput || state.interrupted) {
+    clearExecutingTools(runtimeId)
+  }
+
   const current = $sessionStates.get()
   const prev = current[runtimeId] ?? null
 
@@ -907,6 +912,7 @@ export function releaseSessionTranscript(runtimeId: string, state?: ClientSessio
 }
 
 export function dropSessionState(runtimeId: string) {
+  clearExecutingTools(runtimeId)
   // Disarm the watchdog — a dropped runtime must not fire a stale clear later.
   // Settle-grace entries are keyed by stored id and self-expire; leave them so
   // a just-finished session's row survives merge eviction even if its tile or
@@ -936,6 +942,8 @@ export function dropSessionState(runtimeId: string) {
  *  wiped gateway's sessions must not fire stale clears or linger in the
  *  sidebar merge keep-set after the switch. */
 export function clearAllSessionStates() {
+  $executingToolsByRuntime.set({})
+
   for (const timer of sessionWatchdogTimers.values()) {
     clearTimeout(timer)
   }

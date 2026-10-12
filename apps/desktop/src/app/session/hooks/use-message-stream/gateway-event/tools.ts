@@ -8,6 +8,7 @@ import { invalidateSlashCompletions } from '@/lib/slash-completion-cache'
 import { refreshBackgroundProcesses } from '@/store/composer-status'
 import { flashPetActivity, setPetActivity } from '@/store/pet'
 import { recordPreviewArtifact, reofferPreviewArtifact } from '@/store/preview-status'
+import { recordExecutingTool } from '@/store/session-executing-tools'
 import { $sessionStates, storedSessionIdForRuntimeId } from '@/store/session-states'
 import { setupBeatResult } from '@/store/setup-beat'
 import { isTerminalSubagentCompletion, pruneDelegateFallbackSubagents, upsertSubagent } from '@/store/subagents'
@@ -148,6 +149,16 @@ export function handleToolEvent(ctx: GatewayEventContext): boolean {
     }
 
     flushQueuedDeltas(sessionId)
+
+    if (!sessionInterrupted(sessionId) && typeof payload?.name === 'string') {
+      recordExecutingTool(
+        sessionId,
+        String(payload.tool_id ?? payload.tool_call_id ?? payload.id ?? payload.name),
+        payload.name,
+        true
+      )
+    }
+
     upsertToolCall(sessionId, toTodoPayload(payload) ?? payload, 'running', event.type, occurredAt)
 
     if (isActiveEvent) {
@@ -160,6 +171,15 @@ export function handleToolEvent(ctx: GatewayEventContext): boolean {
   if (event.type === 'tool.complete') {
     if (sessionId) {
       flushQueuedDeltas(sessionId)
+
+      if (typeof payload?.name === 'string') {
+        recordExecutingTool(
+          sessionId,
+          String(payload.tool_id ?? payload.tool_call_id ?? payload.id ?? payload.name),
+          payload.name,
+          false
+        )
+      }
 
       const state = $sessionStates.get()[sessionId]
       // Read before the upsert seals the part: only a completion that resolves

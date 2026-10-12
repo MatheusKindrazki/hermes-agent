@@ -2,9 +2,10 @@ import { useStore } from '@nanostores/react'
 import { useEffect, useRef, useState } from 'react'
 
 import { useSessionView } from '@/app/chat/session-view'
+import { FileTypeIcon } from '@/components/ui/file-type-icon'
 import { useI18n } from '@/i18n'
 import { isDesktopFsRemoteMode } from '@/lib/desktop-fs'
-import { Download, FolderOpen, MonitorPlay } from '@/lib/icons'
+import { Download, FolderOpen } from '@/lib/icons'
 import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
 import { downloadGatewayMediaFile } from '@/lib/media'
 import { previewName } from '@/lib/preview-targets'
@@ -223,9 +224,12 @@ export function PreviewAttachment({ target }: { target: string }) {
   // Download, no preview button that used to open a broken text tab (#101683).
   if (localTarget?.type === 'directory') {
     return (
-      <div className="flex w-full max-w-160 items-center gap-2 rounded-lg border border-(--ui-stroke-tertiary) bg-card/55 px-2.5 py-1.5 text-sm">
-        <span className="grid size-6 shrink-0 place-items-center rounded-md bg-muted/55 text-muted-foreground/85">
-          <MonitorPlay className="size-3.5" />
+      <div
+        className="chat-result-card flex w-full max-w-160 items-center gap-3 rounded-xl border border-(--ui-stroke-tertiary) bg-card/55 px-3.5 py-3 text-sm"
+        data-slot="chat-result-card"
+      >
+        <span className="chat-result-card__icon grid size-10 shrink-0 place-items-center rounded-xl bg-muted/55 text-muted-foreground/85">
+          <FileTypeIcon path={target} size="1.125rem" />
         </span>
         <span className="min-w-0 flex-1 truncate text-[0.78rem] font-medium text-foreground/90" title={target}>
           {name}
@@ -244,13 +248,21 @@ export function PreviewAttachment({ target }: { target: string }) {
   }
 
   return (
-    <div className="flex w-full max-w-160 items-center gap-2 rounded-lg border border-(--ui-stroke-tertiary) bg-card/55 px-2.5 py-1.5 text-sm">
-      <span className="grid size-6 shrink-0 place-items-center rounded-md bg-muted/55 text-muted-foreground/85">
-        <MonitorPlay className="size-3.5" />
+    <div
+      className="chat-result-card flex w-full max-w-160 items-center gap-3 rounded-xl border border-(--ui-stroke-tertiary) bg-card/55 px-3.5 py-3 text-sm"
+      data-slot="chat-result-card"
+    >
+      <span className="chat-result-card__icon grid size-10 shrink-0 place-items-center rounded-xl bg-muted/55 text-muted-foreground/85">
+        <FileTypeIcon path={target} size="1.125rem" />
       </span>
-      <span className="min-w-0 flex-1 truncate text-[0.78rem] font-medium text-foreground/90" title={target}>
-        {name}
-      </span>
+      <div className="min-w-0 flex-1" title={target}>
+        <span className="block truncate text-[0.8125rem] font-medium text-foreground/90">{name}</span>
+        <span className="mt-0.5 block text-[0.6875rem] text-(--ui-text-tertiary)">
+          {/^https?:/i.test(target)
+            ? 'Link · Prévia'
+            : `Arquivo · ${name.includes('.') ? name.split('.').at(-1)?.toUpperCase() : 'Prévia'}`}
+        </span>
+      </div>
       {localTarget?.type === 'file' ? (
         // The file already exists on this machine: reveal it in the OS file
         // manager instead of offering to download it again (#101683).

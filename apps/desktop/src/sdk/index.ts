@@ -93,6 +93,7 @@ import {
   setResumeExhaustedSessionId,
   setSessionOwnerHint
 } from '@/store/session'
+import { $sessionDotStateById } from '@/store/session-dot-state'
 import { $focusedStoredSessionId } from '@/store/session-focus'
 import {
   $focusedRuntimeId,
@@ -118,6 +119,7 @@ import {
   pluginRouteStillRegistered,
   requestPluginProfile
 } from './profile-request'
+import { $sessionToolsById, $sessionWorkById } from './session-activity'
 import { sessionsHost } from './sessions'
 import { desktopSettings } from './settings'
 
@@ -589,6 +591,12 @@ export const host = {
     busy: readonlyAtom<boolean>($focusedBusy),
     /** Runtime session id → mid-turn. Not socket state; see `gateway`. */
     busyBySession: readonlyAtom<Record<string, boolean>>($busyBySession),
+    /** Stored id / compression aliases -> live thinking, tool execution, background work or waiting. Independent of focus. */
+    sessionWorkById: readonlyAtom($sessionWorkById),
+    /** Canonical status map including unread and needs-input, independent of focused chat. */
+    sessionStatusById: readonlyAtom($sessionDotStateById),
+    /** Pending tool names by stored-session aliases; never exposes tool arguments. */
+    sessionToolsById: readonlyAtom($sessionToolsById),
     /** Registry source that owns the active gateway, when source-scoped. */
     connectionId: readonlyAtom<null | string>($activeConnectionId),
     /** Active workspace cwd ('' when detached). */

@@ -216,3 +216,25 @@ describe('which row owns the workspace highlight', () => {
     expect(botRowOwnsWorkspace(bot, 'team', false, null, 'local::ops')).toBe(false)
   })
 })
+
+describe('canonical-session activity independent of selection', () => {
+  it('keeps an unselected canonical bot thinking and executing tools', () => {
+    const bot = row({
+      name: 'alpha',
+      connectionId: 'mini',
+      canonical_session: { id: 'stored-alpha', resolved_id: 'tip-alpha' }
+    })
+
+    const anotherOwner = { authoritative: true, connectionId: 'mini', name: 'beta' }
+    expect(botWorkingMood(bot, anotherOwner, false, 'mini', NOW, undefined, { 'tip-alpha': 'think' })).toBe('think')
+    expect(botWorkingMood(bot, anotherOwner, false, 'mini', NOW, undefined, { 'tip-alpha': 'work' })).toBe('work')
+    expect(botWorkingMood(bot, anotherOwner, false, 'mini', NOW, undefined, { 'stored-other': 'work' })).toBe('idle')
+  })
+
+  it('does not animate a blocked turn as working or use another session preview', () => {
+    const bot = row({ name: 'alpha', canonical_session: { id: 'canonical' }, last_session: { id: 'unrelated' } })
+    const owner = { authoritative: true, connectionId: 'local', name: 'alpha' }
+    expect(botWorkingMood(bot, owner, true, 'local', NOW, undefined, { canonical: 'waiting' })).toBe('idle')
+    expect(botWorkingMood(bot, null, false, 'local', NOW, undefined, { unrelated: 'work' })).toBe('idle')
+  })
+})

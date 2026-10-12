@@ -1115,6 +1115,7 @@ export function ChatBar({
       onPickFiles={onPickFiles}
       onPickFolders={onPickFolders}
       onPickImages={onPickImages}
+      sessionId={sessionId}
       state={state}
     />
   )

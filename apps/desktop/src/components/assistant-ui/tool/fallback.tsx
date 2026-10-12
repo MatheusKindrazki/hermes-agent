@@ -886,12 +886,15 @@ function ToolRunHeader({
   summary: string
 }) {
   return (
-    <div data-conversation-scaffold="" data-tool-summary="">
+    <div data-conversation-scaffold="" data-tool-live={live ? 'true' : undefined} data-tool-summary="">
       <ScaffoldRow
         onToggle={onToggle}
         open={open}
         trailing={<TimelineTimestamp completedAt={completedAt} timestamp={startedAt} />}
       >
+        <span aria-hidden className={SCAFFOLD_GLYPH_CLASS}>
+          {live ? <GlyphSpinner className="size-3" /> : <Codicon name="list-tree" size="0.8125rem" />}
+        </span>
         <FadeText className={cn(SCAFFOLD_LABEL_CLASS, 'truncate')}>
           {live ? <span className="shimmer">{summary}</span> : summary}
         </FadeText>

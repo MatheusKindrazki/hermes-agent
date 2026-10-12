@@ -1,9 +1,11 @@
 import type { Unstable_TriggerAdapter, Unstable_TriggerItem } from '@assistant-ui/core'
-import { useCallback } from 'react'
+import { useStore } from '@nanostores/react'
+import { useCallback, useEffect } from 'react'
 
 import { refChipLabel } from '@/components/assistant-ui/directive-text'
 import { useContributions } from '@/contrib/react/use-contributions'
 import type { HermesGateway } from '@/hermes'
+import { $localApplications, loadLocalApplications, localApplicationCompletions } from '@/lib/local-applications'
 import { cachedPathCompletion, hasCachedPathCompletion } from '@/lib/slash-completion-cache'
 import { normalize } from '@/lib/text'
 
@@ -130,6 +132,10 @@ export function useAtCompletions(options: {
   cwd: string | null
 }): { adapter: Unstable_TriggerAdapter; loading: boolean } {
   const { gateway, sessionId, cwd } = options
+  const applications = useStore($localApplications)
+  useEffect(() => {
+    void loadLocalApplications()
+  }, [])
   const enabled = Boolean(gateway)
 
   const contributed = useContributions(COMPOSER_AREAS.atCompletions)
@@ -140,6 +146,7 @@ export function useAtCompletions(options: {
   const contributedEntries = useCallback(
     (query: string): { entries: CompletionEntry[]; claimedHandles: Set<string> } => {
       const out: CompletionEntry[] = []
+
       const claimedHandles = new Set<string>()
 
       for (const contribution of contributed) {
@@ -189,9 +196,18 @@ export function useAtCompletions(options: {
         }
       }
 
+      out.push(
+        ...localApplicationCompletions(applications, query).map(item => ({
+          text: item.insert,
+          display: item.display,
+          meta: item.meta,
+          icon: item.icon
+        }))
+      )
+
       return { entries: out, claimedHandles }
     },
-    [contributed]
+    [applications, contributed]
   )
 
   // Cache key: the completion depends on the query AND the directory it's

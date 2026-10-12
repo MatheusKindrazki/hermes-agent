@@ -3886,3 +3886,132 @@ html[data-hud-window] [data-slot='popover-content'] {
 [data-pane-hidden] * {
   visibility: inherit !important;
 }
+
+/* Personal bot conversations: character presence, restrained persona color, readable prose. */
+[data-chat-persona] {
+  --composer-width: 54rem;
+  --conversation-turn-gap: 1.125rem;
+  --paragraph-gap: 0.85rem;
+  --dt-user-bubble: color-mix(in srgb, var(--chat-persona-accent) 8%, var(--ui-chat-bubble-opaque-background));
+  --composer-surface-pad-x: 0.875rem;
+  --composer-surface-pad-y: 0.625rem;
+}
+.chat-persona-header {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-shrink: 0;
+  width: min(54rem, 100%);
+  margin-inline: auto;
+  padding: 1.125rem 1.5rem 0.75rem;
+}
+.chat-persona-header__identity {
+  display: flex;
+  align-items: center;
+  gap: 0.875rem;
+  min-width: 0;
+}
+.chat-persona-header__avatar {
+  flex-shrink: 0;
+  filter: drop-shadow(0 4px 8px color-mix(in srgb, var(--chat-persona-accent) 16%, transparent));
+}
+.chat-persona-header__source {
+  max-width: 35%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ui-text-quaternary);
+  font-size: 0.625rem;
+}
+.chat-persona-header[data-status='needs-input'] p {
+  color: var(--ui-warning, var(--ui-text-primary));
+}
+[data-chat-persona] [data-slot='aui_assistant-message-content'] {
+  line-height: 1.65;
+}
+[data-chat-persona] [data-slot='aui_assistant-message-content'] .aui-md {
+  background: transparent;
+}
+[data-chat-persona] .composer-human-message {
+  border-color: color-mix(in srgb, var(--chat-persona-accent) 16%, var(--ui-stroke-tertiary));
+  border-radius: 1rem;
+}
+[data-chat-persona] [data-slot='composer-surface'] {
+  border-color: color-mix(in srgb, var(--chat-persona-accent) 18%, var(--ui-stroke-tertiary));
+  box-shadow: 0 6px 22px color-mix(in srgb, var(--ui-text-primary) 4%, transparent);
+}
+[data-chat-persona] [data-slot='composer-surface']:focus-within {
+  border-color: color-mix(in srgb, var(--chat-persona-accent) 55%, var(--ui-stroke-tertiary));
+}
+[data-chat-persona] [data-tool-summary] {
+  padding: 0.375rem 0.5rem;
+  border-radius: 0.625rem;
+  background: color-mix(in srgb, var(--ui-text-primary) 3%, transparent);
+}
+[data-chat-persona] [data-tool-summary][data-tool-live] {
+  background: color-mix(in srgb, var(--chat-persona-accent) 7%, transparent);
+}
+[data-chat-persona] [data-tool-group] {
+  margin-block: 0.25rem;
+}
+[data-chat-persona] .chat-result-card {
+  flex-wrap: wrap;
+  background: color-mix(in srgb, var(--chat-persona-accent) 4%, var(--ui-widget-surface-background));
+  border-color: color-mix(in srgb, var(--chat-persona-accent) 16%, var(--ui-stroke-tertiary));
+}
+[data-chat-persona] .chat-result-card__icon {
+  color: var(--chat-persona-accent);
+  background: color-mix(in srgb, var(--chat-persona-accent) 12%, transparent);
+}
+[data-chat-persona] [data-slot='aui_markdown-image'] img {
+  border-radius: 0.875rem;
+}
+@media (max-width: 640px) {
+  .chat-persona-header__source {
+    display: none;
+  }
+  .chat-persona-header {
+    padding-inline: 1rem;
+  }
+}
+
+/* Keep the bot's prose flat even when a custom theme supplies message cards. */
+[data-chat-persona] :is([data-slot='aui_assistant-message-root'], [data-slot='aui_assistant-message-content']) {
+  background: transparent !important;
+  border: 0 !important;
+  box-shadow: none !important;
+}
+[data-chat-persona] [data-slot='aui_assistant-message-content'] .aui-md:not(pre) {
+  background: transparent !important;
+  box-shadow: none !important;
+}
+[data-chat-persona] [data-tool-summary] {
+  width: fit-content;
+  max-width: 100%;
+  justify-self: start;
+}
+
+[data-chat-persona] :is([data-slot='composer-model'], [data-slot='composer-effort']) {
+  font-size: 0.6875rem;
+  color: var(--ui-text-tertiary);
+}
+[data-chat-persona] :is([data-slot='composer-model'], [data-slot='composer-effort']):is(:hover, :focus-visible) {
+  color: var(--ui-text-primary);
+}
+
+/* The runtime Grok Chat theme injects important gray prose-pill rules after
+   the app stylesheet. This surface-qualified selector outranks that skin's
+   html[data-grok-chat-look] selector, while preserving nested result cards. */
+html [data-chat-surface][data-chat-persona] [data-slot='aui_assistant-message-content'] > .aui-md {
+  display: block !important;
+  width: 100% !important;
+  max-width: 100% !important;
+  padding: 0 !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}

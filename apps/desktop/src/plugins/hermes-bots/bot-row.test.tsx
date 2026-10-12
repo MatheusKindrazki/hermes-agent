@@ -110,6 +110,16 @@ describe('pre-warm is hover-scoped, never roster-wide', () => {
     expect(warmAgent).not.toHaveBeenCalled()
   })
 
+  it('greets only the hovered mascot and returns it to rest on pointer exit', () => {
+    const row = renderRow({ name: 'default' } as RosterRow)
+    const face = row.querySelector('[data-hb-painted]')!
+    expect(face.getAttribute('data-hb-hover')).toBe('0')
+    fireEvent.pointerEnter(row)
+    expect(face.getAttribute('data-hb-hover')).toBe('1')
+    fireEvent.pointerLeave(row)
+    expect(face.getAttribute('data-hb-hover')).toBe('0')
+  })
+
   it('pre-dials a source-scoped row on its own source', async () => {
     const row = renderRow({
       connectionId: 'work',

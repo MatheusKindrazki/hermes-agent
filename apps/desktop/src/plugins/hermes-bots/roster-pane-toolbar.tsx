@@ -10,6 +10,7 @@ import {
   SearchField,
   Tip
 } from '@hermes/plugin-sdk'
+import type { ReactNode } from 'react'
 
 import { seatableGroupBots, useGroupCapability } from './canonical-group-capabilities'
 import { botSourceStatus } from './data'
@@ -40,6 +41,7 @@ function NewGroupChatItem({ label, onSelect, roster }: NewGroupChatItemProps) {
 }
 
 interface renderRosterToolbarProps {
+  navigation?: ReactNode
   b: ReturnType<typeof useBots>
   activityToasts: boolean
   activeSourceRoster: RosterRow[]
@@ -67,6 +69,7 @@ interface renderRosterToolbarProps {
 
 export function renderRosterToolbar({
   b,
+  navigation,
   activityToasts,
   activeSourceRoster,
   roster,
@@ -89,10 +92,8 @@ export function renderRosterToolbar({
 }: renderRosterToolbarProps) {
   return (
     <>
-      <div className="flex items-center justify-between gap-2 px-2.5 pt-2.5 pb-1.5">
-        <span className="text-[0.6875rem] font-semibold uppercase tracking-wider text-(--ui-text-quaternary)">
-          Bots
-        </span>
+      <div className="flex items-center justify-between gap-2 px-3.5 pt-1 pb-2">
+        {navigation ?? <span className="text-[0.6875rem] font-semibold text-(--ui-text-tertiary)">Bots</span>}
         <div className="flex items-center gap-0.5">
           <Tip
             label={activityToasts ? 'Activity toasts on — click to silence' : 'Activity toasts off — click to enable'}
@@ -135,15 +136,15 @@ export function renderRosterToolbar({
         </div>
       </div>
       {showRosterTools ? (
-        <div className="flex min-w-0 items-center gap-1 px-2.5 pb-1.5">
+        <div className="flex min-w-0 items-center gap-2 px-3.5 pb-3">
           {showRosterSearch ? (
             <SearchField
               aria-label={b.roster.search}
-              containerClassName={cn('min-w-0 flex-1', query ? 'opacity-100!' : 'opacity-50 focus-within:opacity-100')}
+              containerClassName={cn('min-w-0 flex-1', 'opacity-100!')}
               inputClassName="w-full text-[0.75rem] placeholder:text-(--ui-text-tertiary)"
               key={'roster-search'}
               onChange={setQuery}
-              placeholder={b.roster.searchPlaceholder}
+              placeholder="Buscar no seu time"
               value={query}
             />
           ) : (

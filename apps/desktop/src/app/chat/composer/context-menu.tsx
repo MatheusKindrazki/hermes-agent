@@ -18,6 +18,8 @@ import { useI18n } from '@/i18n'
 import { Clipboard, FileText, FolderOpen, type IconComponent, ImageIcon, Link, MessageSquareText } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 
+import { ComputerUseMenu } from '../computer-use-menu'
+
 import { useComposerAttachmentProviders } from './contrib'
 import { GHOST_ICON_BTN } from './controls'
 import type { ChatBarState } from './types'
@@ -26,6 +28,7 @@ const SNIPPET_KEYS = ['codeReview', 'implementationPlan', 'explainThis']
 
 export function ContextMenu({
   state,
+  sessionId,
   onInsertText,
   onOpenUrlDialog,
   onPasteClipboardImage,
@@ -116,6 +119,7 @@ export function ContextMenu({
         </DropdownMenuContent>
       </DropdownMenu>
 
+      <ComputerUseMenu sessionId={sessionId} />
       <PromptSnippetsDialog onInsertText={onInsertText} onOpenChange={setSnippetsOpen} open={snippetsOpen} />
     </>
   )
@@ -185,6 +189,7 @@ interface ContextMenuItemProps {
 }
 
 interface ContextMenuProps {
+  sessionId?: string | null
   onInsertText: (text: string) => void
   onOpenUrlDialog: () => void
   onPasteClipboardImage?: (opts?: { silent?: boolean }) => Promise<boolean> | void

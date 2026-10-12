@@ -7,7 +7,7 @@ import type {
   ToolsetModelsResponse
 } from '@/types/hermes'
 
-import { capabilityScoped, hermesApi, type ProfileScope, profileScoped } from './client'
+import { capabilityScoped, hermesApi, type ProfileScope } from './client'
 
 // The optional trailing `profile` on every capability fetcher below is the
 // Capabilities view's profile-scope override: it lets the Skills/Tools/MCP
@@ -128,16 +128,16 @@ export function selectTerminalBackend(
   })
 }
 
-export function getComputerUseStatus(): Promise<ComputerUseStatus> {
+export function getComputerUseStatus(profile?: ProfileScope): Promise<ComputerUseStatus> {
   return hermesApi<ComputerUseStatus>({
-    ...profileScoped(),
+    ...capabilityScoped(profile),
     path: '/api/tools/computer-use/status'
   })
 }
 
-export function grantComputerUsePermissions(): Promise<ActionResponse> {
+export function grantComputerUsePermissions(profile?: ProfileScope): Promise<ActionResponse> {
   return hermesApi<ActionResponse>({
-    ...profileScoped(),
+    ...capabilityScoped(profile),
     path: '/api/tools/computer-use/permissions/grant',
     method: 'POST'
   })

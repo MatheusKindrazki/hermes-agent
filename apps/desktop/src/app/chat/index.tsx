@@ -27,6 +27,7 @@ import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
 import { migrateSessionDraft } from '@/store/composer'
 import { migrateQueuedPrompts, parkQueuedPrompts } from '@/store/composer-queue'
+import { $hudMode } from '@/store/hud'
 import { $introSplash } from '@/store/intro-splash'
 import { $pinnedSessionIds } from '@/store/layout'
 import { $introView } from '@/store/onboarding-intro'
@@ -57,6 +58,7 @@ import { isAuxiliaryWindow, isMainWindow } from '@/store/windows'
 import { primaryRouteSelectedSessionId, routeSessionId } from '../routes'
 import { titlebarHeaderBaseClass, titlebarHeaderShadowClass, titlebarHeaderTitleClass } from '../shell/titlebar'
 
+import { ChatPersonaHeader, useChatPersona } from './bot-persona'
 import { ChatDropOverlay } from './chat-drop-overlay'
 import { dropOverlayKind, useShowChatBar } from './chat-surface-state'
 import { ChatSwapOverlay, ChatSyncBadge } from './chat-swap-overlay'
@@ -531,6 +533,9 @@ const ChatViewContent = memo(function ChatViewContent({
 
   const storedId = useStore(view.$storedId)
   const setupChat = useSetupChatView()
+  const resolvedPersona = useChatPersona(storedId)
+  const hudMode = useStore($hudMode)
+  const chatPersona = hudMode ? null : resolvedPersona
   // Multi-pane dimming: only the focused surface paints at full strength, so
   // two sessions side by side read as "this one, and that one over there".
   // A selector, not a plain useStore — the focused id changes on click, and a
@@ -749,6 +754,7 @@ const ChatViewContent = memo(function ChatViewContent({
         'relative isolate flex h-full min-w-0 flex-col overflow-hidden bg-(--ui-chat-surface-background)',
         className
       )}
+      data-chat-persona={chatPersona?.bot.name}
       data-chat-surface=""
       data-chat-unfocused={surfaceFocused || surfaceHovered ? undefined : ''}
       data-composer-surface-id={composerSurfaceId}
@@ -756,6 +762,7 @@ const ChatViewContent = memo(function ChatViewContent({
       data-guide-arrived={isPrimary && guideStarted ? '' : undefined}
       data-session-anchor={sessionAnchor}
       data-setup-chat={setupChat ? '' : undefined}
+      style={chatPersona?.style}
     >
       <Backdrop />
       {/* Tiles get their chrome from the layout zone (chip strip); the modal
@@ -769,6 +776,8 @@ const ChatViewContent = memo(function ChatViewContent({
           selectedSessionId={selectedSessionId}
         />
       )}
+
+      {chatPersona && <ChatPersonaHeader persona={chatPersona} />}
 
       {/* Mounted for the primary AND every tile, each scoped to its own session
           so a tiled/background session's blocking prompt surfaces instead of

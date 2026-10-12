@@ -87,6 +87,11 @@ export function workerActiveAt(bot: null | RosterRow | undefined, now = Date.now
 
 /** Older shells without the live-turn atom remain idle rather than reading socket state. */
 const $idleTurn = atom(false)
+const $noSessionWork = atom<Readonly<Record<string, string>>>({})
+
+export function useSessionWork() {
+  return useValue(host.state.sessionWorkById || $noSessionWork)
+}
 
 export function useTurnBusy(): boolean {
   return useValue(host.state.busy || $idleTurn)
@@ -105,10 +110,22 @@ export function botWorkingMood(
   turnBusy: boolean,
   activeConnectionId = 'local',
   now = Date.now(),
-  groupKeys?: ReadonlySet<string>
+  groupKeys?: ReadonlySet<string>,
+  sessionWork?: Readonly<Record<string, string>>
 ): 'idle' | 'think' | 'work' {
   if (groupKeys?.has(botRosterKey(bot))) {
     return 'think'
+  }
+
+  const sessionId = botCanonicalSessionId(bot)
+  const liveMood = sessionId ? sessionWork?.[sessionId] : undefined
+
+  if (liveMood === 'waiting') {
+    return 'idle'
+  }
+
+  if (liveMood === 'think' || liveMood === 'work') {
+    return liveMood
   }
 
   const botConnectionId = bot.connectionId || (bot.remoteSource ? '' : activeConnectionId)
@@ -133,10 +150,11 @@ export function activeBots(
   turnBusy: boolean,
   now = Date.now(),
   activeConnectionId = 'local',
-  groupKeys?: ReadonlySet<string>
+  groupKeys?: ReadonlySet<string>,
+  sessionWork?: Readonly<Record<string, string>>
 ): RosterRow[] {
   return (roster || []).filter(bot => {
-    const busyTurn = botWorkingMood(bot, owner, turnBusy, activeConnectionId, now, groupKeys) !== 'idle'
+    const busyTurn = botWorkingMood(bot, owner, turnBusy, activeConnectionId, now, groupKeys, sessionWork) !== 'idle'
     const last = botActivitySession(bot)?.last_active || 0
     const inWindow = Boolean(last && now / 1000 - last < ACTIVE_WINDOW_S)
 

@@ -24,13 +24,13 @@ import {
   host,
   queryClient,
   RowButton,
-  SessionStatusDot,
-  SidebarRowLead,
   Tip,
   useI18n,
   useValue
 } from '@hermes/plugin-sdk'
+import { useState } from 'react'
 
+import { activityPreview, useActivityStatus, useActivityTools } from './activity-preview'
 import { avatarColor, botAppearance, BotFace } from './avatar'
 import { isBackfilledFacePng } from './avatar-image'
 import {
@@ -70,10 +70,10 @@ import { openRosterBot } from './roster-actions'
 import { botRosterMeta, botWorkspaceOwnerKey, setBotsWorkspaceOwner } from './routing'
 import {
   A2A_PREFIX_RE,
-  botCanonicalSessionId,
   botRowOwnsWorkspace,
   botWorkingMood,
   previewKind,
+  useSessionWork,
   useTurnBusy,
   workerActiveAt
 } from './row-helpers'
@@ -116,6 +116,7 @@ interface BotRowProps {
 export function BotRow({ bot, onDelete, onEdit, onGroup, onNewSection, showHandle }: BotRowProps) {
   const { t } = useI18n()
   const b = useBots()
+  const [avatarHovered, setAvatarHovered] = useState(false)
   const focusedOwner = focusedRosterOwner(useValue($focusedBotOwner))
   const selectedRosterKey = useValue($selectedRosterKey)
   const pendingOpenKey = useValue($pendingBotOpen)?.key
@@ -163,10 +164,8 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, onNewSection, showHandl
   const rowAgeTs = Math.max(activitySession?.last_active || 0, bot.worker_session?.last_active || 0)
 
   const groupKeys = useValue($activeGroupMemberKeys)
-  const botMood = botWorkingMood(bot, focusedOwner, turnBusy, activeConnectionId, Date.now(), groupKeys)
-  // Status keys off the canonical Bot Chat — the very session this row opens,
-  // so the dot and the click can never describe different conversations.
-  const canonicalSessionId = botCanonicalSessionId(bot)
+  const sessionWork = useSessionWork()
+  const botMood = botWorkingMood(bot, focusedOwner, turnBusy, activeConnectionId, Date.now(), groupKeys, sessionWork)
   // Needs-attention badge (#93091 item 3): background failures record under
   // the selection key (group turns) or the route key (relay deliveries) —
   // check both. Local/unannotated rows carry no connectionId, so their relay
@@ -194,15 +193,26 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, onNewSection, showHandl
     fromBot ? (previewSession?.preview || '').replace(A2A_PREFIX_RE, '').trim() || '…' : previewSession?.preview || ''
   )
 
+  const activityStatuses = useActivityStatus()
+  const activityTools = useActivityTools()
+  const livePreview = activityPreview(bot, botMood, activityStatuses, activityTools, Boolean(attention))
   const handle = botHandle(bot.name, bot)
   const gatewayLabel = bot.connectionLabel || (bot.connectionId === 'local' ? b.bot.thisDevice : '')
-  const showDetailsRow = Boolean(showHandle || displayPreview || fromBot)
+  const showDetailsRow = Boolean(showHandle || livePreview || displayPreview || fromBot)
 
-  const rowTooltip = [displayName(bot, meta), `@${handle}`, gatewayLabel, sourceStatus.label]
+  const rowTooltip = [
+    displayName(bot, meta),
+    `@${handle}`,
+    gatewayLabel,
+    sourceStatus.label,
+    botMood !== 'idle' ? t.sidebar.row.sessionRunning : ''
+  ]
     .filter(Boolean)
     .join(' · ')
 
   const warm = () => {
+    setAvatarHovered(true)
+
     // Multi-source row: pre-dial the agent's OWN source (feature-detected).
     if (bot.sourceScoped && typeof host.warmAgent === 'function') {
       try {
@@ -252,6 +262,7 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, onNewSection, showHandl
       )}
       data-roster-key={rosterKey}
       draggable
+      onBlur={() => setAvatarHovered(false)}
       onClick={open}
       onDragEnd={() => $draggingBot.set(null)}
       onDragStart={event => {
@@ -259,31 +270,24 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, onNewSection, showHandl
         event.dataTransfer.effectAllowed = 'move'
         $draggingBot.set(rosterKey)
       }}
+      onFocus={() => setAvatarHovered(true)}
       onPointerEnter={warm}
+      onPointerLeave={() => setAvatarHovered(false)}
     >
       <div className={cn('shrink-0', !sourceStatus.available && 'grayscale opacity-60')}>
         <BotFace
           color={avatarColor(color, bot.name)}
+          hovered={avatarHovered}
           image={photo ? image : null}
           mood={botMood}
           name={bot.name}
           shape={shape}
-          size={34}
+          size={44}
         />
       </div>
       <div className="min-w-0 flex-1">
         <div className="flex items-baseline justify-between gap-2">
           <div className="flex min-w-0 items-center gap-1.5">
-            {/* The session row's own lead cell, so a bot's name sits on the
-                same left edge as every session name above it in the rail. */}
-            <SidebarRowLead>
-              <SessionStatusDot storedSessionId={canonicalSessionId} />
-            </SidebarRowLead>
-            {pinned ? (
-              <Tip label={b.roster.pinned}>
-                <Codicon className="shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)" name="pinned" />
-              </Tip>
-            ) : null}
             {hidden ? (
               <Tip label={b.roster.hiddenFromRoster}>
                 <Codicon className="shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)" name="eye-closed" />
@@ -317,7 +321,19 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, onNewSection, showHandl
               <span className="shrink-0 font-mono text-[0.6875rem] text-(--ui-text-quaternary)">{`@${handle}`}</span>
             ) : null}
             {showHandle && displayPreview ? <span className="shrink-0 text-(--ui-text-quaternary)">·</span> : null}
-            {displayPreview ? (
+            {livePreview ? (
+              <span
+                className={cn(
+                  'min-w-0 truncate',
+                  activityStatuses[bot.canonical_session?.resolved_id || bot.canonical_session?.id || ''] ===
+                    'needs-input'
+                    ? 'text-amber-600 dark:text-amber-300'
+                    : 'text-(--ui-text-secondary)'
+                )}
+              >
+                {livePreview}
+              </span>
+            ) : displayPreview ? (
               <span className={cn('min-w-0 truncate', fromBot && 'italic')}>{displayPreview}</span>
             ) : null}
           </div>
@@ -598,11 +614,6 @@ export function GroupRow({ active, group, members, needsYou, onOpen, onDisband, 
       <div className="min-w-0 flex-1">
         <div className="flex items-baseline justify-between gap-2">
           <span className="min-w-0 flex-1 truncate text-[0.8125rem] font-medium">{group}</span>
-          {room.pinned ? (
-            <Tip label={b.roster.pinned}>
-              <Codicon className="shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)" name="pinned" />
-            </Tip>
-          ) : null}
           {needsYou ? (
             <Tip label={b.group.needsYourInput}>
               <Codicon aria-label={b.roster.needsInput} className="shrink-0 text-(--ui-accent)" name="question" />
