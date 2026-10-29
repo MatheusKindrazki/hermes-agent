@@ -551,7 +551,9 @@ export function ConnectorExecution(props: ToolCallMessagePartProps) {
   return (
     <details className="connector-execution-details" data-conversation-scaffold="">
       <summary className={SCAFFOLD_LABEL_CLASS}>{[...new Set(labels.map(label => label.text))].join(' · ')}</summary>
-      <div className="pt-2">{rows}</div>
+      <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md border border-(--ui-stroke-tertiary) p-3 text-xs">
+        {JSON.stringify({ arguments: props.args, result: props.result }, null, 2)}
+      </pre>
     </details>
   )
 }

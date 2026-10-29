@@ -29,7 +29,7 @@ describe('execution disclosure', () => {
     expect(container.querySelector('details')).not.toBeNull()
     expect(container.querySelector('details')?.open).toBe(false)
     expect(container.querySelector('summary')?.textContent).toBe('Delivery')
-    expect(container.textContent).toContain('Execution detail')
+    expect(container.querySelector('pre')?.textContent).toContain('ok')
   })
   it('keeps pending calls and errors visible', () => {
     for (const part of [

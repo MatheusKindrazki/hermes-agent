@@ -4042,3 +4042,14 @@ html [data-chat-surface][data-chat-persona] [data-slot='tool-block'] button {
   background: transparent !important;
   box-shadow: none !important;
 }
+
+html [data-chat-surface][data-chat-persona] [data-tool-summary]:not([data-tool-live]) {
+  padding: 0.25rem 0 !important;
+  background: transparent !important;
+}
+html [data-chat-surface][data-chat-persona] [data-tool-summary]:not([data-tool-live]) button[aria-expanded] {
+  padding: 0 !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
