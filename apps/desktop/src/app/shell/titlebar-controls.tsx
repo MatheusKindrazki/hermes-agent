@@ -145,7 +145,7 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
   const unreadCount = useStore($unreadSessionCount)
   const appActionsSide = useStore($titlebarAppActionsSide)
   const interfaceMode = useStore($interfaceMode)
-  const unreadBadge = unreadCount > 0 ? unreadCount : undefined
+  const unreadBadge = interfaceMode === 'advanced' && unreadCount > 0 ? unreadCount : undefined
   const unreadHint = unreadBadge ? ` · ${t.titlebar.unreadSessions(unreadBadge)}` : ''
   // One filter for every cluster: a tool's own `hidden`, then the mode's tier.
   const shown = shownInMode(interfaceMode)

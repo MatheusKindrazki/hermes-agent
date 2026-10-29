@@ -8,7 +8,6 @@
 
 import {
   cn,
-  coarseElapsed,
   Codicon,
   ContextMenu,
   ContextMenuCheckboxItem,
@@ -46,7 +45,6 @@ import {
   $botAttention,
   $botMeta,
   $lastRoster,
-  botActivitySession,
   botAttentionHint,
   botHandle,
   botRosterKey,
@@ -58,7 +56,7 @@ import {
   saveBotMeta
 } from './data'
 import { $groupChats, $groupChatWorkspace } from './group-chat'
-import { botGroups, groupLastActivity } from './group-membership'
+import { botGroups } from './group-membership'
 import { toggleGroupChatPinned } from './group-pin'
 import { $activeGroupMemberKeys } from './group-presence'
 import { fallbackSelectionAfterHide, isBotHidden, isBotPinned } from './hidden-bots'
@@ -78,7 +76,7 @@ import {
   workerActiveAt
 } from './row-helpers'
 import { openBotScreen } from './screen-open'
-import type { GroupMember, RosterRow, SidebarRowLabels } from './types'
+import type { GroupMember, RosterRow } from './types'
 import {
   $botSections,
   $draggingBot,
@@ -91,17 +89,6 @@ import {
 } from './user-sections'
 
 // ── bot row ──────────────────────────────────────────────────────────────────
-
-/** Row age in the sidebar's compact form ("now", "52m", "3h", "18d").
- *  Deliberately the same `coarseElapsed` + suffix pair the session rows
- *  directly above use, so the two lists in one rail don't disagree about how
- *  an age is spelled. Not `relativeTime` — that's the bidirectional Intl form
- *  ("in 14 hr"), which belongs on a scheduled next-run. */
-function rowAge(ms: number, r: SidebarRowLabels): string {
-  const { unit, value } = coarseElapsed(Date.now() - ms)
-
-  return unit === 'second' ? r.ageNow : `${value}${unit === 'day' ? r.ageDay : unit === 'hour' ? r.ageHour : r.ageMin}`
-}
 
 interface BotRowProps {
   bot: RosterRow
@@ -147,21 +134,9 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, onNewSection, showHandl
   // Keep user photos/pets. Drop the 160px SVG backfill so the math face can move.
   const photo = Boolean(image && !isBackfilledFacePng(image))
   const turnBusy = useTurnBusy()
-  // Preview identity must match click identity (#88200): when the backend
-  // resolved the pinned canonical chat, preview THAT session — not the
-  // profile's most recent (but unrelated) activity. Activity signals
-  // (age label, pulse dot) follow the same rule via botActivitySession:
-  // the canonical Bot Chat is hidden from last_session, so keying age off
-  // last_session alone shows "6d ago" on a bot you just messaged.
+  // Preview the canonical chat; worker activity still drives the character's mood.
   const previewSession = bot.canonical_session || last
-  const activitySession = botActivitySession(bot)
-  // A live kanban/tool worker gates only the pulse/mood (#90268). The age is
-  // the last time the bot did ANYTHING — chat or delegated worker run — so a
-  // delegate-only specialist that ran all day no longer snaps back to "11d"
-  // the moment the 150 s liveness window lapses (#105874). An absent
-  // worker_session (past the gateway's 20-row window) degrades to chat age.
   const workerActive = workerActiveAt(bot)
-  const rowAgeTs = Math.max(activitySession?.last_active || 0, bot.worker_session?.last_active || 0)
 
   const groupKeys = useValue($activeGroupMemberKeys)
   const sessionWork = useSessionWork()
@@ -310,11 +285,6 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, onNewSection, showHandl
           ) : null}
           {isOpening ? (
             <GlyphSpinner ariaLabel={b.bot.openingChat} className="shrink-0 text-xs text-(--ui-text-secondary)" />
-          ) : null}
-          {rowAgeTs ? (
-            <span className="shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)">
-              {rowAge(rowAgeTs * 1000, t.sidebar.row)}
-            </span>
           ) : null}
         </div>
         {showDetailsRow ? (
@@ -529,7 +499,6 @@ interface GroupRowProps {
 }
 
 export function GroupRow({ active, group, members, needsYou, onOpen, onDisband, onNewSection }: GroupRowProps) {
-  const { t } = useI18n()
   const b = useBots()
   const rooms = useValue($groupChats)
   const sections = useValue($botSections)
@@ -541,7 +510,6 @@ export function GroupRow({ active, group, members, needsYou, onOpen, onDisband, 
 
   const log = Array.isArray(room.log) ? room.log : []
   const last = log.length ? log[log.length - 1] : null
-  const lastAt = groupLastActivity(room)
   // Room previews speak the same handle vocabulary as the roster, mentions
   // and the group prompt: the primary profile is @hermes, not @default.
   const lastFrom = last?.from?.name || ''
@@ -622,11 +590,6 @@ export function GroupRow({ active, group, members, needsYou, onOpen, onDisband, 
             <Tip label={b.group.needsYourInput}>
               <Codicon aria-label={b.roster.needsInput} className="shrink-0 text-(--ui-accent)" name="question" />
             </Tip>
-          ) : null}
-          {lastAt ? (
-            <span className="shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)">
-              {rowAge(lastAt, t.sidebar.row)}
-            </span>
           ) : null}
         </div>
         <div className="min-w-0 truncate text-xs text-(--ui-text-tertiary)">{preview}</div>
