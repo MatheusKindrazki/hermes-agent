@@ -23,7 +23,7 @@ const text = 'text-xs text-white/40'
 const back = 'my-4 text-xs text-white/45 hover:text-white'
 
 /** Only the open, visible panel polls; a failed refresh keeps its last successful snapshot. */
-export function useExecutorRead(url: string, enabled = true) {
+export function useExecutorRead(url: string, enabled = true, poll = true) {
   const visible = usePaneVisible()
   const [data, setData] = useState<Result | null>(null)
   const [error, setError] = useState(false)
@@ -57,14 +57,14 @@ export function useExecutorRead(url: string, enabled = true) {
       }
     }
     void refresh()
-    const timer = window.setInterval(() => void refresh(), 5000)
+    const timer = poll ? window.setInterval(() => void refresh(), 5000) : undefined
     document.addEventListener('visibilitychange', refresh)
     return () => {
       cancelled = true
       window.clearInterval(timer)
       document.removeEventListener('visibilitychange', refresh)
     }
-  }, [url, enabled, visible, retry])
+  }, [url, enabled, visible, retry, poll])
   return { data, error, retry: () => setRetry(n => n + 1) }
 }
 function ReadStatus({ read }: { read: ReturnType<typeof useExecutorRead> }) {
@@ -223,6 +223,24 @@ function TaskRow({ link, onOpen }: { link: ParallelLink; onOpen: () => void }) {
     </button>
   )
 }
+function ConversationRow({ link, onOpen }: { link: ParallelLink; onOpen: () => void }) {
+  const read = useExecutorRead(link.url, true, false)
+  const conversation = read.data?.kind === 'conversation' ? read.data : null
+  const latest = conversation?.items.filter(item => item.text).at(-1)?.text
+  return (
+    <button onClick={onOpen} className="flex w-full items-center gap-3 border-b border-white/6 py-4 text-left">
+      <span className="min-w-0 flex-1">
+        <span className="line-clamp-2 text-sm text-white/80">{conversation?.title || 'Conversa do agente'}</span>
+        <span className="mt-1 block truncate text-xs text-white/40">
+          {read.error
+            ? 'Sem conexão · tentar abrir'
+            : latest || (conversation ? 'Ver mensagens e atividade' : 'Carregando conversa…')}
+        </span>
+      </span>
+      <span className="text-white/30">›</span>
+    </button>
+  )
+}
 export function ExecutorLinks({ links }: { links: ParallelLink[] }) {
   const [selected, setSelected] = useState<ParallelLink | null>(null)
   const [more, setMore] = useState(false)
@@ -247,19 +265,7 @@ export function ExecutorLinks({ links }: { links: ParallelLink[] }) {
         link.kind === 'task' ? (
           <TaskRow key={link.url} link={link} onOpen={() => setSelected(link)} />
         ) : (
-          <button
-            key={link.url}
-            onClick={() => setSelected(link)}
-            className="flex w-full items-center justify-between border-b border-white/6 py-4 text-left text-sm text-white/75"
-          >
-            <span>
-              {link.title}
-              <span className="mt-1 block text-[11px] text-white/35">
-                {new URL(link.url).pathname.split('/').filter(Boolean).pop()?.slice(0, 8)} · ler aqui
-              </span>
-            </span>
-            <span className="text-white/30">›</span>
-          </button>
+          <ConversationRow key={link.url} link={link} onOpen={() => setSelected(link)} />
         )
       )}
       {!more && links.length > 8 && (
