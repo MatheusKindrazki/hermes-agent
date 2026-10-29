@@ -1,4 +1,4 @@
-import { createExecutorReader } from './parallel-executor'
+import { createExecutorReader, createExecutorSender } from './parallel-executor'
 import { type ChildProcess, execFileSync, spawn } from 'node:child_process'
 
 import type { GatewayEndpoint } from './local-gateway'
@@ -17387,8 +17387,8 @@ function readLatestSyncReceipt(): Record<string, unknown> | null {
 ipcMain.handle('hermes:sync-status', () => readLatestSyncReceipt())
 
 const readParallelExecutor = createExecutorReader()
-ipcMain.handle('hermes:parallel:read', async (event, reference: unknown) => {
-  // Only the app renderer, never embedded pages or child frames, gets this read-only capability.
+function assertParallelRenderer(event: IpcMainInvokeEvent) {
+  // Only the app renderer, never embedded pages or child frames, gets these scoped capabilities.
   const frameUrl = new URL(event.senderFrame?.url || 'about:blank')
   frameUrl.hash = ''; frameUrl.search = ''
   const allowed = [pathToFileURL(path.join(APP_ROOT, 'dist', 'index.html')).href,
@@ -17396,7 +17396,15 @@ ipcMain.handle('hermes:parallel:read', async (event, reference: unknown) => {
   if (event.senderFrame !== event.sender.mainFrame || !allowed.includes(frameUrl.href)) {
     throw new Error('Executor access is limited to the app renderer')
   }
+}
+ipcMain.handle('hermes:parallel:read', async (event, reference: unknown) => {
+  assertParallelRenderer(event)
   return readParallelExecutor(reference)
+})
+const sendParallelExecutor = createExecutorSender()
+ipcMain.handle('hermes:parallel:send', async (event, reference: unknown, message: unknown) => {
+  assertParallelRenderer(event)
+  return sendParallelExecutor(reference, message)
 })
 
 

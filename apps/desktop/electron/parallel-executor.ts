@@ -1,4 +1,4 @@
-/** Read-only access to the user's tailnet executor. Never fetch a chat-provided origin. */
+/** Scoped access to the user's tailnet executor. Never fetch a chat-provided origin. */
 const HOST = 'mac-mini-de-matheus.tail0673c.ts.net'
 const ORIGIN = `https://${HOST}:8525`
 const UUID = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i
@@ -90,12 +90,10 @@ export function createExecutorReader(fetcher: typeof fetch = fetch) {
         state: states[job.state] || job.state,
         reason: job.reason,
         convs,
-        timeline: (job.events || [])
-          .slice(0, 14)
-          .map((event: any) => ({
-            at: event.at,
-            text: event.data?.message || event.data?.summary || event.kind.replaceAll('_', ' ')
-          }))
+        timeline: (job.events || []).slice(0, 14).map((event: any) => ({
+          at: event.at,
+          text: event.data?.message || event.data?.summary || event.kind.replaceAll('_', ' ')
+        }))
       }
       return {
         kind: 'task',
@@ -116,6 +114,51 @@ export function createExecutorReader(fetcher: typeof fetch = fetch) {
       sourceAt: archived.sourceAt,
       publishedAt: archived.data.at,
       fetchedAt: new Date().toISOString()
+    }
+  }
+}
+
+/** A deliberate user submission only. No retries: a lost response may follow a successful save. */
+export function createExecutorSender(fetcher: typeof fetch = fetch) {
+  return async (url: unknown, value: unknown) => {
+    const ref = executorReference(url)
+    if (ref.kind !== 'conversation') throw new Error('Choose an agent conversation')
+    if (typeof value !== 'string' || !value.trim() || value.length > 20000) throw new Error('Invalid message')
+    try {
+      const response = await fetcher(ORIGIN + '/api/panel/conversation/send', {
+        method: 'POST',
+        redirect: 'error',
+        credentials: 'omit',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: ref.id, text: value.trim() }),
+        signal: AbortSignal.timeout(30000)
+      })
+      if (!response.ok || !response.headers.get('content-type')?.includes('application/json'))
+        throw new Error('Unconfirmed')
+      const reader = response.body?.getReader()
+      if (!reader) throw new Error('Empty receipt')
+      let raw = '',
+        size = 0
+      const decoder = new TextDecoder()
+      try {
+        while (true) {
+          const { done, value: chunk } = await reader.read()
+          if (done) break
+          size += chunk.byteLength
+          if (size > 64000) throw new Error('Invalid receipt')
+          raw += decoder.decode(chunk, { stream: true })
+        }
+        const data = JSON.parse(raw + decoder.decode())
+        if (data.ok !== true || typeof data.msg !== 'string') throw new Error('Unconfirmed')
+        return { ok: true, message: data.msg === 'Enviado' ? 'Mensagem enviada ao agente.' : data.msg.slice(0, 1000) }
+      } finally {
+        await reader.cancel().catch(() => {})
+      }
+    } catch {
+      return {
+        ok: false,
+        message: 'Não foi possível confirmar o envio. Confira as mensagens antes de tentar novamente.'
+      }
     }
   }
 }

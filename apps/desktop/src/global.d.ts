@@ -33,6 +33,7 @@ export type DesktopMachineProfile = MachineProfile
 declare global {
   interface Window {
     hermesDesktop: {
+      sendParallelExecutor?: (reference: string, message: string) => Promise<{ok: boolean; message: string}>
       readParallelExecutor?: (reference: string) => Promise<unknown>
       listLocalApplications?: () => Promise<{
         machine: string

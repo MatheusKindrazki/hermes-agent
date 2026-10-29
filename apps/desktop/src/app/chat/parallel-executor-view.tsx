@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { usePaneVisible } from '@/components/pane-shell/pane-visibility'
 import type { ParallelLink } from './parallel-links'
+import { ExecutorComposer } from './parallel-executor-compose'
 
 type Conversation = {
   id: string
@@ -149,6 +150,9 @@ function ExecutorConversation({ url }: { url: string }) {
             </div>
           ))}
       </div>
+      {conversation && (
+        <ExecutorComposer url={url} recipient={conversation.title || 'Agente desta conversa'} onSent={read.retry} />
+      )}
     </div>
   )
 }
