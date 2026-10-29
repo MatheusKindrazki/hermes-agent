@@ -111,6 +111,7 @@ export function CanonicalGroupList({ onOpen }: { onOpen: (key: string, origin: C
   const labels = useCanonicalGroupLabels()
   const connectionId = useValue(host.state.connectionId)
   const profile = useValue(host.state.profile)
+  const gateway = useValue(host.state.gateway)
   const [rooms, setRooms] = useState<Array<{ key: string; name: string }>>([])
   const [error, setError] = useState('')
   const [refresh, setRefresh] = useState(0)
@@ -118,6 +119,8 @@ export function CanonicalGroupList({ onOpen }: { onOpen: (key: string, origin: C
     let cancelled = false
     setRooms([])
     setError('')
+    // Discover only after reconnection, instead of leaving a startup error in the sidebar.
+    if (!connectionId || gateway !== 'open') return
     void (async () => {
       const route = captureCanonicalGroupRoute()
       const result = await discoverCanonicalGroups(route)
@@ -134,7 +137,7 @@ export function CanonicalGroupList({ onOpen }: { onOpen: (key: string, origin: C
     return () => {
       cancelled = true
     }
-  }, [connectionId, profile, refresh])
+  }, [connectionId, profile, gateway, refresh])
 
   return (
     <div className="grid gap-1 px-2">
