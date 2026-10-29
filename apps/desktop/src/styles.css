@@ -4015,3 +4015,30 @@ html [data-chat-surface][data-chat-persona] [data-slot='aui_assistant-message-co
   background: transparent !important;
   box-shadow: none !important;
 }
+
+.chat-persona-header {
+  padding-block: 0.625rem;
+}
+.chat-persona-header__identity {
+  gap: 0.625rem;
+}
+html [data-chat-surface][data-chat-persona] .connector-execution-details {
+  padding: 0.25rem 0 !important;
+  border: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+.connector-execution-details > summary {
+  cursor: pointer;
+  width: fit-content;
+}
+.connector-execution-details > summary:focus-visible {
+  outline: 2px solid var(--ui-text-secondary);
+  outline-offset: 4px;
+}
+html [data-chat-surface][data-chat-persona] [data-slot='tool-block'] button {
+  padding: 0.25rem 0 !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}

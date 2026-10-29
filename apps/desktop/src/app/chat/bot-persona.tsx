@@ -77,17 +77,21 @@ export function ChatPersonaHeader({ persona }: { persona: NonNullable<ReturnType
             mood={mood}
             name={bot.name}
             shape={appearance.shape}
-            size={48}
+            size={36}
           />
         </div>
         <div className="min-w-0">
           <h1 className="truncate text-[0.9375rem] font-semibold text-(--ui-text-primary)">{title}</h1>
-          <p aria-atomic="true" aria-live="polite" className="mt-1 text-[0.6875rem] text-(--ui-text-tertiary)">{label}</p>
+          <p
+            hidden={status === 'idle'}
+            aria-atomic="true"
+            aria-live="polite"
+            className="mt-1 text-[0.6875rem] text-(--ui-text-tertiary)"
+          >
+            {label}
+          </p>
         </div>
       </div>
-      <span className="chat-persona-header__source" title={bot.connectionLabel || ''}>
-        {bot.connectionLabel || 'Bot Chat'}
-      </span>
     </header>
   )
 }

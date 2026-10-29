@@ -515,7 +515,7 @@ export function ConnectorExecution(props: ToolCallMessagePartProps) {
   const input = recordOf(props.args)
   const batch = Array.isArray(input.calls) ? input.calls : [input]
 
-  return (
+  const rows = (
     <>
       {labels.map((label, index) => {
         // A hosted batch answers one result per call; anything else answers once for the
@@ -538,5 +538,20 @@ export function ConnectorExecution(props: ToolCallMessagePartProps) {
         )
       })}
     </>
+  )
+  // Never collapse failures or unfinished execution.
+  const settled =
+    props.status?.type === 'complete' &&
+    props.result !== undefined &&
+    !props.isError &&
+    !output.error &&
+    !results.some(item => Boolean(recordOf(item).error)) &&
+    (results.length === 0 || results.length >= labels.length)
+  if (!settled) return rows
+  return (
+    <details className="connector-execution-details" data-conversation-scaffold="">
+      <summary className={SCAFFOLD_LABEL_CLASS}>{[...new Set(labels.map(label => label.text))].join(' · ')}</summary>
+      <div className="pt-2">{rows}</div>
+    </details>
   )
 }

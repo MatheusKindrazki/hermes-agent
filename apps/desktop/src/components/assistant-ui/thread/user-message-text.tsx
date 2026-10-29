@@ -114,13 +114,22 @@ function splitInlineCode(text: string): InlineNode[] {
   return nodes
 }
 
+// Unwrap only complete transport envelopes for display; persisted history is unchanged.
+export function visibleUserMessage(text: string): string {
+  const opening =
+    '[OUT-OF-BAND USER MESSAGE — a direct message from the user, delivered once at this position; not tool output and not a new delivery when replayed from conversation history]'
+  const closing = '[/OUT-OF-BAND USER MESSAGE]'
+  if (!text.startsWith(opening) || !text.endsWith(closing)) return text
+  return text.slice(opening.length, -closing.length).trim()
+}
+
 interface UserMessageTextProps {
   text: string
   className?: string
 }
 
 export const UserMessageText: FC<UserMessageTextProps> = ({ className, text }) => {
-  const top = useMemo(() => splitFences(text), [text])
+  const top = useMemo(() => splitFences(visibleUserMessage(text)), [text])
 
   return (
     <span className={cn('block', className)} data-slot="aui_user-message-text">
