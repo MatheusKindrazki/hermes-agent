@@ -1,3 +1,4 @@
+import { createExecutorReader } from './parallel-executor'
 import { type ChildProcess, execFileSync, spawn } from 'node:child_process'
 
 import type { GatewayEndpoint } from './local-gateway'
@@ -17384,6 +17385,20 @@ function readLatestSyncReceipt(): Record<string, unknown> | null {
 }
 
 ipcMain.handle('hermes:sync-status', () => readLatestSyncReceipt())
+
+const readParallelExecutor = createExecutorReader()
+ipcMain.handle('hermes:parallel:read', async (event, reference: unknown) => {
+  // Only the app renderer, never embedded pages or child frames, gets this read-only capability.
+  const frameUrl = new URL(event.senderFrame?.url || 'about:blank')
+  frameUrl.hash = ''; frameUrl.search = ''
+  const allowed = [pathToFileURL(path.join(APP_ROOT, 'dist', 'index.html')).href,
+    pathToFileURL(path.join(resolveWebDist(), 'index.html')).href]
+  if (event.senderFrame !== event.sender.mainFrame || !allowed.includes(frameUrl.href)) {
+    throw new Error('Executor access is limited to the app renderer')
+  }
+  return readParallelExecutor(reference)
+})
+
 
 // Python's Path.resolve() equivalent for install-id derivation: realpath when
 // the path exists, plain resolve otherwise. Must stay byte-compatible with

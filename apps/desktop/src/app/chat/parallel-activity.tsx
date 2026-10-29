@@ -11,6 +11,7 @@ import { $subagentsBySession, reconcileSubagentSnapshot, type SubagentPayload } 
 import { SubagentTranscript } from './composer/status-stack/subagent-transcript'
 import { rejectUnownedSubagentRequest } from './composer/status-stack/use-subagent-snapshot'
 import { parallelLinks } from './parallel-links'
+import { ExecutorLinks } from './parallel-executor-view'
 import { agentExchanges } from './parallel-exchanges'
 import { useSessionView } from './session-view'
 
@@ -75,7 +76,6 @@ function ParallelContent({ sessionId }: { sessionId: string | null }) {
   const [tab, setTab] = useState<'conversations' | 'tasks'>('conversations')
   const [peer, setPeer] = useState<string | null>(null)
   const [expanded, setExpanded] = useState<string | null>(null)
-  const [more, setMore] = useState(false)
   const groups = useMemo(() => {
     const map = new Map<string, { key: string; name: string; rows: typeof exchanges }>()
     for (const entry of exchanges) {
@@ -159,6 +159,7 @@ function ParallelContent({ sessionId }: { sessionId: string | null }) {
             </div>
           ) : (
             <div className="divide-y divide-white/6">
+              <ExecutorLinks links={links.filter(link => link.kind === 'conversation')} />
               {groups.length === 0 ? (
                 <p className="py-8 text-sm text-white/40">Ainda não há trocas entre personagens neste trecho.</p>
               ) : (
@@ -215,31 +216,7 @@ function ParallelContent({ sessionId }: { sessionId: string | null }) {
                 )}
               </div>
             ))}
-            {links.length > 0 && <p className="mt-5 mb-1 text-[11px] text-white/35">Links do histórico</p>}
-            {(more ? links : links.slice(0, 8)).map(link => (
-              <a
-                key={link.url}
-                href={link.url}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="flex items-center gap-3 border-b border-white/6 py-3"
-              >
-                <span className="min-w-0 flex-1">
-                  <span className="line-clamp-2 text-sm text-white/75">{link.title}</span>
-                  <span className="mt-1 block text-[11px] text-white/35">
-                    {link.kind === 'task' ? 'Acompanhar tarefa' : 'Abrir no executor'}
-                  </span>
-                </span>
-                <span aria-hidden className="text-white/30">
-                  ↗
-                </span>
-              </a>
-            ))}
-            {!more && links.length > 8 && (
-              <button type="button" className="mt-4 text-xs text-white/45" onClick={() => setMore(true)}>
-                Ver mais
-              </button>
-            )}
+            <ExecutorLinks links={links.filter(link => link.kind === 'task')} />
             {load === 'ready' && agents.length === 0 && links.length === 0 && (
               <p className="py-4 text-sm text-white/40">Nenhuma tarefa disponível neste trecho.</p>
             )}
