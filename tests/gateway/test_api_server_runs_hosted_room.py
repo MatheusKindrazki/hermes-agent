@@ -1,3 +1,4 @@
+from tests.gateway.test_api_server_runs_idempotency import _use_idempotency_db
 """Tests for /v1/runs under hosted-room grants (``HermesRoom`` authorization).
 
 Covers room-member invitations/grants driving runs: exact approval request ids,
@@ -17,7 +18,6 @@ from gateway.platforms.api_server_runs import _RunStream
 from tests.gateway.test_api_server_runs import (
     _create_runs_app,
     _make_adapter,
-    _use_idempotency_db,
 )
 from tools import approval as approval_mod
 from tools import approval_gateway_wait

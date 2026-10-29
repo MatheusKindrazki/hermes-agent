@@ -8,7 +8,8 @@ that just failed — so the retry re-fails and later attempts abort without a se
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from agent.context_compressor import ContextCompressor, pin_summary_route
+from agent.context_compressor import (ContextCompressor)
+from agent.context_compressor_route import (pin_summary_route)
 
 
 def _compressor():

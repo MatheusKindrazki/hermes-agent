@@ -110,7 +110,7 @@ export function retireTurnToolProgress(eventType: string, sessionId: string): vo
 /** tool.generating / tool.start / tool.complete / subagent.*. */
 export function handleToolEvent(ctx: GatewayEventContext): boolean {
   const { deps, event, payload, sessionId, isActiveEvent, occurredAt } = ctx
-  const { flushQueuedDeltas, nativeSubagentSessionsRef, sessionInterrupted, updateSessionState, upsertToolCall } = deps
+  const { flushQueuedDeltas, nativeSubagentSessionsRef, sessionInterrupted, upsertToolCall } = deps
 
   if (event.type === 'todo.updated') {
     if (sessionId && !sessionInterrupted(sessionId)) {
@@ -169,69 +169,7 @@ export function handleToolEvent(ctx: GatewayEventContext): boolean {
   }
 
   if (event.type === 'tool.complete') {
-    if (sessionId) {
-      flushQueuedDeltas(sessionId)
-
-      if (typeof payload?.name === 'string') {
-        recordExecutingTool(
-          sessionId,
-          String(payload.tool_id ?? payload.tool_call_id ?? payload.id ?? payload.name),
-          payload.name,
-          false
-        )
-      }
-
-      const state = $sessionStates.get()[sessionId]
-      // Read before the upsert seals the part: only a completion that resolves
-      // a still-pending call is a fresh production; a duplicate or replayed
-      // completion may never re-offer a dismissed target.
-      const pendingProduction = !event.replayed && Boolean(toolCallOwnerMessageId(state?.messages ?? [], payload))
-
-      upsertToolCall(sessionId, toTodoPayload(payload) ?? payload, 'complete', event.type, occurredAt)
-
-      noteToolOutcome(ctx, sessionId, state?.cwd ?? '', pendingProduction)
-
-      if (isActiveEvent) {
-        setPetActivity({ toolRunning: false })
-
-        // A tool can fail without ending the turn when the agent recovers
-        // and continues. Surface that failure as a short pet beat too;
-        // otherwise only turn-level errors ever reach the failed state.
-        if (payload?.error) {
-          flashPetActivity({ error: true })
-        }
-      }
-
-      // A pending clarify blocks the turn, so the first tool.complete after
-      // one is the clarify resolving — drop the "needs input" flag here so
-      // the sidebar indicator clears as soon as it's answered, not only at
-      // message.complete.
-      updateSessionState(sessionId, state => (state.needsInput ? { ...state, needsInput: false } : state))
-
-      // terminal/process tool calls are the only things that spawn or reap
-      // background processes — sync the composer status stack right after,
-      // even on an interrupted turn (idempotent re-sync; the 5s poll may be
-      // unarmed when no running row is on screen yet, #81114).
-      if (payload?.name === 'terminal' || payload?.name === 'process') {
-        void refreshBackgroundProcesses(sessionId)
-      }
-    }
-
-    // The agent just created/deleted/renamed a skill, which adds or removes
-    // its `/name` command. Drop the composer's cached `/` list so the new
-    // skill is offerable now rather than after the hour-long TTL.
-    if (payload?.name === 'skill_manage') {
-      invalidateSlashCompletions()
-    }
-
-    // A file-mutating tool just finished — nudge the git-mirroring surfaces
-    // (coding rail, review pane, file tree) to refresh. Event-driven, not
-    // polled: fires exactly when the agent touches the tree.
-    if (payload && toolMayMutateFiles(payload)) {
-      notifyWorkspaceChanged(toolChangedPath(payload))
-    }
-
-    return true
+    return handleToolComplete(ctx)
   }
 
   if (SUBAGENT_EVENT_TYPES.has(event.type)) {
@@ -262,4 +200,72 @@ export function handleToolEvent(ctx: GatewayEventContext): boolean {
   }
 
   return false
+}
+
+function handleToolComplete(ctx: GatewayEventContext): boolean {
+  const { deps, event, payload, sessionId, isActiveEvent, occurredAt } = ctx
+  const { flushQueuedDeltas, updateSessionState, upsertToolCall } = deps
+  if (sessionId) {
+    flushQueuedDeltas(sessionId)
+
+    if (typeof payload?.name === 'string') {
+      recordExecutingTool(
+        sessionId,
+        String(payload.tool_id ?? payload.tool_call_id ?? payload.id ?? payload.name),
+        payload.name,
+        false
+      )
+    }
+
+    const state = $sessionStates.get()[sessionId]
+    // Read before the upsert seals the part: only a completion that resolves
+    // a still-pending call is a fresh production; a duplicate or replayed
+    // completion may never re-offer a dismissed target.
+    const pendingProduction = !event.replayed && Boolean(toolCallOwnerMessageId(state?.messages ?? [], payload))
+
+    upsertToolCall(sessionId, toTodoPayload(payload) ?? payload, 'complete', event.type, occurredAt)
+
+    noteToolOutcome(ctx, sessionId, state?.cwd ?? '', pendingProduction)
+
+    if (isActiveEvent) {
+      setPetActivity({ toolRunning: false })
+
+      // A tool can fail without ending the turn when the agent recovers
+      // and continues. Surface that failure as a short pet beat too;
+      // otherwise only turn-level errors ever reach the failed state.
+      if (payload?.error) {
+        flashPetActivity({ error: true })
+      }
+    }
+
+    // A pending clarify blocks the turn, so the first tool.complete after
+    // one is the clarify resolving — drop the "needs input" flag here so
+    // the sidebar indicator clears as soon as it's answered, not only at
+    // message.complete.
+    updateSessionState(sessionId, state => (state.needsInput ? { ...state, needsInput: false } : state))
+
+    // terminal/process tool calls are the only things that spawn or reap
+    // background processes — sync the composer status stack right after,
+    // even on an interrupted turn (idempotent re-sync; the 5s poll may be
+    // unarmed when no running row is on screen yet, #81114).
+    if (payload?.name === 'terminal' || payload?.name === 'process') {
+      void refreshBackgroundProcesses(sessionId)
+    }
+  }
+
+  // The agent just created/deleted/renamed a skill, which adds or removes
+  // its `/name` command. Drop the composer's cached `/` list so the new
+  // skill is offerable now rather than after the hour-long TTL.
+  if (payload?.name === 'skill_manage') {
+    invalidateSlashCompletions()
+  }
+
+  // A file-mutating tool just finished — nudge the git-mirroring surfaces
+  // (coding rail, review pane, file tree) to refresh. Event-driven, not
+  // polled: fires exactly when the agent touches the tree.
+  if (payload && toolMayMutateFiles(payload)) {
+    notifyWorkspaceChanged(toolChangedPath(payload))
+  }
+
+  return true
 }

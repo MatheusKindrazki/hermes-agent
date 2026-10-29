@@ -29,52 +29,18 @@ export function resolvePinnedLocalBackend(options: {
   }
 
   if (!override) {
-    let stat
+    const pin = readRuntimePin(pinPath, options.bundled, fail)
 
-    try {
-      stat = lstatSync(pinPath)
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {return null}
-
-      return fail('the pin cannot be read')
-    }
-
-    if (options.bundled)
-      {return fail('this app contains a bundled runtime; use the thin Desktop build for an external runtime pin')}
-
-    if (!stat.isFile() || stat.isSymbolicLink()) {return fail('the pin must be a regular file')}
-
-    if (process.platform !== 'win32' && (stat.uid !== process.getuid?.() || (stat.mode & 0o022) !== 0)) {
-      return fail('the pin must be owned by this user and not writable by other users')
-    }
-
-    let value: unknown
-
-    try {
-      value = JSON.parse(readFileSync(pinPath, 'utf8'))
-    } catch {
-      return fail('invalid JSON')
-    }
-
-    if (!value || typeof value !== 'object' || Array.isArray(value)) {return fail('expected a versioned runtime object')}
-    const pin = value as Record<string, unknown>
-
-    if (pin.version !== 1 || Object.keys(pin).some(key => !['version', 'root', 'python'].includes(key))) {
-      return fail('unsupported pin schema (expected version 1, root and optional python)')
-    }
+    if (!pin) {return null}
 
     root = pin.root
     python = env.HERMES_DESKTOP_PYTHON ?? pin.python
   }
 
-  if (typeof root !== 'string' || !path.isAbsolute(root)) {return fail('root must be an absolute source directory')}
-
-  if (python !== undefined && (typeof python !== 'string' || !path.isAbsolute(python))) {
-    return fail('python must be an absolute executable path')
-  }
+  validateRuntimePaths(root, python, fail)
 
   try {
-    root = realpathSync(root)
+    root = realpathSync(root as string)
 
     if (!statSync(path.join(root as string, 'hermes_cli', 'main.py')).isFile()) {return fail('root has no Hermes CLI')}
   } catch {
@@ -101,6 +67,44 @@ export function resolvePinnedLocalBackend(options: {
   return backend
 }
 
+/** Validate deployment authority before interpreting any runtime path. */
+function readRuntimePin(pinPath: string, bundled: boolean | undefined, fail: (reason: string) => never): Record<string, unknown> | null {
+  let stat
+
+  try {
+    stat = lstatSync(pinPath)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {return null}
+
+    return fail('the pin cannot be read')
+  }
+
+  if (bundled)
+    {return fail('this app contains a bundled runtime; use the thin Desktop build for an external runtime pin')}
+
+  if (!stat.isFile() || stat.isSymbolicLink()) {return fail('the pin must be a regular file')}
+
+  if (process.platform !== 'win32' && (stat.uid !== process.getuid?.() || (stat.mode & 0o022) !== 0)) {
+    return fail('the pin must be owned by this user and not writable by other users')
+  }
+
+  let value: unknown
+
+  try {
+    value = JSON.parse(readFileSync(pinPath, 'utf8'))
+  } catch {
+    return fail('invalid JSON')
+  }
+
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {return fail('expected a versioned runtime object')}
+  const pin = value as Record<string, unknown>
+
+  if (pin.version !== 1 || Object.keys(pin).some(key => !['version', 'root', 'python'].includes(key))) {
+    return fail('unsupported pin schema (expected version 1, root and optional python)')
+  }
+  return pin
+}
+
 /** The Desktop client updates a local installation even while its active chat is remote. */
 export function resolveLocalUpdateRoot(options: {
   userData: string
@@ -116,4 +120,13 @@ export function resolveLocalUpdateRoot(options: {
   })
 
   return pinned?.root ?? options.fallback()
+}
+
+function validateRuntimePaths(root: unknown, python: unknown, fail: (reason: string) => never) {
+  if (typeof root !== 'string' || !path.isAbsolute(root)) {return fail('root must be an absolute source directory')}
+
+  if (python !== undefined && (typeof python !== 'string' || !path.isAbsolute(python))) {
+    return fail('python must be an absolute executable path')
+  }
+
 }

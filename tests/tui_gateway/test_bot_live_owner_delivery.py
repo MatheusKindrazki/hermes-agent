@@ -27,7 +27,7 @@ def test_refused_input_commits_failed_mailbox_receipt(tmp_path):
     session = dict(agent=agent, session_key="chat", history_lock=threading.RLock(), running=True)
     retired = []
     noop = lambda *args, **kwargs: None
-    submit = rebind(prompt_turn._run_prompt_submit, {
+    bindings = {
         "threading": threading, "time": time, "logger": logging.getLogger(__name__),
         "_start_session_work": _start_session_work,
         "_sessions_lock": threading.RLock(), "_sessions": {},
@@ -48,7 +48,9 @@ def test_refused_input_commits_failed_mailbox_receipt(tmp_path):
         "_reopen_routed_session_row": noop,
         # Every dispatch binds the session's own row before the turn writes (#111999).
         "_ensure_session_db_row": noop,
-    })
+    }
+    bindings["_run_prompt_submit_inner"] = rebind(prompt_turn._run_prompt_submit_inner, bindings)
+    submit = rebind(prompt_turn._run_prompt_submit, bindings)
     def terminal(outcome):
         mailbox.complete_delivery(tmp_path, queued["id"], status=outcome["status"],
                                   error=outcome.get("error", ""))

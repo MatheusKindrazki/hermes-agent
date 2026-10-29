@@ -213,6 +213,10 @@ function isPreAdmissionRefusal(error: unknown): boolean {
   return code === 4094 || (code === 4000 && typeof message === 'string' && /submission_id/.test(message))
 }
 
+function resolveSubmissionId(retainedId: string | undefined, options?: SubmitTextOptions) {
+  return retainedId ?? options?.submission_id ?? options?.sourceEventId ?? createPromptSourceEventId()
+}
+
 export function useSubmitPrompt(deps: SubmitPromptDeps) {
   const {
     activeSessionIdRef,
@@ -514,7 +518,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         : captured
 
       let requestGateway = destination.requestGateway
-      const submissionId = retained?.id ?? options?.submission_id ?? options?.sourceEventId ?? createPromptSourceEventId()
+      const submissionId = resolveSubmissionId(retained?.id, options)
 
       let startingStoredSessionId = routedSessionNeedsResume
         ? routedStoredSessionId

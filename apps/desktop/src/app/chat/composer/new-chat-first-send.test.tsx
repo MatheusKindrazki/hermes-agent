@@ -92,7 +92,7 @@ it('a new chat first send keeps its creation-time draft, queues on the new chat 
   const file: ComposerAttachment = { id: 'file:notes', kind: 'file', label: 'notes.txt' }
 
   $sessionStates.set({ 'session-a': { storedSessionId: 'session-a' } as ClientSessionState })
-  enqueueQueuedPrompt('session-a', { attachments: [], id: 'for-a', text: 'for A' })
+  enqueueQueuedPrompt('session-a', { attachments: [], id: '11111111-1111-4111-8111-111111111111', text: 'for A' })
 
   const view = render(
     <Harness busy freshDraftKey={freshDraftKey} latest={latest} onSubmit={onSubmit} queueSessionKey="session-a" sessionId="session-a" />
@@ -139,7 +139,7 @@ it('a new chat first send keeps its creation-time draft, queues on the new chat 
   await vi.waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
   expect(onSubmit.mock.calls[0]?.[0]).toBe('follow-up')
   expect(onSubmit.mock.calls[0]?.[1]).toMatchObject({ sessionId: 'rt-new', storedSessionId: 'stored-new' })
-  expect(getQueuedPrompts('session-a').map(entry => entry.id)).toEqual(['for-a'])
+  expect(getQueuedPrompts('session-a').map(entry => entry.id)).toEqual(['11111111-1111-4111-8111-111111111111'])
   expect(getQueuedPrompts(freshDraftKey)).toEqual([])
 })
 
@@ -150,7 +150,7 @@ it('a follow-up queued while session.create is in flight moves to the new chat a
   const latest: { current: Composer | null } = { current: null }
 
   $sessionStates.set({ 'session-a': { storedSessionId: 'session-a' } as ClientSessionState })
-  enqueueQueuedPrompt('session-a', { attachments: [], id: 'for-a', text: 'for A' })
+  enqueueQueuedPrompt('session-a', { attachments: [], id: '11111111-1111-4111-8111-111111111111', text: 'for A' })
 
   const view = render(
     <Harness busy freshDraftKey={freshDraftKey} latest={latest} onSubmit={onSubmit} queueSessionKey={null} sessionId="session-a" />
@@ -187,7 +187,7 @@ it('a follow-up queued while session.create is in flight moves to the new chat a
   await vi.waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
   expect(onSubmit.mock.calls[0]?.[0]).toBe('follow-up')
   expect(onSubmit.mock.calls[0]?.[1]).toMatchObject({ sessionId: 'rt-new', storedSessionId: 'stored-new' })
-  expect(getQueuedPrompts('session-a').map(entry => entry.id)).toEqual(['for-a'])
+  expect(getQueuedPrompts('session-a').map(entry => entry.id)).toEqual(['11111111-1111-4111-8111-111111111111'])
   expect(getQueuedPrompts(freshDraftKey)).toEqual([])
 })
 
@@ -214,7 +214,7 @@ it('a session already claimed elsewhere never hands its queue to the new chat on
   const onSubmit = vi.fn<ChatBarProps['onSubmit']>(async () => true)
 
   $sessionStates.set({ 'session-a': { storedSessionId: 'session-a' } as ClientSessionState })
-  enqueueQueuedPrompt('session-a', { attachments: [], id: 'for-a', text: 'for A' })
+  enqueueQueuedPrompt('session-a', { attachments: [], id: '11111111-1111-4111-8111-111111111111', text: 'for A' })
 
   const view = render(
     <Harness busy freshDraftKey={freshDraftKey} latest={latest} onSubmit={onSubmit} queueSessionKey="session-a" sessionId="session-a" />
@@ -228,6 +228,6 @@ it('a session already claimed elsewhere never hands its queue to the new chat on
     )
   )
 
-  expect(getQueuedPrompts('session-a').map(entry => entry.id)).toEqual(['for-a'])
+  expect(getQueuedPrompts('session-a').map(entry => entry.id)).toEqual(['11111111-1111-4111-8111-111111111111'])
   expect(getQueuedPrompts('stored-new')).toEqual([])
 })

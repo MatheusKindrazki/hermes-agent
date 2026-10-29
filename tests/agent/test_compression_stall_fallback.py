@@ -24,11 +24,8 @@ import threading
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from agent.context_compressor import (
-    ContextCompressor,
-    pin_summary_route,
-    take_pinned_summary_route,
-)
+from agent.context_compressor import (ContextCompressor)
+from agent.context_compressor_route import (pin_summary_route, take_pinned_summary_route)
 from agent.conversation_compression import (
     CompressionCommitFence,
     resolve_compression_fallback_route,

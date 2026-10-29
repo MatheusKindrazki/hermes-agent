@@ -1239,6 +1239,50 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             raise RuntimeStoreError('profile_mismatch')
         return False, None
 
+    def _record_admitted_inbound_origin(self, event, source, is_internal):
+        """Publish ingress provenance only after its durable admission succeeded."""
+        if not is_internal:
+            from agent.durable_admission import capture_effect_origin, platform_event_id, publish_effect_origin
+
+            _raw_event = getattr(event, "message_id", None)
+            if _raw_event in (None, ""):
+                _raw_event = getattr(event, "platform_update_id", None)
+            _platform = getattr(getattr(source, "platform", None), "value", "") or "hermes"
+            publish_effect_origin(capture_effect_origin(
+                self._session_key_for_source(source), platform_event_id(_platform, _raw_event),
+            ))
+        if not is_internal:
+            from hermes_cli.observability.shared_metrics_events import record_gateway_slash_command
+            record_gateway_slash_command(event)
+
+    def _admit_durable_inbound(self, event, source, is_internal):
+        """Return a refusal before any input rewrites or model execution."""
+        try:
+            from agent.durable_admission import ModeError as _K8ModeError
+            from agent.durable_admission import resolve_mode as _k8_resolve_mode
+
+            _k8_on = _k8_resolve_mode()
+        except _K8ModeError as _k8_mode_exc:
+            # A misconfigured mode is not "off". An operator who typo'd the
+            # arming value asked for enforcement and must not silently get
+            # none, so the turn stops here — before any config, subprocess or
+            # model — with a stable refusal.
+            logger.error("durable admission mode refused: %s", _k8_mode_exc)
+            return (
+                "This message was not processed: the durable-admission mode "
+                "setting is not recognised, so the work ledger could not be "
+                "consulted. Nothing has run."
+            )
+        except Exception:
+            logger.debug("durable admission probe failed", exc_info=True)
+            _k8_on = False
+        if _k8_on and not is_internal:
+            _k8_blocked = self._k8_admit_inbound(event, source)
+            if _k8_blocked is not None:
+                return _k8_blocked
+
+        return None
+
     async def _handle_message_with_effect_scope(self, event: MessageEvent) -> Optional[str]:
         """Handle an incoming message from any platform: auth → command check → running-agent
         interrupt → get/create session → build context → run agent → return response."""
@@ -1266,43 +1310,11 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         # With K8 unarmed this is one environment read and a None. The
         # ContextVar the helper publishes is scoped to this per-message asyncio
         # task's context, so it is this request's and no sibling's.
-        try:
-            from agent.durable_admission import ModeError as _K8ModeError
-            from agent.durable_admission import resolve_mode as _k8_resolve_mode
+        refusal = self._admit_durable_inbound(event, source, is_internal)
+        if refusal is not None:
+            return refusal
 
-            _k8_on = _k8_resolve_mode()
-        except _K8ModeError as _k8_mode_exc:
-            # A misconfigured mode is not "off". An operator who typo'd the
-            # arming value asked for enforcement and must not silently get
-            # none, so the turn stops here — before any config, subprocess or
-            # model — with a stable refusal.
-            logger.error("durable admission mode refused: %s", _k8_mode_exc)
-            return (
-                "This message was not processed: the durable-admission mode "
-                "setting is not recognised, so the work ledger could not be "
-                "consulted. Nothing has run."
-            )
-        except Exception:
-            logger.debug("durable admission probe failed", exc_info=True)
-            _k8_on = False
-        if _k8_on and not is_internal:
-            _k8_blocked = self._k8_admit_inbound(event, source)
-            if _k8_blocked is not None:
-                return _k8_blocked
-
-        if not is_internal:
-            from agent.durable_admission import capture_effect_origin, platform_event_id, publish_effect_origin
-
-            _raw_event = getattr(event, "message_id", None)
-            if _raw_event in (None, ""):
-                _raw_event = getattr(event, "platform_update_id", None)
-            _platform = getattr(getattr(source, "platform", None), "value", "") or "hermes"
-            publish_effect_origin(capture_effect_origin(
-                self._session_key_for_source(source), platform_event_id(_platform, _raw_event),
-            ))
-        if not is_internal:
-            from hermes_cli.observability.shared_metrics_events import record_gateway_slash_command
-            record_gateway_slash_command(event)
+        self._record_admitted_inbound_origin(event, source, is_internal)
         # TERMINAL-DECLINE LATCH TEARDOWN. Deliberately placed AFTER admission,
         # not on the adapter's raw inbound: profile routing, the ignored-channel
         # guard, plugin hooks and user authorization all reject events above,
@@ -1395,6 +1407,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
                     agent_result=_agent_result, source=source, is_internal=is_internal, event=event,
                 )
             except Exception as _goal_exc:
+                logging.getLogger(__name__).debug('GatewayInboundMixin._handle_message_with_effect_scope: optional operation failed', exc_info=True)
                 logger.debug("post-turn hook failed: %s", _goal_exc)
             return _agent_result
         finally:

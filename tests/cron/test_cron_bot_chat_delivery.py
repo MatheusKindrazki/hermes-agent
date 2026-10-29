@@ -13,13 +13,8 @@ import pytest
 from cron import scheduler as sched
 from cron import scheduler_delivery as sched_delivery
 from cron.scheduler import _resolve_delivery_targets
-from cron.scheduler_delivery import (
-    BOT_CHAT_PLATFORM, BOT_CHAT_NOTIFY_PLATFORM,
-    _deliver_to_bot_chat,
-    _resolve_bot_chat_target,
-    parse_bot_chat_deliver_token,
-    parse_bot_chat_notify_deliver_token,
-)
+from cron.scheduler_delivery import (BOT_CHAT_PLATFORM, _deliver_to_bot_chat, _resolve_bot_chat_target, parse_bot_chat_deliver_token)
+from cron.scheduler_bot_notification import (BOT_CHAT_NOTIFY_PLATFORM, parse_bot_chat_notify_deliver_token)
 from cron.scheduler_preflight import _preflight_check_delivery
 
 

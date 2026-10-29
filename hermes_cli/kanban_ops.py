@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from hermes_cli import kanban_worker_command
+
 import argparse
 import json
 import os
@@ -66,17 +68,17 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         _cfg = load_config()
         _kanban_cfg = _cfg.get("kanban", {}) if isinstance(_cfg, dict) else {}
         default_assignee = (_kanban_cfg.get("default_assignee") or "").strip() or None
-        max_in_progress_per_profile = kbd._positive_int(
+        max_in_progress_per_profile = kanban_worker_command._positive_int(
             _kanban_cfg.get("max_in_progress_per_profile"), None
         )
         # Memory-derived default when unset — same fallback the gateway applies.
         max_in_progress = kbd.resolve_max_in_progress(
-            kbd._positive_int(_kanban_cfg.get("max_in_progress"), None)
+            kanban_worker_command._positive_int(_kanban_cfg.get("max_in_progress"), None)
         )
         # CLI --max is the more explicit signal, so it wins over kanban.max_spawn.
         cli_max = getattr(args, "max", None)
         max_spawn = (
-            cli_max if cli_max is not None else kbd._positive_int(_kanban_cfg.get("max_spawn"), None)
+            cli_max if cli_max is not None else kanban_worker_command._positive_int(_kanban_cfg.get("max_spawn"), None)
         )
     except Exception:
         default_assignee = max_in_progress_per_profile = max_in_progress = None

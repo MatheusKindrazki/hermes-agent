@@ -101,7 +101,7 @@ def _find_persisted_delivery(session_db: Any, session_id: str, envelope: Mapping
         if tip and tip not in candidates:
             candidates.append(tip)
     except Exception:
-        pass
+        logging.getLogger(__name__).debug('_find_persisted_delivery: optional operation failed', exc_info=True)
     offset = 0
     while True:
         try:
@@ -110,6 +110,7 @@ def _find_persisted_delivery(session_db: Any, session_id: str, envelope: Mapping
                 project_compression_tips=False, include_hidden=True, include_archived=True,
             )
         except Exception:
+            logging.getLogger(__name__).debug('_find_persisted_delivery: optional operation failed', exc_info=True)
             rows = []
         for session in rows:
             candidate = str(session.get("id") or "") if isinstance(session, dict) else ""

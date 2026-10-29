@@ -18,7 +18,7 @@ import pytest
 
 from gateway import shutdown_flush
 from gateway.session import SessionStore
-from agent.conversation_compression import DurableCompressionTurnSpool
+from agent.conversation_compression_spool import (DurableCompressionTurnSpool)
 
 
 def _make_store(db):

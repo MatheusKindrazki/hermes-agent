@@ -238,6 +238,7 @@ def _relay_enforce_refusal() -> Optional[str]:
             return None
         revalidate_current_turn_identity()
     except Exception as exc:
+        logging.getLogger(__name__).debug('_relay_enforce_refusal: optional operation failed', exc_info=True)
         return _err(f"Desktop relay authority refused: {type(exc).__name__}: {exc}")
     return _err(
         "Desktop relay has no durable destination ACK; delivery is disabled under enforce."
@@ -284,6 +285,7 @@ def message_agent_tool(
             return _err("This install is not Bot-Mode-managed (no bot roster); "
                         "message_agent is unavailable. Do not retry.")
     except Exception as exc:  # pragma: no cover — defensive
+        logging.getLogger(__name__).debug('Recoverable operation failed', exc_info=True)
         return _err(f"Bot Mode gate check failed: {exc}")
     from hermes_cli.observability.shared_metrics_signals import record_feature_used
     record_feature_used("bot_mode", hermes_home=home)
@@ -577,7 +579,7 @@ def _delivery_ledger_lock(idempotency_key: str):
                 try:
                     msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)  # type: ignore[name-defined]  # pragma: no cover
                 except Exception:
-                    pass
+                    logging.getLogger(__name__).debug('_delivery_ledger_lock: optional operation failed', exc_info=True)
             else:
                 fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
@@ -702,6 +704,7 @@ def _update_delivery_receipt(dm_file: str, state: str, *, ack: Optional[dict[str
                 return
             return _update_delivery_receipt_inner(dm_file, state, ack=ack, ack_row_validated=ack_row_validated)
     except Exception:
+        logging.getLogger(__name__).debug('_update_delivery_receipt: optional operation failed', exc_info=True)
         observation_gap(record.get("observation"), "ledger_failed")
 
 
@@ -753,6 +756,7 @@ def _settle_enforced_delivery(record: dict, path: Path, ack: dict, *, ack_row_va
             record["release_receipt"] = release_observed_effect(record["turn_identity"], record["release_event_id"])
             record["release_state"] = "acknowledged"
         except Exception:
+            logging.getLogger(__name__).debug('_settle_enforced_delivery: optional operation failed', exc_info=True)
             record["release_state"] = "unknown"
     _atomic_json(path, record)
     _atomic_json(_delivery_ledger_path(record["idempotency_key"]), record)
@@ -770,6 +774,7 @@ def _settle_observed_delivery(record: dict, path: Path, ack: dict, *, ack_row_va
         if spool is None:
             raise ValueError("spool disabled")
     except Exception:
+        logging.getLogger(__name__).debug('_settle_observed_delivery: optional operation failed', exc_info=True)
         observation_gap(observation, "spool_failed")
         return
     try:
@@ -779,11 +784,13 @@ def _settle_observed_delivery(record: dict, path: Path, ack: dict, *, ack_row_va
         _atomic_json(ledger, record)
         ledger_hash = hashlib.sha256(ledger.read_bytes()).hexdigest()
     except Exception:
+        logging.getLogger(__name__).debug('_settle_observed_delivery: optional operation failed', exc_info=True)
         observation_gap(observation, "ledger_failed")
         return
     try:
         release = release_observed_effect(record["turn_identity"], record["release_event_id"])
     except Exception:
+        logging.getLogger(__name__).debug('_settle_observed_delivery: optional operation failed', exc_info=True)
         observation_gap(observation, "release_ambiguous")
         return
     try:
@@ -804,6 +811,7 @@ def _settle_observed_delivery(record: dict, path: Path, ack: dict, *, ack_row_va
             "release_receipt_sha256": _canonical_sha256(release),
         })
     except Exception:
+        logging.getLogger(__name__).debug('_settle_observed_delivery: optional operation failed', exc_info=True)
         observation_gap(observation, "storage_failed")
 
 
@@ -811,7 +819,9 @@ def _emit_delivery_shadow_receipt(
     record: dict[str, Any], state: str, *, ack_bytes: Optional[str] = None
 ) -> Optional[Path]:
     """Observe a terminal DM effect only with an upstream-validated fence."""
-    if os.environ.get("HERMES_KERNEL_SHADOW_PRODUCER_ENABLED", "0") != "1":
+    from hermes_cli.operational_settings import shadow_producer_enabled
+
+    if not shadow_producer_enabled():
         return
     if state != "delivered" or not ack_bytes:
         return
@@ -996,19 +1006,6 @@ def _live_intent_file(dm_file: str | os.PathLike) -> str:
     return f"{os.fspath(dm_file)}.live.json"
 
 
-def _delivery_runtime_env() -> dict[str, str]:
-    """Keep internal Hermes CLI children on the runner's selected release.
-
-    Terminal tools intentionally remove Hermes-owned PYTHONPATH entries. The
-    delivery runner restores its own source only for its internal transport;
-    otherwise a borrowed interpreter can import an older editable installation.
-    """
-    env = dict(os.environ)
-    root = str(Path(__file__).resolve().parents[1])
-    entries = [entry for entry in env.get("PYTHONPATH", "").split(os.pathsep)
-               if entry and entry != root]
-    env["PYTHONPATH"] = os.pathsep.join([root, *entries])
-    return env
 
 
 def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, str]] = None) -> int:
@@ -1019,7 +1016,7 @@ def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, st
 
     def _turn(turn_env=env):
         return subprocess.run([*argv, "--query-file", dm_file], check=False, stdin=subprocess.DEVNULL,
-                              capture_output=True, text=True, encoding="utf-8", errors="replace", env=turn_env)
+                              capture_output=True, text=True, encoding="utf-8", errors="replace", env=turn_env, timeout=_LIVE_WAIT_MAX_SECONDS)
 
     proc = _turn()
     if proc.returncode != 0:
@@ -1267,6 +1264,117 @@ def _runner_argv(args: list[str]) -> tuple[Optional[str], str, str, list[str]] |
     return author, rest[0], rest[1], rest[2:]
 
 
+def _run_live_delivery(argv, dm_file, profile_home, author):
+    """Admit once to the canonical owner; only its settled receipt proves delivery."""
+    home = profile_home or _local_delivery_home(argv)
+    if home is None and not os.path.exists(_live_intent_file(dm_file)):
+        print(json.dumps({"reason": "runtime_unavailable", "error": "No canonical Bot Chat authority; payload retained."}))
+        return 1, None
+    try:
+        live_record = _admit_live_dm(home, dm_file, author)
+    except LiveTargetHeldError as exc:
+        print(_settled_no_send(dm_file, exc))
+        return 1, None
+    except LiveTargetUnavailableError as exc:
+        print(_unavailable_payload(dm_file, exc))
+        return 1, None
+    except Exception as exc:
+        logging.getLogger(__name__).debug('Recoverable operation failed', exc_info=True)
+        print(_live_outcome_unknown(dm_file, exc))
+        return 1, None
+    if live_record is None:
+        print(json.dumps({"reason": "runtime_unavailable", "error": "No canonical Bot Chat authority; payload retained."}))
+        return 1, None
+    live_state = "unknown"
+    def capture_live_status(status):
+        nonlocal live_state
+        live_state = "delivered" if status == "settled" else (
+            "failed" if status in ("failed", "cancelled") else "unknown")
+    returncode = _wait_live_dm(live_record["profile_home"], live_record["delivery_id"],
+                               dm_file=dm_file, on_result=capture_live_status)
+    return returncode, live_state
+
+
+def _run_delivery_transport(transport_argv, dm_file, stdin_file, env):
+    """Run the declared transport, retrying only an explicit retryable failure."""
+    if stdin_file:
+        # Keep the file open until the transport exits; cleanup occurs
+        # after subprocess.run returns, not merely after stdin reaches EOF.
+        with open(dm_file, "r", encoding="utf-8-sig") as stream:
+            proc = subprocess.run(
+                transport_argv, input=stream.read(), check=False, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", env=env, timeout=_LIVE_WAIT_MAX_SECONDS,
+            )
+    else:
+        proc = subprocess.run(
+            [*transport_argv, "--query-file", dm_file],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8", errors="replace", env=env, timeout=_LIVE_WAIT_MAX_SECONDS,
+        )
+    if proc.returncode != 0 and not stdin_file:
+        from tools.bot_failure_reasons import (
+            RETRY_NONE,
+            classify_agent_error,
+            retry_action,
+            turn_failure_text,
+        )
+        from tools.bot_relay import retry_turn_env
+
+        detail = turn_failure_text(proc.stdout, proc.stderr)
+        if retry_action(classify_agent_error(detail)) != RETRY_NONE:
+            proc = subprocess.run(
+                [*transport_argv, "--query-file", dm_file],
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8", errors="replace",
+                env=retry_turn_env(env), timeout=_LIVE_WAIT_MAX_SECONDS,
+            )
+
+    return proc
+
+
+def _consume_delivery_transport(proc, record, argv, *, structured: bool, stdin_file: bool):
+    """Validate transport ACK evidence and forward its response streams."""
+    returncode, ack, ack_row_validated = proc.returncode, None, False
+    # Re-emit the transport's streams: stdout is the reply text the
+    # completion notification carries back to the sending agent.
+    if structured and proc.returncode == 0:
+        try:
+            payload = json.loads(proc.stdout or "")
+            ack = _validated_delivery_ack(
+                payload, record,
+                expected_adapter="api_server" if stdin_file else "cli",
+            )
+            if not stdin_file:
+                _validate_local_ack_against_destination(ack, record, argv)
+                ack_row_validated = True
+            reply = str(payload.get("reply") or "")
+        except Exception as exc:
+            if record.get("observation"):
+                from agent.durable_admission import observation_gap
+                observation_gap(record["observation"], "ack_missing")
+                ack = None
+                reply = proc.stdout or ""
+            else:
+                if not isinstance(exc, (TypeError, ValueError)):
+                    raise
+                returncode = 1
+                reply = ""
+        if reply:
+            sys.stdout.write(reply)
+            sys.stdout.flush()
+    elif proc.stdout:
+        sys.stdout.write(proc.stdout)
+        sys.stdout.flush()
+    if proc.stderr:
+        sys.stderr.write(proc.stderr)
+        sys.stderr.flush()
+    return returncode, ack, ack_row_validated
+
+
 def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
                   profile_home: Path | None = None, author: Optional[dict] = None,
                   lock_held: bool = False, strict_authority: bool = False) -> int:
@@ -1279,6 +1387,7 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
     The optional peer stdin transport remains an explicit remote route, never a
     fallback after local admission. Background processes wait for delivery only.
     """
+    from tools.bot_delivery_runtime_env import _delivery_runtime_env
     returncode = 1
     keep_live_intent = False
     live_state = None
@@ -1314,39 +1423,12 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
         env["PYTHONPATH"] = _delivery_runtime_env()["PYTHONPATH"]
         if not structured and not record.get("observation") and not record.get("enforced_effect") and not stdin_file:
             keep_live_intent = True
-            # The live consumer owns turn admission; never compete for its CLI lease.
-            if not stdin_file:
-                home = profile_home or _local_delivery_home(argv)
-                if home is not None or os.path.exists(_live_intent_file(dm_file)):
-                    try:
-                        live_record = _admit_live_dm(home, dm_file, author)
-                    except LiveTargetHeldError as exc:
-                        print(_settled_no_send(dm_file, exc))  # the owner settled the id: drop the payload too
-                        return 1
-                    except LiveTargetUnavailableError as exc:
-                        print(_unavailable_payload(dm_file, exc))
-                        return 1
-                    except Exception as exc:
-                        print(_live_outcome_unknown(dm_file, exc))
-                        return 1
-                    if live_record is not None:
-                        # A successful wait can still mean queued/claimed. Only settlement
-                        # proves delivery; keep uncertain receipts out of the delivered ledger.
-                        live_state = "unknown"
-                        def capture_live_status(status):
-                            nonlocal live_state
-                            live_state = "delivered" if status == "settled" else (
-                                "failed" if status in ("failed", "cancelled") else "unknown")
-                        returncode = _wait_live_dm(live_record["profile_home"], live_record["delivery_id"],
-                                                   dm_file=dm_file, on_result=capture_live_status)
-                        return returncode
-            if not stdin_file:
-                print(json.dumps({"reason": "runtime_unavailable", "error": "No canonical Bot Chat authority; payload retained."}))
-                return 1
+            returncode, live_state = _run_live_delivery(argv, dm_file, profile_home, author)
+            return returncode
         if not structured and stdin_file and not record.get("observation") and not record.get("enforced_effect"):
             with _delivery_lock(argv, stdin_file=True):
                 with open(dm_file, "r", encoding="utf-8-sig") as stream:
-                    returncode = subprocess.run(argv, input=stream.read().encode("utf-8"), check=False, env=env).returncode
+                    returncode = subprocess.run(argv, input=stream.read().encode("utf-8"), check=False, env=env, timeout=_LIVE_WAIT_MAX_SECONDS).returncode
                     return returncode
         transport_argv = list(argv)
         if not stdin_file and "chat" not in transport_argv:
@@ -1360,6 +1442,7 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
                 ):
                     raise ValueError("delivery fence invalid")
             except Exception:
+                logging.getLogger(__name__).debug('_run_delivery: optional operation failed', exc_info=True)
                 if record.get("observation") and not strict_authority:
                     from agent.durable_admission import observation_gap
                     observation_gap(record["observation"], "admission_failed")
@@ -1381,78 +1464,18 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
                 )
                 os.chmod(dm_file, 0o600)
         with (contextlib.nullcontext() if lock_held else _delivery_lock(argv, stdin_file=stdin_file)):
-            if stdin_file:
-                # Keep the file open until the transport exits; cleanup occurs
-                # after subprocess.run returns, not merely after stdin reaches EOF.
-                with open(dm_file, "r", encoding="utf-8-sig") as stream:
-                    proc = subprocess.run(
-                        transport_argv, input=stream.read(), check=False, capture_output=True, text=True,
-                        encoding="utf-8", errors="replace", env=env,
-                    )
-                returncode = proc.returncode
-            else:
-                proc = subprocess.run(
-                    [*transport_argv, "--query-file", dm_file],
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8", errors="replace", env=env,
-                )
-                returncode = proc.returncode
-            if proc.returncode != 0 and not stdin_file:
-                from tools.bot_failure_reasons import (
-                    RETRY_NONE,
-                    classify_agent_error,
-                    retry_action,
-                    turn_failure_text,
-                )
-                from tools.bot_relay import retry_turn_env
-
-                detail = turn_failure_text(proc.stdout, proc.stderr)
-                if retry_action(classify_agent_error(detail)) != RETRY_NONE:
-                    proc = subprocess.run(
-                        [*transport_argv, "--query-file", dm_file],
-                        check=False,
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8", errors="replace",
-                        env=retry_turn_env(env),
-                    )
-                    returncode = proc.returncode
-            # Re-emit the transport's streams: stdout is the reply text the
-            # completion notification carries back to the sending agent.
-            if structured and proc.returncode == 0:
-                try:
-                    payload = json.loads(proc.stdout or "")
-                    ack = _validated_delivery_ack(
-                        payload, record,
-                        expected_adapter="api_server" if stdin_file else "cli",
-                    )
-                    if not stdin_file:
-                        _validate_local_ack_against_destination(ack, record, argv)
-                        ack_row_validated = True
-                    reply = str(payload.get("reply") or "")
-                except Exception as exc:
-                    if record.get("observation"):
-                        from agent.durable_admission import observation_gap
-                        observation_gap(record["observation"], "ack_missing")
-                        ack = None
-                        reply = proc.stdout or ""
-                    else:
-                        if not isinstance(exc, (TypeError, ValueError)):
-                            raise
-                        returncode = 1
-                        reply = ""
-                if reply:
-                    sys.stdout.write(reply)
-                    sys.stdout.flush()
-            elif proc.stdout:
-                sys.stdout.write(proc.stdout)
-                sys.stdout.flush()
-            if proc.stderr:
-                sys.stderr.write(proc.stderr)
-                sys.stderr.flush()
+            proc = _run_delivery_transport(transport_argv, dm_file, stdin_file, env)
+            returncode = proc.returncode
+            returncode, ack, ack_row_validated = _consume_delivery_transport(
+                proc, record, argv, structured=structured, stdin_file=stdin_file)
             return returncode
+    except subprocess.TimeoutExpired:
+        # The child may already have admitted the turn. Keep evidence/payload and
+        # classify ambiguity without issuing another model-facing turn.
+        live_state = "unknown"
+        keep_live_intent = True
+        print(json.dumps({"reason": "delivery_timeout", "error": "Delivery outcome unknown; no retry was started."}))
+        return 1
     finally:
         state = "delivered" if returncode == 0 and (ack is not None or not structured) else "failed"
         if live_state is not None:
@@ -1522,6 +1545,7 @@ def _start_delivery(
                 if identity is not None:
                     fence = da._run_turn_identity_revalidation(identity)
             except Exception:
+                logging.getLogger(__name__).debug('_start_delivery: optional operation failed', exc_info=True)
                 identity = fence = None
                 da.observation_gap(observation, "admission_failed")
         else:
@@ -1600,6 +1624,7 @@ def _start_delivery_inner(
         if admission_enabled():
             turn_identity, fence = revalidate_current_turn_identity()
     except Exception as exc:
+        logging.getLogger(__name__).debug('_start_delivery_inner: optional operation failed', exc_info=True)
         return _err(f"Delivery authority refused: {type(exc).__name__}: {exc}")
     origin = str(origin_session_id or getattr(agent, "session_id", "") or "")
     if not origin:
@@ -1616,6 +1641,7 @@ def _start_delivery_inner(
         except LiveTargetUnavailableError as exc:
             return _settled_no_send(dm_file, exc)
         except Exception as exc:
+            logging.getLogger(__name__).debug('_start_delivery_inner: optional operation failed', exc_info=True)
             return json.dumps({"status": "ambiguous", "delivery_id": _dm_delivery_id(dm_file),
                 "error": f"Live delivery admission could not be confirmed: {exc}. Do not resend.",
                 "evidence_file": dm_file})
@@ -1700,6 +1726,7 @@ def _start_delivery_inner(
                 _unlink_dm_file(str(_delivery_envelope_path(dm_file)))
                 dm_file = None  # the queue now owns its private payload copy
             except Exception as exc:
+                logging.getLogger(__name__).debug('_start_delivery_inner: optional operation failed', exc_info=True)
                 return _err(f"Durable delivery could not be queued: {type(exc).__name__}: {exc}")
     if _defer_spawn:
         return command, dm_file, receipt
@@ -1847,6 +1874,7 @@ def _persist_reply_when_done(proc_id: str, agent: Any) -> bool:
                               display_kind="process_complete",
                               display_metadata={"display_text": process_completion_display_text([evt])})
         except Exception as exc:
+            logging.getLogger(__name__).debug('Recoverable operation failed', exc_info=True)
             logger.warning("message_agent: could not persist the reply of %s into session %s: %s",
                            proc_id, session_id, exc)
 
@@ -1909,6 +1937,7 @@ def _delivery_main(args: list[str]) -> int:
         # Every refusal ships a typed reason on stdout so the completion notification carries it
         # back to the sender (#93091): 'target_busy' from the queue's bounded wait, otherwise the
         # same vocabulary-guarded classification the relay lane applies.
+        logging.getLogger(__name__).debug('Recoverable operation failed', exc_info=True)
         from tools.bot_failure_reasons import delivery_failure_reason
 
         print(json.dumps({"error": str(exc), "reason": delivery_failure_reason(exc)}))

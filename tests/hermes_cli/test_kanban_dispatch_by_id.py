@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from hermes_cli import kanban_worker_path
+
 import os
 from pathlib import Path
 import subprocess
@@ -126,11 +128,11 @@ def test_worker_path_library_exact_hash_and_source_are_required(monkeypatch, tmp
         HERMES_CLAUDE_SHIM_BIN=str(shim),
         HERMES_WORK_CONTROL_RESOLVE="0",
     )
-    assert kb._validate_worker_path_lib(env) == (lib, expected)
+    assert kanban_worker_path._validate_worker_path_lib(env) == (lib, expected)
 
     env["K5_WORKER_PATH_SHA256"] = "0" * 64
     with pytest.raises(RuntimeError, match="^worker_path_hash_mismatch$"):
-        kb._validate_worker_path_lib(env)
+        kanban_worker_path._validate_worker_path_lib(env)
 
 
 def test_target_identity_is_revalidated_atomically_at_claim(monkeypatch, tmp_path):
@@ -249,7 +251,7 @@ def test_worker_path_snapshot_survives_pathname_swap(monkeypatch, tmp_path):
         K5_WORKER_PATH_SHA256=expected,
     )
 
-    snapshot = kb._snapshot_worker_path_lib(env)
+    snapshot = kanban_worker_path._snapshot_worker_path_lib(env)
     try:
         replacement = tmp_path / "replacement.sh"
         replacement.write_text("exit 99\n", encoding="utf-8")

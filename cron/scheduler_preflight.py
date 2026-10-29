@@ -246,6 +246,7 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
         if notification_inbox.enabled(get_hermes_home()):
             return None  # isolated delivery uses only this profile's local DB
     except Exception as exc:
+        logging.getLogger(__name__).debug('_preflight_check_delivery: optional operation failed', exc_info=True)
         return f"notification inbox configuration failed: {type(exc).__name__}"
 
     deliver_value = _delivery._normalize_deliver_value(job.get("deliver", "local"))

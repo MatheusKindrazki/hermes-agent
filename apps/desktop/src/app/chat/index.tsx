@@ -1,4 +1,4 @@
-import { useQuery } from '@tanstack/react-query'
+import { useContextSubmitGuard } from './use-context-submit-guard'
 import { type AppendMessage, AssistantRuntimeProvider, type ThreadMessage } from '@assistant-ui/react'
 import { useStore } from '@nanostores/react'
 import type { ReadableAtom } from 'nanostores'
@@ -6,7 +6,6 @@ import type * as React from 'react'
 import { memo, Suspense, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useLocation } from 'react-router'
 
-import { getApiCapabilities } from '@/api/capabilities'
 import type { SubmitTextOptions } from '@/app/session/hooks/use-prompt-actions/utils'
 import { sessionShouldHaveTranscript } from '@/app/session/hooks/use-session-actions/utils'
 import { Thread } from '@/components/assistant-ui/thread'
@@ -72,9 +71,6 @@ import { titlebarHeaderBaseClass, titlebarHeaderShadowClass, titlebarHeaderTitle
 import { ChatPersonaHeader, useChatPersona } from './bot-persona'
 import {
   type ActiveContext,
-  activeContextCanSubmit,
-  activeContextCapabilityDecision,
-  activeContextCorrelationFromReceipt,
   resolveActiveContext
 } from './active-context'
 import { ActiveContextChip } from './active-context-chip'
@@ -166,15 +162,7 @@ interface ChatHeaderProps {
   selectedSessionId: null | string
 }
 
-function ChatHeader({
-  activeContext: suppliedActiveContext,
-  activeSessionId,
-  isRoutedSessionView,
-  onDeleteSelectedSession,
-  onToggleSelectedPin,
-  routedSessionId,
-  selectedSessionId
-}: ChatHeaderProps) {
+function useHeaderContext({ activeContext: suppliedActiveContext, activeSessionId, routedSessionId, selectedSessionId }: ChatHeaderProps) {
   const sessions = useStore($sessions)
   const pinnedSessionIds = useStore($pinnedSessionIds)
   const profiles = useStore($profiles)
@@ -239,6 +227,23 @@ function ChatHeader({
     : selectedSessionId
       ? pinnedSessionIds.includes(selectedSessionId)
       : false
+
+  return { activeStoredSession, title, activeContext, showProfileTag, showContext, selectedIsPinned }
+}
+
+function ChatHeader({
+  activeContext: suppliedActiveContext,
+  activeSessionId,
+  isRoutedSessionView,
+  onDeleteSelectedSession,
+  onToggleSelectedPin,
+  routedSessionId,
+  selectedSessionId
+}: ChatHeaderProps) {
+  const { activeStoredSession, title, activeContext, showProfileTag, showContext, selectedIsPinned } = useHeaderContext({
+    activeContext: suppliedActiveContext, activeSessionId, routedSessionId, selectedSessionId,
+    isRoutedSessionView, onDeleteSelectedSession, onToggleSelectedPin
+  })
 
   // Secondary windows (new-session scratch, subagent watch, cmd-click pop-out)
   // are compact side panels — they drop the session-actions header + border
@@ -573,6 +578,106 @@ export const ChatView = memo(function ChatView(props: ChatViewProps) {
   )
 })
 
+function chatPresentation({ isPrimary, routedSessionId, selectedSessionId, sessions, activeSessionId, gatewaySwapTarget, messagesEmpty, transcriptStoredSessionId, introSplash, freshDraftReady, isRoutedSessionView, resumeExhaustedSessionId, busy, awaitingResponse, lastVisibleIsUser }: {
+  isPrimary: boolean
+  routedSessionId: string | null
+  selectedSessionId: string | null
+  sessions: ReturnType<typeof $sessions.get>
+  activeSessionId: string | null
+  gatewaySwapTarget: ReturnType<typeof $gatewaySwapTarget.get>
+  messagesEmpty: boolean
+  transcriptStoredSessionId: string | null
+  introSplash: boolean
+  freshDraftReady: boolean
+  isRoutedSessionView: boolean
+  resumeExhaustedSessionId: string | null
+  busy: boolean
+  awaitingResponse: boolean
+  lastVisibleIsUser: boolean
+}) {
+  // The URL points at a session the store hasn't loaded yet (sidebar / cmd-K /
+  // direct nav). Derived in render so the swap reads instantly: the same frame
+  // the id changes we drop the old transcript and show the loader, instead of
+  // waiting for the resume effect (which paints a frame later) to clear them.
+  const routeSessionMismatch = isPrimary
+    ? isRouteSessionMismatch(routedSessionId, selectedSessionId, sessions, {
+        activeRuntimeId: activeSessionId,
+        contextSwitching: Boolean(gatewaySwapTarget),
+        messagesEmpty,
+        transcriptStoredSessionId
+      })
+    : false
+
+  // The compact new-session pop-out skips the wordmark/tagline intro — it's a
+  // scratch window, not the full-height empty state. The Appearance toggle
+  // turns it off everywhere else.
+  const showIntro = shouldShowIntro({
+    activeSessionId,
+    auxiliaryWindow: isAuxiliaryWindow(),
+    enabled: introSplash,
+    freshDraftReady,
+    messagesEmpty,
+    primary: isPrimary,
+    routedSessionView: isRoutedSessionView,
+    selectedSessionId
+  })
+
+  // Session is still loading if the route references a session we haven't
+  // resumed yet. Brand-new routed drafts are empty on purpose once a runtime
+  // is bound. A session the list already knows has history must keep the
+  // loader up until a display-authoritative transcript arrives — including
+  // the unproven warm-cache hold, where the runtime is bound but messages
+  // are still suppressed.
+  //
+  // resumeExhausted: the bounded auto-retry in use-route-resume gave up on this
+  // routed session (gateway RPC + REST fallback failed through every attempt).
+  // Suppress the loader and show an explicit error + manual Retry instead of
+  // spinning forever. Gated on the route matching so a stale latch from another
+  // session can't blank the current one.
+  const resumeExhausted = isPrimary && isRoutedSessionView && resumeExhaustedSessionId === routedSessionId
+
+  const routedHasHistory = Boolean(
+    routedSessionId &&
+    sessions.some(session => sessionMatchesStoredId(session, routedSessionId) && sessionShouldHaveTranscript(session))
+  )
+
+  const loadingSession = routedSessionIsLoading({
+    activeSessionId,
+    knownHistory: routedHasHistory,
+    messagesEmpty,
+    resumeExhausted,
+    routeSessionMismatch,
+    routedSessionView: isRoutedSessionView
+  })
+
+  const threadLoading = threadLoadingState(loadingSession, busy, awaitingResponse, lastVisibleIsUser)
+
+  return { showIntro, resumeExhausted, loadingSession, threadLoading, routeSessionMismatch }
+}
+
+function useConversationFileDrop(
+  composerScope: ReturnType<typeof useComposerScope>,
+  currentCwd: string,
+  onAttachDroppedItems: ChatViewProps['onAttachDroppedItems']
+) {
+  const onDropFiles = useCallback(
+    (candidates: DroppedFile[]) => {
+      const { inAppRefs, osDrops } = partitionDroppedFiles(candidates)
+      const refs = droppedFileInlineRefs(inAppRefs, currentCwd)
+
+      if (refs.length) {
+        requestComposerInsert(refs.join(' '), { mode: 'inline', target: composerScope.target })
+      }
+
+      if (osDrops.length) {
+        void onAttachDroppedItems(osDrops)
+      }
+    },
+    [composerScope.target, currentCwd, onAttachDroppedItems]
+  )
+  return onDropFiles
+}
+
 const ChatViewContent = memo(function ChatViewContent({
   className,
   gateway,
@@ -660,6 +765,7 @@ const ChatViewContent = memo(function ChatViewContent({
   const gatewayState = useStore($gatewayState)
   const gatewaySwapTarget = useStore($gatewaySwapTarget)
   const hydrationSyncProfile = useStore($hydrationSyncProfile)
+  const effectiveModelProfile = modelOptionsProfile || activeGatewayProfile
   const gatewayOpen = gatewayState === 'open'
   const introPersonality = useStore($introPersonality)
   const introSeed = useStore($introSeed)
@@ -720,159 +826,14 @@ const ChatViewContent = memo(function ChatViewContent({
   // A tile IS its session — no route involved, never "mismatched".
   const routedSessionId = isPrimary ? routeSessionId(location.pathname) : selectedSessionId
   const isRoutedSessionView = Boolean(routedSessionId)
-  const targetStoredSessionId = routedSessionId ?? selectedSessionId
-
-  const targetSession = targetStoredSessionId
-    ? (sessions.find(session => sessionMatchesStoredId(session, targetStoredSessionId)) ?? null)
-    : null
-
-  const owner = knownSessionOwner(sessions, targetStoredSessionId)
-
-  const draftRoute = useMemo(() => {
-    void activeConnectionId
-    void activeGatewayProfile
-
-    return resolveNewChatOwnerRoute()
-  }, [activeConnectionId, activeGatewayProfile])
-
-  const ownerConnectionId =
-    owner && typeof owner === 'object' && 'connectionId' in owner
-      ? owner.connectionId
-      : targetSession?.connection_id || draftRoute?.connectionId || activeConnectionId
-
-  const ownerProfile =
-    owner && typeof owner === 'object' && 'connectionId' in owner
-      ? owner.targetProfile || owner.profile
-      : typeof owner === 'string'
-        ? owner
-        : targetSession?.profile || draftRoute?.profile || activeGatewayProfile
-
-  const activeContextCapabilityQuery = useQuery({
-    queryKey: ['active-context-capability', ownerConnectionId ?? 'local', ownerProfile ?? 'default'],
-    queryFn: () =>
-      getApiCapabilities({
-        connectionId: ownerConnectionId,
-        profile: ownerProfile
-      }),
-    enabled: gatewayOpen && identityV2Override === undefined,
-    retry: false,
-    staleTime: 30_000
+  const { composerDisabled, allowDraftingWhileDisabled, activeContext, contextAllowsSubmit, submitWithContextGuard, steerWithContextGuard, identityV2Enabled, capabilityState } = useContextSubmitGuard({
+    activeSessionId, routedSessionId, selectedSessionId, sessions, activeConnectionId,
+    activeGatewayProfile, gatewayOpen, identityV2Override, onSubmit, onSteer
   })
 
-  const activeContextCapability = activeContextCapabilityQuery.data?.features?.active_context_v2
-
-  // Capability and receipt are separate authority signals. A canary-enabled
-  // backend can legitimately have no receipt (missing identity config, draft,
-  // malformed row); that absence must block rather than silently falling back
-  // to legacy routing. Tests may force the gate through the internal prop.
-  const activeContextCapabilityDecisionResult = activeContextCapabilityDecision({
-    feature: activeContextCapability,
-    override: identityV2Override,
-    status: activeContextCapabilityQuery.status
+  const { showIntro, resumeExhausted, loadingSession, threadLoading, routeSessionMismatch } = chatPresentation({
+    isPrimary, routedSessionId, selectedSessionId, sessions, activeSessionId, gatewaySwapTarget, messagesEmpty, transcriptStoredSessionId, introSplash, freshDraftReady, isRoutedSessionView, resumeExhaustedSessionId, busy, awaitingResponse, lastVisibleIsUser
   })
-
-  const identityV2Enabled = activeContextCapabilityDecisionResult.v2
-
-  const activeContext = useMemo(() => {
-    // The legacy local door intentionally returns no explicit draft route:
-    // its submit is ambient. The ambient destination is still exact at this
-    // render because these two atoms are the same active connection/profile
-    // the request dispatcher uses. Carry that pair for display only; never
-    // infer either field from a title, session id, or profile name.
-    const displayedDraftRoute =
-      draftRoute ??
-      (!targetStoredSessionId && ownerConnectionId && ownerProfile
-        ? { connectionId: ownerConnectionId, profile: ownerProfile }
-        : null)
-
-    return resolveActiveContext({
-      activeRuntimeSessionId: activeSessionId,
-      correlation: activeContextCorrelationFromReceipt(targetSession?.active_context),
-      identityV2: identityV2Enabled,
-      newChatRoute: displayedDraftRoute,
-      owner,
-      targetStoredSessionId
-    })
-  }, [
-    activeSessionId,
-    draftRoute,
-    identityV2Enabled,
-    owner,
-    ownerConnectionId,
-    ownerProfile,
-    targetSession,
-    targetStoredSessionId
-  ])
-
-  const contextAllowsSubmit =
-    activeContextCapabilityDecisionResult.known && activeContextCanSubmit(activeContext, identityV2Enabled)
-
-  const submitWithContextGuard = useCallback(
-    (text: string, options?: SubmitTextOptions) => (contextAllowsSubmit ? onSubmit(text, options) : false),
-    [contextAllowsSubmit, onSubmit]
-  )
-
-  const steerWithContextGuard = useCallback(
-    (text: string) => (contextAllowsSubmit ? onSteer(text) : false),
-    [contextAllowsSubmit, onSteer]
-  )
-
-  // The URL points at a session the store hasn't loaded yet (sidebar / cmd-K /
-  // direct nav). Derived in render so the swap reads instantly: the same frame
-  // the id changes we drop the old transcript and show the loader, instead of
-  // waiting for the resume effect (which paints a frame later) to clear them.
-  const routeSessionMismatch = isPrimary
-    ? isRouteSessionMismatch(routedSessionId, selectedSessionId, sessions, {
-        activeRuntimeId: activeSessionId,
-        contextSwitching: Boolean(gatewaySwapTarget),
-        messagesEmpty,
-        transcriptStoredSessionId
-      })
-    : false
-
-  // The compact new-session pop-out skips the wordmark/tagline intro — it's a
-  // scratch window, not the full-height empty state. The Appearance toggle
-  // turns it off everywhere else.
-  const showIntro = shouldShowIntro({
-    activeSessionId,
-    auxiliaryWindow: isAuxiliaryWindow(),
-    enabled: introSplash,
-    freshDraftReady,
-    messagesEmpty,
-    primary: isPrimary,
-    routedSessionView: isRoutedSessionView,
-    selectedSessionId
-  })
-
-  // Session is still loading if the route references a session we haven't
-  // resumed yet. Brand-new routed drafts are empty on purpose once a runtime
-  // is bound. A session the list already knows has history must keep the
-  // loader up until a display-authoritative transcript arrives — including
-  // the unproven warm-cache hold, where the runtime is bound but messages
-  // are still suppressed.
-  //
-  // resumeExhausted: the bounded auto-retry in use-route-resume gave up on this
-  // routed session (gateway RPC + REST fallback failed through every attempt).
-  // Suppress the loader and show an explicit error + manual Retry instead of
-  // spinning forever. Gated on the route matching so a stale latch from another
-  // session can't blank the current one.
-  const resumeExhausted = isPrimary && isRoutedSessionView && resumeExhaustedSessionId === routedSessionId
-
-  const routedHasHistory = Boolean(
-    routedSessionId &&
-    sessions.some(session => sessionMatchesStoredId(session, routedSessionId) && sessionShouldHaveTranscript(session))
-  )
-
-  const loadingSession = routedSessionIsLoading({
-    activeSessionId,
-    knownHistory: routedHasHistory,
-    messagesEmpty,
-    resumeExhausted,
-    routeSessionMismatch,
-    routedSessionView: isRoutedSessionView
-  })
-
-  const threadLoading = threadLoadingState(loadingSession, busy, awaitingResponse, lastVisibleIsUser)
 
   const showChatBar = useShowChatBar({
     loadingSession,
@@ -904,21 +865,7 @@ const ChatViewContent = memo(function ChatViewContent({
   // drops carry absolute local paths that don't exist on a remote gateway (and
   // images need byte upload for vision), so route them through the attachment
   // pipeline — otherwise the local path leaks into the prompt verbatim.
-  const onDropFiles = useCallback(
-    (candidates: DroppedFile[]) => {
-      const { inAppRefs, osDrops } = partitionDroppedFiles(candidates)
-      const refs = droppedFileInlineRefs(inAppRefs, currentCwd)
-
-      if (refs.length) {
-        requestComposerInsert(refs.join(' '), { mode: 'inline', target: composerScope.target })
-      }
-
-      if (osDrops.length) {
-        void onAttachDroppedItems(osDrops)
-      }
-    },
-    [composerScope.target, currentCwd, onAttachDroppedItems]
-  )
+  const onDropFiles = useConversationFileDrop(composerScope, currentCwd, onAttachDroppedItems)
 
   // Session drags are POINTER drags (session-drag.ts) — never native DnD.
   // The drop zone below only handles files; session drops commit through the
@@ -945,13 +892,7 @@ const ChatViewContent = memo(function ChatViewContent({
         className
       )}
       data-chat-persona={chatPersona?.bot.name}
-      data-active-context-capability={
-        activeContextCapabilityDecisionResult.known
-          ? identityV2Enabled
-            ? 'enabled'
-            : 'disabled'
-          : activeContextCapabilityQuery.status
-      }
+      data-active-context-capability={capabilityState}
       data-active-context-submit={contextAllowsSubmit ? 'allowed' : 'blocked'}
       data-active-context-v2={identityV2Enabled ? 'enabled' : 'legacy'}
       data-chat-surface=""
@@ -1009,7 +950,7 @@ const ChatViewContent = memo(function ChatViewContent({
             onCancel={haltRun}
             onDismissError={onDismissError}
             onRestoreToMessage={onRestoreToMessage}
-            scrollProfile={modelOptionsProfile || activeGatewayProfile}
+            scrollProfile={effectiveModelProfile}
             sessionId={activeSessionId}
             sessionKey={threadKey}
           />
@@ -1044,10 +985,10 @@ const ChatViewContent = memo(function ChatViewContent({
           <FloatingComposerSurface>
             <Suspense fallback={<ChatBarFallback />}>
               <ChatBar
-                allowDraftingWhileDisabled={gatewayOpen && !contextAllowsSubmit}
+                allowDraftingWhileDisabled={allowDraftingWhileDisabled}
                 busy={busy}
                 cwd={currentCwd}
-                disabled={!gatewayOpen || !contextAllowsSubmit}
+                disabled={composerDisabled}
                 focusKey={activeSessionId}
                 freshDraftKey={freshDraftKey}
                 gateway={gateway}
@@ -1067,7 +1008,7 @@ const ChatViewContent = memo(function ChatViewContent({
                 onSteerHidden={onSteerHidden}
                 onSubmit={submitWithContextGuard}
                 onTranscribeAudio={onTranscribeAudio}
-                profile={modelOptionsProfile || activeGatewayProfile}
+                profile={effectiveModelProfile}
                 queueSessionKey={queueSessionKey}
                 sessionId={activeSessionId}
                 state={chatBarState}

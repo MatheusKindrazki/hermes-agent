@@ -19,7 +19,7 @@ import os
 from gateway.platforms.base import (
     BasePlatformAdapter,
 )
-from gateway.run import _collect_history_media_paths
+from gateway.run_media_history import _collect_history_media_paths
 
 
 

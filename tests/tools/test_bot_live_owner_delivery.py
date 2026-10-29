@@ -348,6 +348,7 @@ def test_pre_dial_failure_is_a_definite_no_send_not_ambiguous(tmp_path, monkeypa
     """#139303: a dial that dies before ``bot_relay.deliver`` reached the socket admits
     nothing — the pinned intent is dropped and the sender hears 'safe to resend',
     instead of the old 'ambiguous / do not resend' that stranded the DM."""
+    from types import SimpleNamespace
     from tools import bot_live_delivery as live
     from tools import bot_mode_dm
 
@@ -360,7 +361,7 @@ def test_pre_dial_failure_is_a_definite_no_send_not_ambiguous(tmp_path, monkeypa
 
     payload = json.loads(bot_mode_dm._start_delivery(
         ["hermes", "-p", "researcher"], "hello", "@researcher",
-        stdin_file=False, task_id=None, agent=None, profile_home=tmp_path))
+        stdin_file=False, task_id=None, agent=SimpleNamespace(session_id="sender-session"), profile_home=tmp_path))
 
     assert payload["reason"] == "runtime_unavailable"
     assert "safe to resend" in payload["error"]

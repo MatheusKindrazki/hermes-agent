@@ -592,7 +592,7 @@ class TestWireInvariant:
         reloaded = db.get_messages_as_conversation(sid)[0]
         assert reloaded["display_metadata"]["source"] == "native"
         assert reloaded["display_metadata"]["_compression_turn_id"] == durable_id
-        from agent.conversation_compression import ensure_compression_turn_identity
+        from agent.conversation_compression_spool import (ensure_compression_turn_identity)
         assert ensure_compression_turn_identity(reloaded) == durable_id
 
     def test_multimodal_turn_sends_persists_and_replays_context_part(self, wire_env):

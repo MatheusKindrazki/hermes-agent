@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from hermes_cli import kanban_worker_command
+
 import pytest
 import os
 import subprocess
@@ -57,7 +59,7 @@ agent:
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_dispatch as kbd
 
-    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kanban_worker_command, "_resolve_hermes_argv", lambda: ["hermes"])
 
     captured = {}
 
@@ -94,7 +96,7 @@ def test_default_spawn_does_not_pass_mutable_launch_overrides(monkeypatch, tmp_p
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_dispatch as kbd
 
-    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kanban_worker_command, "_resolve_hermes_argv", lambda: ["hermes"])
     captured = {}
 
     class FakeProc:
@@ -154,7 +156,7 @@ def test_default_spawn_resolves_env_passthrough_under_multiplex(monkeypatch, tmp
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_dispatch as kbd
 
-    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kanban_worker_command, "_resolve_hermes_argv", lambda: ["hermes"])
 
     captured = {}
 

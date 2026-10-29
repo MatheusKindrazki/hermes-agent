@@ -263,7 +263,8 @@ def _validate_bot_chat_deliver(deliver: Optional[str]) -> Optional[str]:
     if not deliver:
         return None
     try:
-        from cron.scheduler_delivery import parse_bot_chat_deliver_token, parse_bot_chat_notify_deliver_token
+        from cron.scheduler_delivery import (parse_bot_chat_deliver_token)
+        from cron.scheduler_bot_notification import (parse_bot_chat_notify_deliver_token)
         from hermes_cli.profiles import normalize_profile_name, profile_exists
     except Exception:
         return None  # best-effort; resolution re-checks at fire time

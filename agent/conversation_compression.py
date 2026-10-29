@@ -47,804 +47,25 @@ from hermes_state_ids import new_session_id as mint_session_id
 from hermes_state_pidns import holder_namespace_token
 from agent.conversation_compression_watermark import held_archive_watermark
 
+from agent.conversation_compression_spool import (
+    compression_turn_spool,
+    drain_compression_turns_into_agent,
+    commit_compression_turn_spool,
+    register_compression_turn_spool
+)
+
+from agent.conversation_compression_state import (
+    _strip_marker_for_comparison,
+    _session_was_rotated_by_compression,
+    _existing_system_prompt,
+    _restore_messages_snapshot,
+    _restore_prune_rearm_tokens
+)
+
 logger = logging.getLogger(__name__)
 
 COMPRESSION_TURN_HARD_CEILING_TOKENS = 1_000_000
 
-
-class DurableCompressionTurnSpool:
-    """Append-only durable handoff for turns racing context compression.
-
-    Records are atomically replaced only to advance ``pending`` → ``drained``;
-    they are never deleted. A root-scoped sequence preserves enqueue order,
-    while per-session monotonic epochs fence compression lineage publication.
-    """
-
-    _locks_guard = threading.Lock()
-    _locks: dict[str, threading.RLock] = {}
-
-    def __init__(self, root: Path | str) -> None:
-        self.root = Path(os.path.abspath(os.fspath(root)))
-
-    @staticmethod
-    def _directory_flags() -> int:
-        flags = os.O_RDONLY
-        if hasattr(os, "O_DIRECTORY"):
-            flags |= os.O_DIRECTORY
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        return flags
-
-    def _open_root_path_fd(self, *, create: bool) -> int:
-        """Walk the absolute root one no-follow directory component at a time."""
-        parts = self.root.parts
-        if not parts or parts[0] != os.sep or any(part in {"", ".", ".."} for part in parts[1:]):
-            raise RuntimeError("compression spool root must be an absolute safe path")
-        current_fd = os.open(os.sep, self._directory_flags())
-        try:
-            for index, part in enumerate(parts[1:]):
-                try:
-                    next_fd = os.open(
-                        part, self._directory_flags(), dir_fd=current_fd
-                    )
-                except FileNotFoundError:
-                    if not create:
-                        raise RuntimeError(
-                            "compression spool canonical root is missing"
-                        )
-                    try:
-                        os.mkdir(part, 0o700, dir_fd=current_fd)
-                    except FileExistsError:
-                        # Another process won the same safe component create.
-                        # The no-follow open below revalidates what appeared.
-                        pass
-                    next_fd = os.open(
-                        part, self._directory_flags(), dir_fd=current_fd
-                    )
-                except OSError as exc:
-                    raise RuntimeError(
-                        "compression spool path contains a symlink or non-directory"
-                    ) from exc
-                os.close(current_fd)
-                current_fd = next_fd
-                if index == len(parts[1:]) - 1:
-                    os.fchmod(current_fd, 0o700)
-            return current_fd
-        except Exception:
-            os.close(current_fd)
-            raise
-
-    def _ensure_root(self) -> None:
-        root_fd = self._open_root_path_fd(create=True)
-        os.close(root_fd)
-
-    def _open_root_fd(self) -> int:
-        """Open and pin the validated spool directory for one operation."""
-        fd = self._open_root_path_fd(create=True)
-        if not stat.S_ISDIR(os.fstat(fd).st_mode):
-            os.close(fd)
-            raise RuntimeError("compression spool root is not a directory")
-        return fd
-
-    def _assert_canonical_root(self, root_fd: int, record_name: Optional[str] = None) -> None:
-        canonical_fd = self._open_root_path_fd(create=False)
-        try:
-            pinned = os.fstat(root_fd)
-            canonical = os.fstat(canonical_fd)
-            if (pinned.st_dev, pinned.st_ino) != (canonical.st_dev, canonical.st_ino):
-                raise RuntimeError("compression spool canonical root changed")
-            if record_name is not None:
-                flags = os.O_RDONLY
-                if hasattr(os, "O_NOFOLLOW"):
-                    flags |= os.O_NOFOLLOW
-                record_fd = os.open(record_name, flags, dir_fd=canonical_fd)
-                try:
-                    if not stat.S_ISREG(os.fstat(record_fd).st_mode):
-                        raise RuntimeError(
-                            "compression spool canonical record is not regular"
-                        )
-                finally:
-                    os.close(record_fd)
-        finally:
-            os.close(canonical_fd)
-
-    @staticmethod
-    def _assert_regular_no_symlink(path: Path, *, allow_missing: bool) -> bool:
-        try:
-            path_stat = os.lstat(path)
-        except FileNotFoundError:
-            if allow_missing:
-                return False
-            raise
-        if stat.S_ISLNK(path_stat.st_mode) or not stat.S_ISREG(path_stat.st_mode):
-            raise RuntimeError(f"compression spool path is not a regular file: {path.name}")
-        return True
-
-    @staticmethod
-    def _key(session_id: str) -> str:
-        return hashlib.sha256(str(session_id).encode("utf-8")).hexdigest()[:24]
-
-    @contextlib.contextmanager
-    def _locked(self, scope: str):
-        root_fd = self._open_root_fd()
-        root_stat = os.fstat(root_fd)
-        lock_key = f"{root_stat.st_dev}:{root_stat.st_ino}::{scope}"
-        with self._locks_guard:
-            local_lock = self._locks.setdefault(lock_key, threading.RLock())
-        try:
-            local_context = local_lock
-            with local_context:
-                lock_name = f".lock-{self._key(scope)}"
-                flags = os.O_CREAT | os.O_RDWR
-                if hasattr(os, "O_NOFOLLOW"):
-                    flags |= os.O_NOFOLLOW
-                lock_fd = os.open(lock_name, flags, 0o600, dir_fd=root_fd)
-                os.fchmod(lock_fd, 0o600)
-                if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
-                    os.close(lock_fd)
-                    raise RuntimeError("compression spool lock is not a regular file")
-                lock_file = os.fdopen(lock_fd, "a+b")
-                acquired = False
-                try:
-                    try:
-                        import fcntl
-                    except ImportError as exc:
-                        raise RuntimeError("compression spool requires fcntl locking") from exc
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-                    acquired = True
-                    yield root_fd
-                finally:
-                    try:
-                        if acquired:
-                            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-                    finally:
-                        lock_file.close()
-        finally:
-            os.close(root_fd)
-
-    @contextlib.contextmanager
-    def _lineage_locked(self, session_id: str):
-        """Fence lineage reads/writes with one cross-process lock order.
-
-        Lock order is always ``global lineage`` then ``session state``.
-        Enqueue/drain only need the outer global fence; every state writer
-        enters through this helper. No code may acquire global while holding a
-        session lock, preventing nested inversion across threads/processes.
-        """
-        with self._locked("global"):
-            with self._locked(f"state:{session_id}") as root_fd:
-                yield root_fd
-
-    @staticmethod
-    def _relative_name(path: Path | str) -> str:
-        name = Path(path).name
-        if name != str(path) and Path(path).parent != Path("."):
-            # Public helpers pass absolute Paths rooted at self.root. Only the
-            # basename is used after the root fd has been pinned.
-            name = Path(path).name
-        if not name or name in {".", ".."} or "/" in name or "\\" in name:
-            raise RuntimeError("invalid compression spool filename")
-        return name
-
-    def _write_json(
-        self, path: Path | str, payload: dict[str, Any], *, root_fd: Optional[int] = None
-    ) -> None:
-        own_fd = root_fd is None
-        if own_fd:
-            root_fd = self._open_root_fd()
-        assert root_fd is not None
-        name = self._relative_name(path)
-        temp_name = f".compression-turn-{uuid.uuid4().hex}.tmp"
-        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        fd = os.open(temp_name, flags, 0o600, dir_fd=root_fd)
-        try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.rename(temp_name, name, src_dir_fd=root_fd, dst_dir_fd=root_fd)
-            os.fsync(root_fd)
-        finally:
-            try:
-                os.unlink(temp_name, dir_fd=root_fd)
-            except FileNotFoundError:
-                pass
-            if own_fd:
-                os.close(root_fd)
-
-    def _read_json(
-        self, path: Path | str, *, root_fd: Optional[int] = None
-    ) -> Optional[dict[str, Any]]:
-        own_fd = root_fd is None
-        if own_fd:
-            root_fd = self._open_root_fd()
-        assert root_fd is not None
-        name = self._relative_name(path)
-        flags = os.O_RDONLY
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        try:
-            fd = os.open(name, flags, dir_fd=root_fd)
-            try:
-                if not stat.S_ISREG(os.fstat(fd).st_mode):
-                    raise RuntimeError(
-                        f"compression spool path changed during validation: {name}"
-                    )
-                with os.fdopen(fd, "r", encoding="utf-8-sig") as handle:
-                    fd = -1
-                    value = json.load(handle)
-            finally:
-                if fd >= 0:
-                    os.close(fd)
-        except FileNotFoundError:
-            return None
-        except (ValueError, TypeError) as exc:
-            raise RuntimeError(f"corrupt compression spool JSON: {name}") from exc
-        finally:
-            if own_fd:
-                os.close(root_fd)
-        if not isinstance(value, dict):
-            raise RuntimeError(f"corrupt compression spool JSON: {name}")
-        return value
-
-    def _resync_file(self, path: Path | str, *, root_fd: int) -> None:
-        name = self._relative_name(path)
-        flags = os.O_RDONLY
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        fd = os.open(name, flags, dir_fd=root_fd)
-        try:
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
-                raise RuntimeError(f"compression spool path is not regular: {name}")
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        os.fsync(root_fd)
-
-    def _state_path(self, session_id: str) -> Path:
-        return self.root / f"state-{self._key(session_id)}.json"
-
-    def _state(self, session_id: str, *, root_fd: Optional[int] = None) -> dict[str, Any]:
-        state = self._read_json(self._state_path(session_id), root_fd=root_fd)
-        if state is None:
-            state = {}
-        elif not (
-            state.get("version", 1) == 1
-            and not isinstance(state.get("version", 1), bool)
-            and isinstance(state.get("session_id"), str)
-            and state.get("session_id") == session_id
-            and isinstance(state.get("epoch"), int)
-            and not isinstance(state.get("epoch"), bool)
-            and isinstance(state.get("committed_epoch"), int)
-            and not isinstance(state.get("committed_epoch"), bool)
-            and (state.get("owner") is None or isinstance(state.get("owner"), str))
-            and isinstance(state.get("live_tip"), str)
-            and (
-                state.get("owner_pid") is None
-                or (
-                    isinstance(state.get("owner_pid"), int)
-                    and not isinstance(state.get("owner_pid"), bool)
-                )
-            )
-        ):
-            raise RuntimeError("invalid compression spool state schema")
-        return {
-            "version": 1,
-            "session_id": session_id,
-            "epoch": int(state.get("epoch") or 0),
-            "owner": state.get("owner"),
-            "live_tip": state.get("live_tip") or session_id,
-            "committed_epoch": int(state.get("committed_epoch") or 0),
-            "owner_pid": state.get("owner_pid"),
-            "lease_expires_ns": int(state.get("lease_expires_ns") or 0),
-            "owner_process_identity": state.get("owner_process_identity"),
-            "lease_started_monotonic_ns": int(
-                state.get("lease_started_monotonic_ns") or 0
-            ),
-            "lease_duration_ns": int(state.get("lease_duration_ns") or 0),
-        }
-
-    @staticmethod
-    def _process_liveness(pid: Any) -> tuple[str, Optional[str]]:
-        try:
-            pid_int = int(pid)
-        except (TypeError, ValueError):
-            return "unknown", None
-        if pid_int <= 0:
-            return "unknown", None
-        try:
-            import psutil
-
-            exists = psutil.pid_exists(pid_int)
-            if exists is False:
-                return "dead_or_reused", None
-            if exists is not True:
-                return "unknown", None
-        except Exception:
-            return "unknown", None
-        try:
-            boot = Path("/proc/sys/kernel/random/boot_id").read_text(
-                encoding="utf-8"
-            ).strip()
-        except OSError:
-            try:
-                import subprocess
-
-                boot = subprocess.check_output(
-                    ["sysctl", "-n", "kern.boottime"], text=True
-                ).strip()
-            except Exception:
-                return "unknown", None
-        start = None
-        try:
-            fields = Path(f"/proc/{pid_int}/stat").read_text(
-                encoding="utf-8"
-            ).split()
-            start = fields[21]
-        except (OSError, IndexError):
-            try:
-                import subprocess
-
-                start = subprocess.check_output(
-                    ["ps", "-o", "lstart=", "-p", str(pid_int)], text=True
-                ).strip()
-            except Exception:
-                return "unknown", None
-        if not boot or not start:
-            return "unknown", None
-        return "alive", f"{boot}:{pid_int}:{start}"
-
-    @classmethod
-    def _process_identity(cls, pid: Any) -> Optional[str]:
-        status, identity = cls._process_liveness(pid)
-        return identity if status == "alive" else None
-
-    def _owner_liveness(self, state: dict[str, Any]) -> str:
-        status, identity = self._process_liveness(state.get("owner_pid"))
-        if status == "dead_or_reused":
-            return status
-        if status != "alive":
-            return "unknown"
-        stored = state.get("owner_process_identity")
-        if not isinstance(stored, str) or not stored:
-            return "unknown"
-        return "alive" if identity == stored else "dead_or_reused"
-
-    def begin_attempt(
-        self,
-        session_id: str,
-        owner: str,
-        *,
-        allow_stale_owner_takeover: bool = False,
-        lease_seconds: float = 300.0,
-    ) -> Optional[int]:
-        with self._lineage_locked(session_id) as root_fd:
-            state = self._state(session_id, root_fd=root_fd)
-            if state["owner"]:
-                owner_liveness = self._owner_liveness(state)
-                if not (
-                    allow_stale_owner_takeover
-                    and owner_liveness == "dead_or_reused"
-                ):
-                    return None
-            own_status, own_identity = self._process_liveness(os.getpid())
-            if own_status != "alive" or not own_identity:
-                raise RuntimeError("compression spool process identity is unknown")
-            state["epoch"] += 1
-            state["owner"] = owner
-            state["owner_pid"] = os.getpid()
-            state["owner_process_identity"] = own_identity
-            duration_ns = max(1, int(float(lease_seconds) * 1_000_000_000))
-            state["lease_started_monotonic_ns"] = time.monotonic_ns()
-            state["lease_duration_ns"] = duration_ns
-            state["lease_expires_ns"] = time.time_ns() + max(
-                1, duration_ns
-            )
-            self._write_json(self._state_path(session_id), state, root_fd=root_fd)
-            return int(state["epoch"])
-
-    def commit_attempt(
-        self,
-        session_id: str,
-        owner: str,
-        epoch: int,
-        *,
-        live_tip: str,
-    ) -> bool:
-        with self._lineage_locked(session_id) as root_fd:
-            state = self._state(session_id, root_fd=root_fd)
-            if state["owner"] != owner or int(state["epoch"]) != int(epoch):
-                return False
-            if self._owner_liveness(state) != "alive":
-                return False
-            if str(live_tip) != str(session_id):
-                proposed_tip = self._resolve_live_tip(
-                    str(live_tip), root_fd=root_fd
-                )
-                if proposed_tip == str(session_id):
-                    return False
-            if (
-                time.monotonic_ns() - int(state["lease_started_monotonic_ns"] or 0)
-                >= int(state["lease_duration_ns"] or 0)
-            ):
-                return False
-            state["owner"] = None
-            state["owner_pid"] = None
-            state["owner_process_identity"] = None
-            state["lease_expires_ns"] = 0
-            state["committed_epoch"] = int(epoch)
-            state["live_tip"] = str(live_tip)
-            self._write_json(self._state_path(session_id), state, root_fd=root_fd)
-            return True
-
-    def refresh_attempt(
-        self,
-        session_id: str,
-        owner: str,
-        epoch: int,
-        *,
-        lease_seconds: float = 300.0,
-    ) -> bool:
-        with self._lineage_locked(session_id) as root_fd:
-            state = self._state(session_id, root_fd=root_fd)
-            if state["owner"] != owner or int(state["epoch"]) != int(epoch):
-                return False
-            duration_ns = max(1, int(float(lease_seconds) * 1_000_000_000))
-            state["lease_started_monotonic_ns"] = time.monotonic_ns()
-            state["lease_duration_ns"] = duration_ns
-            state["lease_expires_ns"] = time.time_ns() + duration_ns
-            self._write_json(self._state_path(session_id), state, root_fd=root_fd)
-            return True
-
-    def abort_attempt(self, session_id: str, owner: str, epoch: int) -> bool:
-        with self._lineage_locked(session_id) as root_fd:
-            state = self._state(session_id, root_fd=root_fd)
-            if state["owner"] != owner or int(state["epoch"]) != int(epoch):
-                return False
-            state["owner"] = None
-            state["owner_pid"] = None
-            state["owner_process_identity"] = None
-            state["lease_expires_ns"] = 0
-            self._write_json(self._state_path(session_id), state, root_fd=root_fd)
-            return True
-
-    def reconcile_canonical_tip(
-        self,
-        session_id: str,
-        live_tip: str,
-        *,
-        expected_owner: Optional[str] = None,
-        expected_epoch: Optional[int] = None,
-    ) -> bool:
-        """Record a SessionDB-proven child after a partial spool commit."""
-        if not live_tip:
-            return False
-        with self._lineage_locked(session_id) as root_fd:
-            state = self._state(session_id, root_fd=root_fd)
-            if str(live_tip) != str(session_id):
-                proposed_tip = self._resolve_live_tip(
-                    str(live_tip), root_fd=root_fd
-                )
-                if proposed_tip == str(session_id):
-                    return False
-            caller_still_fenced = (
-                expected_owner is not None
-                and expected_epoch is not None
-                and state["owner"] == expected_owner
-                and int(state["epoch"]) == int(expected_epoch)
-                and self._owner_liveness(state) == "alive"
-            )
-            if state["live_tip"] == str(live_tip) and not state["owner"]:
-                self._resync_file(self._state_path(session_id), root_fd=root_fd)
-                return True
-            if not caller_still_fenced:
-                if state["owner"] and self._owner_liveness(state) != "dead_or_reused":
-                    return False
-                state["epoch"] = int(state["epoch"]) + 1
-            state["committed_epoch"] = int(state["epoch"])
-            state["owner"] = None
-            state["owner_pid"] = None
-            state["owner_process_identity"] = None
-            state["lease_expires_ns"] = 0
-            state["lease_started_monotonic_ns"] = 0
-            state["lease_duration_ns"] = 0
-            state["live_tip"] = str(live_tip)
-            self._write_json(self._state_path(session_id), state, root_fd=root_fd)
-            return True
-
-    def _resolve_live_tip(self, session_id: str, *, root_fd: int) -> str:
-        current = str(session_id)
-        visited: set[str] = set()
-        while current not in visited:
-            visited.add(current)
-            tip = str(self._state(current, root_fd=root_fd)["live_tip"] or current)
-            if tip == current:
-                return current
-            current = tip
-        raise RuntimeError(
-            f"compression spool live-tip cycle detected for session: {session_id}"
-        )
-
-    def resolve_live_tip(self, session_id: str) -> str:
-        with self._locked("global") as root_fd:
-            return self._resolve_live_tip(session_id, root_fd=root_fd)
-
-    def _iter_record_files(self, *, root_fd: int):
-        return [
-            self.root / name
-            for name in os.listdir(root_fd)
-            if name.endswith(".json")
-            and not name.startswith("state-")
-            and name != "global-state.json"
-        ]
-
-    def _record_rows(self, *, root_fd: int) -> list[tuple[Path, dict[str, Any]]]:
-        rows = []
-        for path in self._iter_record_files(root_fd=root_fd):
-            payload = self._read_json(path, root_fd=root_fd)
-            if payload is None:
-                continue
-            payload.setdefault("session_id", payload.get("origin_session"))
-            payload.setdefault("origin_session", payload.get("session_id"))
-            payload.setdefault("client_turn_id", path.stem)
-            payload.setdefault("created_ns", 0)
-            payload.setdefault("sequence", int(payload.get("created_ns") or 0))
-            payload.setdefault("status", "pending")
-            valid = (
-                isinstance(payload.get("origin_session"), str)
-                and bool(payload.get("origin_session"))
-                and isinstance(payload.get("session_id"), str)
-                and bool(payload.get("session_id"))
-                and payload.get("session_id") == payload.get("origin_session")
-                and isinstance(payload.get("client_turn_id"), str)
-                and bool(payload.get("client_turn_id"))
-                and isinstance(payload.get("message"), dict)
-                and isinstance(payload["message"].get("role"), str)
-                and "content" in payload["message"]
-                and isinstance(payload.get("created_ns"), int)
-                and not isinstance(payload.get("created_ns"), bool)
-                and isinstance(payload.get("sequence"), int)
-                and not isinstance(payload.get("sequence"), bool)
-                and payload.get("status") in {"pending", "drained"}
-                and (
-                    "version" not in payload
-                    or (
-                        payload.get("version") == 1
-                        and not isinstance(payload.get("version"), bool)
-                        and isinstance(payload.get("token_count"), int)
-                        and not isinstance(payload.get("token_count"), bool)
-                    )
-                )
-            )
-            if not valid:
-                raise RuntimeError(f"invalid compression spool record schema: {path.name}")
-            rows.append((path, payload))
-        rows.sort(key=lambda item: (int(item[1]["sequence"]), int(item[1]["created_ns"])))
-        return rows
-
-    def enqueue(
-        self,
-        session_id: str,
-        message: dict[str, Any],
-        *,
-        token_count: int,
-        client_turn_id: Optional[str] = None,
-    ) -> dict[str, Any]:
-        turn_id = str(client_turn_id or uuid.uuid4().hex)
-        with self._locked("global") as root_fd:
-            # A durable ACK promises that this session's lineage can later be
-            # resolved and drained. Validate its state before touching global
-            # sequence metadata or creating/revalidating a record. State for
-            # unrelated sessions is intentionally not consulted.
-            self._resolve_live_tip(str(session_id), root_fd=root_fd)
-            for path, payload in self._record_rows(root_fd=root_fd):
-                if (
-                    payload.get("origin_session") == session_id
-                    and payload.get("client_turn_id") == turn_id
-                ):
-                    self._resync_file(path, root_fd=root_fd)
-                    self._assert_canonical_root(root_fd, path.name)
-                    return {"accepted": True, "durable": True, "turn_id": turn_id, "path": path}
-            global_path = self.root / "global-state.json"
-            global_state = self._read_json(global_path, root_fd=root_fd)
-            if global_state is None:
-                global_state = {"version": 1, "sequence": 0}
-            elif not (
-                global_state.get("version", 1) == 1
-                and not isinstance(global_state.get("version", 1), bool)
-                and isinstance(global_state.get("sequence"), int)
-                and not isinstance(global_state.get("sequence"), bool)
-            ):
-                raise RuntimeError("invalid compression spool global schema")
-            else:
-                self._resync_file(global_path, root_fd=root_fd)
-            sequence = int(global_state.get("sequence") or 0) + 1
-            global_state["sequence"] = sequence
-            global_state["version"] = 1
-            self._write_json(global_path, global_state, root_fd=root_fd)
-            created_ns = time.time_ns()
-            record_path = self.root / f"turn-{sequence:020d}-{uuid.uuid4().hex}.json"
-            payload = {
-                "version": 1,
-                "origin_session": str(session_id),
-                "session_id": str(session_id),
-                "client_turn_id": turn_id,
-                "message": copy.deepcopy(message),
-                "token_count": int(token_count),
-                "sequence": sequence,
-                "created_ns": created_ns,
-                "status": "pending",
-            }
-            self._write_json(record_path, payload, root_fd=root_fd)
-            self._assert_canonical_root(root_fd, record_path.name)
-            return {
-                "accepted": True,
-                "durable": True,
-                "turn_id": turn_id,
-                "path": record_path,
-            }
-
-    def records(self, session_id: str) -> list[dict[str, Any]]:
-        with self._locked("global") as root_fd:
-            target_tip = self._resolve_live_tip(session_id, root_fd=root_fd)
-            return [
-                copy.deepcopy(payload)
-                for _path, payload in self._record_rows(root_fd=root_fd)
-                if payload.get("origin_session")
-                and self._resolve_live_tip(
-                    str(payload["origin_session"]), root_fd=root_fd
-                ) == target_tip
-            ]
-
-    def pending(self, session_id: str) -> list[dict[str, Any]]:
-        return [row for row in self.records(session_id) if row.get("status") != "drained"]
-
-    def drain(self, session_id: str, consumer: Callable[[dict[str, Any], str], None]) -> list[str]:
-        drained: list[str] = []
-        with self._locked("global") as root_fd:
-            live_tip = self._resolve_live_tip(session_id, root_fd=root_fd)
-            for path, payload in self._record_rows(root_fd=root_fd):
-                origin = payload.get("origin_session")
-                if (
-                    not origin
-                    or self._resolve_live_tip(str(origin), root_fd=root_fd) != live_tip
-                    or payload.get("status") == "drained"
-                ):
-                    continue
-                consumer(copy.deepcopy(payload), live_tip)
-                payload["status"] = "drained"
-                payload["drained_tip"] = live_tip
-                payload["drained_ns"] = time.time_ns()
-                self._write_json(path, payload, root_fd=root_fd)
-                drained.append(str(payload["client_turn_id"]))
-        return drained
-
-
-def compression_turn_spool() -> DurableCompressionTurnSpool:
-    home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
-    return DurableCompressionTurnSpool(home / "compression_turn_spool")
-
-
-def ensure_compression_turn_identity(message: dict[str, Any]) -> str:
-    """Stamp one stable internal identity before transcript persistence."""
-    metadata = message.get("display_metadata")
-    if not isinstance(metadata, dict):
-        metadata = {}
-        message["display_metadata"] = metadata
-    turn_id = str(
-        message.get("client_turn_id")
-        or message.get("platform_message_id")
-        or message.get("message_id")
-        or message.get("_compression_spool_turn_id")
-        or metadata.get("_compression_turn_id")
-        or f"compression-turn:{uuid.uuid4().hex}"
-    )
-    message["client_turn_id"] = turn_id
-    message["_compression_spool_turn_id"] = turn_id
-    metadata["_compression_turn_id"] = turn_id
-    return turn_id
-
-
-def spool_deferred_compression_turn(
-    session_id: str,
-    messages: list[dict[str, Any]],
-    *,
-    token_count: int,
-) -> Optional[dict[str, Any]]:
-    """Durably accept the newest user turn on compression-lock contention."""
-    source = next(
-        (
-            message
-            for message in reversed(messages)
-            if isinstance(message, dict) and message.get("role") == "user"
-        ),
-        None,
-    )
-    if source is None:
-        return None
-    message = copy.deepcopy(source)
-    message.pop("_db_persisted", None)
-    turn_id = ensure_compression_turn_identity(message)
-    return compression_turn_spool().enqueue(
-        session_id,
-        message,
-        token_count=int(token_count),
-        client_turn_id=turn_id,
-    )
-
-
-def drain_compression_turns_into_agent(
-    agent: Any,
-    origin_session_id: str,
-    live_messages: list[dict[str, Any]],
-) -> list[str]:
-    """Drain queued turns to the transitive live tip with durable dedupe."""
-    session_db = getattr(agent, "_session_db", None)
-    if session_db is None:
-        return []
-    spool = compression_turn_spool()
-
-    def _consume(record: dict[str, Any], live_tip: str) -> None:
-        message = copy.deepcopy(record["message"])
-        turn_id = str(record["client_turn_id"])
-        spool_dedupe_id = f"compression-spool:{turn_id}"
-        original_ids = {
-            str(value)
-            for value in (
-                message.get("platform_message_id"),
-                message.get("message_id"),
-                message.get("client_turn_id"),
-                (message.get("display_metadata") or {}).get(
-                    "_compression_turn_id"
-                ) if isinstance(message.get("display_metadata"), dict) else None,
-            )
-            if value not in (None, "")
-        }
-        dedupe_ids = {spool_dedupe_id, *original_ids}
-        already_live = False
-        for existing in live_messages:
-            if not isinstance(existing, dict):
-                continue
-            existing_ids = {
-                str(value)
-                for value in (
-                    existing.get("_compression_spool_turn_id"),
-                    existing.get("platform_message_id"),
-                    existing.get("message_id"),
-                    existing.get("client_turn_id"),
-                    (existing.get("display_metadata") or {}).get(
-                        "_compression_turn_id"
-                    ) if isinstance(existing.get("display_metadata"), dict) else None,
-                )
-                if value not in (None, "")
-            }
-            if turn_id in existing_ids or bool(original_ids & existing_ids):
-                already_live = True
-                break
-        has_id = getattr(session_db, "has_platform_message_id", None)
-        already_durable = bool(
-            callable(has_id)
-            and any(has_id(live_tip, candidate) for candidate in dedupe_ids)
-        ) or already_live
-        if not already_durable:
-            persisted_id = next(iter(sorted(original_ids)), spool_dedupe_id)
-            session_db.append_message(
-                live_tip,
-                str(message.get("role") or "user"),
-                message.get("content"),
-                platform_message_id=persisted_id,
-                timestamp=message.get("timestamp"),
-            )
-        if not already_live:
-            message["_compression_spool_turn_id"] = turn_id
-            message["_db_persisted"] = True
-            live_messages.append(message)
-
-    return spool.drain(origin_session_id, _consume)
 
 # Terminal compression outcomes published by host/hygiene timeout or cooldown
 # writers. Detached heartbeat workers must not clobber these back to
@@ -884,14 +105,6 @@ COMPACTION_HEARTBEAT_STATUS = f"🗜️ {COMPACTION_STATUS_MARKER} — still sum
 COMPACTION_DONE_STATUS = "✓ Context compaction complete — continuing turn..."
 
 
-def _strip_marker_for_comparison(msgs: Any) -> Any:
-    """Copy ``msgs`` with the ``_db_persisted`` marker removed for no-op comparison.
-    Live dicts carry the marker while ``compress()`` output is swept, so a raw ``==`` would misclassify an
-    identical no-op copy as progress. Non-list inputs and non-dict entries pass through unchanged."""
-    from agent.context_compressor import _DB_PERSISTED_MARKER
-    if not isinstance(msgs, list):
-        return msgs
-    return [{k: v for k, v in m.items() if k != _DB_PERSISTED_MARKER} if isinstance(m, dict) else m for m in msgs]
 
 
 def _emit_compaction_done(agent: Any) -> None:
@@ -1704,7 +917,7 @@ def _stall_retry_routes(escalate_deterministic: bool) -> list:
     stall-class backoff has already burned a window in this session) the deterministic fallback summary."""
     routes = [route for route in (resolve_compression_fallback_route(),) if route is not None]
     if escalate_deterministic:
-        from agent.context_compressor import DETERMINISTIC_SUMMARY_ROUTE
+        from agent.context_compressor_route import (DETERMINISTIC_SUMMARY_ROUTE)
         routes.append(dict(DETERMINISTIC_SUMMARY_ROUTE))
     return routes
 
@@ -1831,7 +1044,7 @@ def _run_pinned_compression_retry(
     compressor = getattr(telemetry_agent, "context_compressor", None)
     streak_before = getattr(compressor, "_fallback_compression_streak", 0)
     try:
-        from agent.context_compressor import pin_summary_route
+        from agent.context_compressor_route import (pin_summary_route)
         with pin_summary_route(route):
             result_msgs, result_prompt = run_compress_context_with_progress_timeout(
                 worker=worker, messages=messages, system_prompt_fallback=system_prompt_fallback,
@@ -2212,32 +1425,12 @@ def _refresh_persisted_compression_guards(compressor: Any, *, include_cooldown: 
             logger.debug("compression guard refresh failed (%s): %s", method_name, exc)
 
 
-def _session_was_rotated_by_compression(session_db: Any, session_id: str) -> bool:
-    """Return whether another path already rotated this compression parent."""
-    getter = getattr(type(session_db), "get_session", None)
-    if not callable(getter):
-        return False
-    session = getter(session_db, session_id)
-    return bool(session and session.get("ended_at") is not None and session.get("end_reason") == "compression")
 
 
-def _existing_system_prompt(agent: Any, system_message: str) -> str:
-    """Cached system prompt, or a fresh build when nothing is cached (abort paths)."""
-    return getattr(agent, "_cached_system_prompt", None) or agent._build_system_prompt(system_message)
 
 
-def _restore_messages_snapshot(messages: list, snapshot: Optional[list]) -> None:
-    """Put the pre-compression deep snapshot back into the live list if it drifted."""
-    if snapshot is not None and messages != snapshot:
-        messages[:] = copy.deepcopy(snapshot)
 
 
-def _restore_prune_rearm_tokens(compressor: Any, snapshot: dict) -> None:
-    """Restore ONLY the prune runway from the attempt snapshot.
-    compress() zeroes it in memory while the durable copy only clears on a successful commit; a kept
-    transcript keeps its cached prefix, and 0 would let the next prune break that cache."""
-    if "_proactive_prune_rearm_tokens" in snapshot:
-        compressor._proactive_prune_rearm_tokens = snapshot["_proactive_prune_rearm_tokens"]
 
 
 def compression_skipped_due_to_lock(agent: Any) -> bool:
@@ -3425,6 +2618,11 @@ class _CompressionLease:
             if self._refresher is not None:
                 with _swallow('compression lock refresher stop failed: %s'):
                     self._refresher.stop()
+            # Retire the spool epoch before making the durable lock available.
+            # The watchdog can detach this worker and admit its fallback immediately.
+            if self.spool_epoch is not None and self.holder and not self.spool_committed:
+                with _swallow("compression spool abort failed: %s"):
+                    compression_turn_spool().abort_attempt(self.sid, self.holder, self.spool_epoch)
             if self.db is not None and self.sid and self.holder:
                 with _swallow('compression lock release failed: %s'):
                     self.db.release_compression_lock(self.sid, self.holder)
@@ -3435,9 +2633,6 @@ class _CompressionLease:
             self._lifecycle.complete()
         finally:
             try:
-                if self.spool_epoch is not None and self.holder and not self.spool_committed:
-                    with _swallow("compression spool abort failed: %s"):
-                        compression_turn_spool().abort_attempt(self.sid, self.holder, self.spool_epoch)
                 self.release_holder_only()
             finally:
                 try:
@@ -4761,6 +3956,15 @@ def _route_codex_compaction(
     attempt: _Attempt, approx_tokens: Optional[int], task_id: str, force: bool,
 ) -> tuple[list, str]:
     """Codex owns the real thread: run its own compact under the commit fence bracket."""
+    if getattr(agent, "compression_checkpoint_required", False) is True:
+        blocked = _checkpoint_blocked(
+            "codex_app_server owns the authoritative thread and does not expose a truthful pre-compaction transcript boundary"
+        )
+        _emit_bypassed_attempt_telemetry(
+            agent, attempt.started_at, commit_status="aborted", failure_class=f"exception:{type(blocked).__name__}",
+            approx_tokens=approx_tokens, route="codex_app_server", attempt_seed=attempt.seed,
+        )
+        raise blocked
     if commit_fence is not None and not commit_fence.begin_commit(getattr(agent, "_hard_interrupt_requested", None)):
         attempt.restore_compressor(agent.context_compressor)
         _emit_bypassed_attempt_telemetry(
@@ -4805,6 +4009,20 @@ def _announce_compression_start(
     if status:
         agent._emit_status(status)
     return _CompactionLifecycle(agent, bool(status))
+
+
+def _snapshot_valid_under_lease(agent, lease, snapshot_is_current, attempt):
+    """Reject stale input before starting summary work, releasing its lease on refusal."""
+    try:
+        current = snapshot_is_current is None or snapshot_is_current()
+    except BaseException:
+        lease.release()
+        raise
+    if not current:
+        _emit_aborted_attempt_telemetry(agent, attempt.started_at, "snapshot_stale", attempt.seed)
+        lease.release()
+        return False
+    return True
 
 
 def compress_context(
@@ -4853,15 +4071,6 @@ def compress_context(
     # summary prompt to inject into. `is True`: MagicMock attributes are truthy.
     checkpoint_required = getattr(agent, "compression_checkpoint_required", False) is True
     if getattr(agent, "api_mode", None) == "codex_app_server":
-        if checkpoint_required:
-            blocked = _checkpoint_blocked(
-                "codex_app_server owns the authoritative thread and does not expose a truthful pre-compaction transcript boundary"
-            )
-            _emit_bypassed_attempt_telemetry(
-                agent, attempt.started_at, commit_status="aborted", failure_class=f"exception:{type(blocked).__name__}",
-                approx_tokens=approx_tokens, route="codex_app_server", attempt_seed=attempt.seed,
-            )
-            raise blocked
         return _route_codex_compaction(
             agent, messages, system_message, commit_fence=commit_fence, attempt=attempt, approx_tokens=approx_tokens,
             task_id=task_id, force=force,
@@ -4906,24 +4115,10 @@ def compress_context(
     # Publish the holder-qualified release hook before a timeout can win the
     # fence. If no durable lock was acquired there is no hook to publish.
     lease.finish_lock_setup()
-    try:
-        current = snapshot_is_current is None or snapshot_is_current()
-    except BaseException:
-        lease.release()
-        raise
-    if not current:
-        _emit_aborted_attempt_telemetry(agent, attempt.started_at, "snapshot_stale", attempt.seed)
-        lease.release()
+    if not _snapshot_valid_under_lease(agent, lease, snapshot_is_current, attempt):
         return messages, _existing_system_prompt(agent, system_message)
-    if lease.holder is not None and lease.sid:
-        try:
-            lease.spool_epoch = compression_turn_spool().begin_attempt(lease.sid, lease.holder, allow_stale_owner_takeover=True)
-        except Exception:
-            logger.warning("compression spool registration failed", exc_info=True)
-        if lease.spool_epoch is None:
-            agent._compression_skipped_due_to_lock = "spool_owner_unavailable"
-            lease.release()
-            return messages, _existing_system_prompt(agent, system_message)
+    if not register_compression_turn_spool(agent, lease):
+        return messages, _existing_system_prompt(agent, system_message)
     _adopted = _adopt_if_parent_rotated(
         agent, lease, messages, system_message, attempt=attempt, approx_tokens=approx_tokens,
     )
@@ -5042,61 +4237,8 @@ def compress_context(
             return messages, commit.refused_prompt
         compressed = commit.compressed
         split_status = commit.split_status
-        if commit.session_commit_succeeded and lease.spool_epoch is not None and lease.holder:
-            try:
-                durable_holder = (
-                    lease.db.get_compression_lock_holder(lease.sid)
-                    if lease.db is not None
-                    else None
-                )
-                if durable_holder != lease.holder:
-                    raise RuntimeError("compression spool owner lost durable lease")
-                if not compression_turn_spool().refresh_attempt(
-                    lease.sid,
-                    lease.holder,
-                    lease.spool_epoch,
-                    lease_seconds=lease.ttl,
-                ):
-                    raise RuntimeError("compression spool epoch became stale")
-                lease.spool_committed = compression_turn_spool().commit_attempt(
-                    lease.sid,
-                    lease.holder,
-                    lease.spool_epoch,
-                    live_tip=agent.session_id or lease.sid,
-                )
-                if lease.spool_committed:
-                    drain_compression_turns_into_agent(
-                        agent,
-                        lease.sid,
-                        compressed,
-                    )
-            except Exception:
-                logger.warning(
-                    "compression turn spool commit/drain failed for %s",
-                    lease.sid,
-                    exc_info=True,
-                )
-                try:
-                    _canonical_tip = (
-                        lease.db.get_compression_tip(lease.sid)
-                        if lease.db is not None
-                        else None
-                    )
-                    if compression_turn_spool().reconcile_canonical_tip(
-                        lease.sid,
-                        str(_canonical_tip or ""),
-                        expected_owner=lease.holder,
-                        expected_epoch=lease.spool_epoch,
-                    ):
-                        drain_compression_turns_into_agent(
-                            agent, lease.sid, compressed
-                        )
-                except Exception:
-                    logger.warning(
-                        "compression canonical tip reconciliation failed for %s",
-                        lease.sid,
-                        exc_info=True,
-                    )
+        if commit.session_commit_succeeded:
+            commit_compression_turn_spool(agent, lease, compressed)
 
         _compressed_est = _finish_compaction_boundary(
             agent, compressed, new_system_prompt=new_system_prompt, old_session_id=commit.old_session_id,
@@ -5134,185 +4276,6 @@ def compress_context(
 
 # 4 MB leaves headroom under Anthropic's 5 MB; shrinking loses quality but only
 # runs after a confirmed provider rejection, so the alternative is failure.
-_IMAGE_SHRINK_TARGET_BYTES = 4 * 1024 * 1024
-_IMAGE_SUFFIX_BY_MIME = {
-    "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp", "image/jpeg": ".jpg", "image/jpg": ".jpg",
-    "image/bmp": ".bmp",
-}
-
-
-def _data_url_mime(header: str, default: str = "image/jpeg") -> str:
-    """``image/*`` mime from a ``data:`` URL header, else ``default``."""
-    if header.startswith("data:"):
-        candidate = header[len("data:") :].split(";", 1)[0].strip()
-        if candidate.startswith("image/"):
-            return candidate
-    return default
-
-
-def _decode_pixels(data_url: str) -> Optional[tuple]:
-    """``(width, height)`` of a base64 data URL; None when Pillow is missing or the payload is corrupt."""
-    try:
-        import base64, io
-        _, _, data_d = data_url.partition(",")
-        if not data_d or not data_url.startswith("data:"):
-            return None
-        from PIL import Image
-        with Image.open(io.BytesIO(base64.b64decode(data_d))) as _img:
-            return _img.size
-    except Exception:
-        return None
-
-
-def _shrink_data_url(url: str, *, max_dimension: int, resize_fn: Any) -> tuple:
-    """Return ``(resized_url, unshrinkable)`` for a data URL.
-    ``resized_url`` is None when no rewrite applied. ``unshrinkable`` is True only when the image violated a
-    constraint and resizing failed to satisfy that same constraint, so the caller knows a retry is pointless.
-    The accept gate MUST use the axis that triggered the shrink: a pixel downscale can re-encode to MORE bytes
-    (PNG non-monotonic); a byte-only reject wedges."""
-    target_bytes = _IMAGE_SHRINK_TARGET_BYTES
-    if not isinstance(url, str) or not url.startswith("data:"):
-        return None, False
-    triggered_by = "bytes" if len(url) > target_bytes else None  # over byte budget
-    if triggered_by is None:
-        # Bytes fine; check pixels against the provider cap (tiny bytes, huge pixels).
-        dims = _decode_pixels(url)
-        if dims is None or max(dims) <= max_dimension:
-            return None, False
-        triggered_by = "dimension"
-    try:
-        header, _, data = url.partition(",")
-        mime = _data_url_mime(header)
-        import base64 as _b64
-        raw = _b64.b64decode(data)
-        tmp = tempfile.NamedTemporaryFile(
-            prefix="hermes_shrink_", suffix=_IMAGE_SUFFIX_BY_MIME.get(mime, ".jpg"), delete=False
-        )
-        try:
-            tmp.write(raw)
-            tmp.close()
-            resized = resize_fn(
-                Path(tmp.name), mime_type=mime, max_base64_bytes=target_bytes, max_dimension=max_dimension
-            )
-        finally:
-            with contextlib.suppress(Exception):
-                Path(tmp.name).unlink(missing_ok=True)
-        if not resized:
-            return None, True  # Pillow couldn't help
-        new_dims = _decode_pixels(resized)
-        if triggered_by == "bytes":
-            # Byte budget is binding — bytes must shrink; and the resizer may return an
-            # over-cap blob (long side freezes at the 64px short-side floor) → still 400.
-            ok = len(resized) < len(url) and (new_dims is None or max(new_dims) <= max_dimension)
-        elif new_dims is not None:
-            # Dimension cap is binding: accept a byte-larger re-encode if now within cap.
-            ok = max(new_dims) <= max_dimension
-        else:
-            # Can't verify dimensions: fall back to the bytes-must-shrink gate so we never
-            # accept an unverifiable byte-larger blob.
-            ok = len(resized) < len(url)
-        return (resized, False) if ok else (None, True)
-    except Exception as exc:
-        logger.warning("image-shrink recovery: re-encode failed — %s", exc)
-        return None, triggered_by is not None
-
-
-def _source_to_data_url(source: Any) -> Optional[str]:
-    """Anthropic ``{"type": "base64", ...}`` image source → data URL, else None."""
-    if not isinstance(source, dict) or source.get("type") != "base64":
-        return None
-    data = source.get("data")
-    if not isinstance(data, str) or not data:
-        return None
-    media_type = str(source.get("media_type") or "image/jpeg").strip()
-    return f"data:{media_type if media_type.startswith('image/') else 'image/jpeg'};base64,{data}"
-
-
-def _write_data_url_to_source(source: dict, data_url: str) -> dict:
-    """Return a NEW source dict carrying the re-encoded payload.
-    Copy-on-write: parts may be shared with the persistent history, so mutating in place would store the
-    degraded image; the caller replaces the part."""
-    header, _, data = data_url.partition(",")
-    return {**source, "type": "base64", "media_type": _data_url_mime(header), "data": data}
-
-
-def try_shrink_image_parts_in_messages(api_messages: list, *, max_dimension: int = 8000) -> bool:
-    """Re-encode oversized native image parts to recover from image-too-large errors.
-    Mutates ``api_messages`` in place. Returns True if any part was replaced, False if nothing to shrink or
-    Pillow could not help. Targets data-URL parts over 4 MB or ``max_dimension`` (Anthropic's per-side pixel
-    cap, parsed from the rejection by the caller); http(s) image URLs are left untouched."""
-    if not api_messages:
-        return False
-    try:
-        from tools.vision_tools import _resize_image_for_vision
-    except Exception as exc:
-        logger.warning("image-shrink recovery: vision_tools unavailable — %s", exc)
-        return False
-    changed_count = 0
-    # Track over-target parts that could not be shrunk: if any remain, a retry
-    # re-sends the same payload and wastes the single retry budget.
-    unshrinkable_oversized = 0
-
-    def _shrink(url: Any) -> tuple:
-        return _shrink_data_url(url, max_dimension=max_dimension, resize_fn=_resize_image_for_vision)
-
-    for msg in api_messages:
-        if not isinstance(msg, dict):
-            continue
-        content = msg.get("content")
-        if not isinstance(content, list):
-            continue
-        # Copy-on-write: part/source dicts can alias stored history, so build a new
-        # content list and reassign msg["content"] on the per-call copy.
-        new_content: list | None = None
-        for part_idx, part in enumerate(content):
-            if not isinstance(part, dict):
-                continue
-            ptype = part.get("type")
-            replacement = None
-            if ptype == "image":
-                source = part.get("source")
-                resized, unshrinkable = _shrink(_source_to_data_url(source) or "")
-                if resized and isinstance(source, dict):
-                    replacement = {**part, "source": _write_data_url_to_source(source, resized)}
-            elif ptype in {"image_url", "input_image"}:
-                image_value = part.get("image_url")
-                # OpenAI chat.completions: {"image_url": {"url": "data:..."}}
-                # OpenAI Responses: {"image_url": "data:..."}
-                if isinstance(image_value, dict):
-                    resized, unshrinkable = _shrink(image_value.get("url", ""))
-                    if resized:
-                        replacement = {**part, "image_url": {**image_value, "url": resized}}
-                elif isinstance(image_value, str):
-                    resized, unshrinkable = _shrink(image_value)
-                    if resized:
-                        replacement = {**part, "image_url": resized}
-                else:
-                    continue
-            else:
-                continue
-            if replacement is not None:
-                if new_content is None:
-                    new_content = list(content)
-                new_content[part_idx] = replacement
-                changed_count += 1
-            elif unshrinkable:
-                unshrinkable_oversized += 1
-        if new_content is not None:
-            msg["content"] = new_content
-    target_mb = _IMAGE_SHRINK_TARGET_BYTES / (1024 * 1024)
-    if changed_count:
-        logger.info("image-shrink recovery: re-encoded %d image part(s) to fit under %.0f MB", changed_count, target_mb)
-    if unshrinkable_oversized:
-        # An unshrinkable oversized image makes retry pointless; signal no progress even
-        # if others shrank so the caller surfaces the original error.
-        logger.warning(
-            "image-shrink recovery: %d oversized image part(s) could not be "
-            "shrunk under %.0f MB — not retrying (would re-send rejected payload)", unshrinkable_oversized,
-            target_mb,
-        )
-        return False
-    return changed_count > 0
 
 
 __all__ = [
@@ -5326,5 +4289,4 @@ __all__ = [
     "is_compaction_progress_status",
     "replay_compression_warning",
     "revalidate_compression_feasibility",
-    "try_shrink_image_parts_in_messages",
 ]

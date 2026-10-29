@@ -8,6 +8,7 @@ post-turn follow-ups (queued prompt, goal continuation, notifications).
 """
 
 from __future__ import annotations
+import logging
 
 import dataclasses
 
@@ -1174,6 +1175,7 @@ def _run_prompt_submit_inner(
             # structured control snapshot now so the Desktop card never paints the pre-judge turn count.
             _publish_session_control_snapshot(sid, session, only_if_present=True)
         except Exception as e:
+            logging.getLogger(__name__).debug('_run_prompt_submit_inner.run_body: optional operation failed', exc_info=True)
             _recover_turn_exception(sid, session, st, e)
         finally:
             _release_turn_scopes(sid, session, st)

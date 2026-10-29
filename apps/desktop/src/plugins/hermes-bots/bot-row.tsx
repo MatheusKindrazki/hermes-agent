@@ -164,9 +164,7 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, onNewSection, showHandl
   const { fromBot } = previewKind(previewSession?.preview)
 
   // DM previews read like DMs: strip the delivery prefix, keep the message.
-  const displayPreview = stripPreviewMarkdown(
-    fromBot ? (previewSession?.preview || '').replace(A2A_PREFIX_RE, '').trim() || '…' : previewSession?.preview || ''
-  )
+  const displayPreview = botDisplayPreview(previewSession?.preview, Boolean(fromBot))
 
   const compactPreview = displayPreview.length > 42 ? displayPreview.slice(0, 42).trimEnd() + '…' : displayPreview
 
@@ -659,4 +657,8 @@ export function GroupRow({ active, group, members, needsYou, onOpen, onDisband, 
       </ContextMenuContent>
     </ContextMenu>
   )
+}
+
+function botDisplayPreview(preview: string | null | undefined, fromBot: boolean): string {
+  return stripPreviewMarkdown(fromBot ? (preview || '').replace(A2A_PREFIX_RE, '').trim() || '…' : preview || '')
 }

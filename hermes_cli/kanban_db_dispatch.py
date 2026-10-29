@@ -6,6 +6,12 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 """
 
 from __future__ import annotations
+from hermes_cli.kanban_worker_log import _open_worker_log
+
+from hermes_cli.kanban_worker_command import _worker_profile_scope, _worker_terminal_timeout_env
+
+from hermes_cli import kanban_worker_path
+import logging
 
 import contextlib
 import os
@@ -2029,6 +2035,7 @@ def _dispatch_once_prevalidated(
         db_path = _kb.kanban_db_path(board=board)
     except Exception:
         # Must not lose the tick — fall through to an unguarded dispatch.
+        logging.getLogger(__name__).debug('_dispatch_once_prevalidated: optional operation failed', exc_info=True)
         result = _locked_tick()
         _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
@@ -2056,6 +2063,70 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
     except (TypeError, ValueError):
         return spawn_fn(task, workspace)
+
+
+def _spawn_claimed_lane_task(conn, claimed, result, *, board, lane, failure_limit,
+                             spawn_fn, worker_path_snapshot, target_constraints, count_spawn):
+    """Resolve the claimed workspace, launch its worker and persist ownership."""
+    try:
+        resolved_branch_name = None
+        if claimed.workspace_kind == "worktree":
+            workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
+        else:
+            workspace = _kbw.resolve_workspace(claimed, board=board)
+    except Exception as exc:
+        logging.exception("Claimed worker launch failed")
+        if target_constraints is not None:
+            result.target_reason = "spawn_failed"
+        if _record_task_failure(
+            conn, claimed.id, f"workspace: {exc}",
+            outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+        ):
+            result.auto_blocked.append(claimed.id)
+        return False
+    _kbw.set_workspace_path(conn, claimed.id, str(workspace))
+    if claimed.workspace_kind == "worktree":
+        _kbw.set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+    _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+    if lane == "review":
+        # Force-load sdlc-review; the kanban lifecycle is already in every
+        # worker's system prompt via KANBAN_GUIDANCE.
+        claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
+    try:
+        if spawn_fn is None:
+            pid = _default_spawn(claimed, str(workspace), board=board, worker_path_snapshot=worker_path_snapshot)
+        else:
+            pid = _call_spawn_fn(spawn_fn, claimed, str(workspace), board)
+        if pid:
+            _set_worker_pid(conn, claimed.id, int(pid), run_id=claimed.current_run_id, claim_lock=claimed.claim_lock)
+        # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
+        _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
+        # consecutive_failures is deliberately NOT reset here: resetting on
+        # spawn would let a task that keeps timing out loop forever. Cleared
+        # only on successful completion (complete_task).
+        if target_constraints is not None:
+            result.target_reason = "spawned"
+        result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
+        count_spawn(claimed.assignee)
+        return True
+    except Exception as exc:
+        logging.exception("Claimed worker launch failed")
+        if target_constraints is not None:
+            result.target_reason = "spawn_failed"
+        from tools.process_registry import RestartSafeScopeUnavailable
+
+        # The host refused the spawn (no restart-safe scope): nothing about the
+        # card ran, so it must not spend the card's retry budget (#114720).
+        infrastructure = isinstance(exc, RestartSafeScopeUnavailable)
+        if infrastructure:
+            _kb._log.warning("kanban dispatcher: spawn of %s deferred, host cannot place the worker: %s", claimed.id, exc)
+        if _record_task_failure(
+            conn, claimed.id, str(exc),
+            outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+            infrastructure=infrastructure,
+        ):
+            result.auto_blocked.append(claimed.id)
+        return False
 
 
 def _dispatch_lane_task(
@@ -2150,63 +2221,10 @@ def _dispatch_lane_task(
         claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
         return False
-    try:
-        resolved_branch_name = None
-        if claimed.workspace_kind == "worktree":
-            workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
-        else:
-            workspace = _kbw.resolve_workspace(claimed, board=board)
-    except Exception as exc:
-        if target_constraints is not None:
-            result.target_reason = "spawn_failed"
-        if _record_task_failure(
-            conn, claimed.id, f"workspace: {exc}",
-            outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
-        ):
-            result.auto_blocked.append(claimed.id)
-        return False
-    _kbw.set_workspace_path(conn, claimed.id, str(workspace))
-    if claimed.workspace_kind == "worktree":
-        _kbw.set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
-    _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-    if lane == "review":
-        # Force-load sdlc-review; the kanban lifecycle is already in every
-        # worker's system prompt via KANBAN_GUIDANCE.
-        claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
-    try:
-        if spawn_fn is None:
-            pid = _default_spawn(claimed, str(workspace), board=board, worker_path_snapshot=worker_path_snapshot)
-        else:
-            pid = _call_spawn_fn(spawn_fn, claimed, str(workspace), board)
-        if pid:
-            _set_worker_pid(conn, claimed.id, int(pid), run_id=claimed.current_run_id, claim_lock=claimed.claim_lock)
-        # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
-        _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
-        # consecutive_failures is deliberately NOT reset here: resetting on
-        # spawn would let a task that keeps timing out loop forever. Cleared
-        # only on successful completion (complete_task).
-        if target_constraints is not None:
-            result.target_reason = "spawned"
-        result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
-        _count_spawn(claimed.assignee)
-        return True
-    except Exception as exc:
-        if target_constraints is not None:
-            result.target_reason = "spawn_failed"
-        from tools.process_registry import RestartSafeScopeUnavailable
-
-        # The host refused the spawn (no restart-safe scope): nothing about the
-        # card ran, so it must not spend the card's retry budget (#114720).
-        infrastructure = isinstance(exc, RestartSafeScopeUnavailable)
-        if infrastructure:
-            _kb._log.warning("kanban dispatcher: spawn of %s deferred, host cannot place the worker: %s", claimed.id, exc)
-        if _record_task_failure(
-            conn, claimed.id, str(exc),
-            outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
-            infrastructure=infrastructure,
-        ):
-            result.auto_blocked.append(claimed.id)
-        return False
+    return _spawn_claimed_lane_task(
+        conn, claimed, result, board=board, lane=lane, failure_limit=failure_limit,
+        spawn_fn=spawn_fn, worker_path_snapshot=worker_path_snapshot,
+        target_constraints=target_constraints, count_spawn=_count_spawn)
 
 
 def _apply_default_assignee(
@@ -2515,217 +2533,6 @@ def _dispatch_once_locked(
     return result
 
 
-def _positive_int(value: Any, default: int, *, minimum: int = 1) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return default
-    return parsed if parsed >= minimum else default
-
-
-def _module_hermes_argv() -> list[str]:
-    """Interpreter-bound Hermes CLI invocation (``hermes_cli.main`` is the
-    console-script target — there is no top-level ``hermes`` package)."""
-    return [sys.executable, "-m", "hermes_cli.main"]
-
-
-def _absolute_hermes_path(path: str) -> str:
-    """Return an absolute filesystem path for a resolved Hermes shim."""
-    expanded = os.path.expanduser(path)
-    return expanded if os.path.isabs(expanded) else os.path.abspath(expanded)
-
-
-def _looks_like_path(value: str) -> bool:
-    """Return true when a command override is an explicit path, not a name."""
-    expanded = os.path.expanduser(value)
-    return (
-        expanded.startswith("~")
-        or os.path.isabs(expanded)
-        or bool(os.path.dirname(expanded))
-        or "\\" in expanded
-        or bool(re.match(r"^[A-Za-z]:", expanded))
-    )
-
-
-def _is_windows_batch_shim(path: str) -> bool:
-    """Return true for Windows shell/batch shims that should not be argv[0]."""
-    return path.lower().endswith((".cmd", ".bat"))
-
-
-def _path_search_names(command: str) -> list[str]:
-    """Return executable names to try for an unqualified command."""
-    if not _kb._IS_WINDOWS or os.path.splitext(command)[1]:
-        return [command]
-    raw = os.environ.get("PATHEXT") or ".COM;.EXE;.BAT;.CMD"
-    return [command + ext for ext in raw.split(";") if ext]
-
-
-def _safe_which_no_cwd(command: str) -> Optional[str]:
-    """Resolve a bare command from PATH without implicit current-dir search.
-
-    On Windows ``shutil.which`` may search the current directory before PATH
-    for bare names — unsafe for a dispatcher. Only explicit PATH entries are
-    considered; empty / ``.`` entries are skipped.
-    """
-    for raw_dir in os.environ.get("PATH", "").split(os.pathsep):
-        if not raw_dir or raw_dir == ".":
-            continue
-        directory = os.path.expanduser(raw_dir)
-        for name in _path_search_names(command):
-            candidate = os.path.join(directory, name)
-            if os.path.isfile(candidate) and (_kb._IS_WINDOWS or os.access(candidate, os.X_OK)):
-                return candidate
-    return None
-
-
-def _hermes_path_argv(path: str) -> list[str]:
-    """argv for a resolved Hermes executable path. Windows batch shims
-    (``.cmd``/``.bat``) are unsafe as argv[0] because the argument vector
-    includes task-derived values; prefer the module form."""
-    if _kb._IS_WINDOWS and _is_windows_batch_shim(path):
-        return _module_hermes_argv()
-    return [_absolute_hermes_path(path)]
-
-
-def _resolve_hermes_argv() -> list[str]:
-    """Resolve the ``hermes`` invocation as argv for ``Popen``: ``$HERMES_BIN``
-    (path-like -> absolute; bare names keep PATH semantics, never a
-    same-directory file), then the running interpreter's ``sys.executable -m
-    hermes_cli.main`` (exactly this install; also covers shim-less cron,
-    systemd ``User=``, launchd), then ``which("hermes")`` (Windows: safe PATH
-    search, batch shims fall back to the module form) only when ``hermes_cli``
-    is not importable. The module argv must win over PATH: a PATH-first lookup
-    lets an attacker-planted ``hermes`` shadow the running install (#111569).
-    Mirrors ``gateway.run._resolve_hermes_bin``; local because ``hermes_cli``
-    sits below ``gateway`` in the dependency order.
-    """
-    import importlib.util
-    import shutil
-
-    env_bin = os.environ.get("HERMES_BIN", "").strip()
-    if env_bin:
-        if _looks_like_path(env_bin):
-            return _hermes_path_argv(env_bin)
-        resolved_env_bin = _safe_which_no_cwd(env_bin)
-        if resolved_env_bin:
-            return _hermes_path_argv(resolved_env_bin)
-        return _module_hermes_argv()
-
-    try:
-        if importlib.util.find_spec("hermes_cli") is not None:
-            return _module_hermes_argv()
-    except Exception:
-        pass
-
-    hermes_bin = _safe_which_no_cwd("hermes") if _kb._IS_WINDOWS else shutil.which("hermes")
-    if hermes_bin:
-        return _hermes_path_argv(hermes_bin)
-    return _module_hermes_argv()
-
-
-def _worker_terminal_timeout_env(
-    max_runtime_seconds: Optional[int],
-    current_timeout: Optional[str],
-) -> Optional[str]:
-    """Return a worker-scoped TERMINAL_TIMEOUT override, if needed.
-
-    When ``max_runtime_seconds`` exceeds the terminal tool's default timeout,
-    raise only the child's default so a long command isn't killed by the
-    generic terminal default first.
-    """
-    if max_runtime_seconds is None:
-        return None
-    try:
-        runtime = int(max_runtime_seconds)
-    except (TypeError, ValueError):
-        return None
-    if runtime <= 0:
-        return None
-
-    desired = max(1, runtime - KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS)
-    try:
-        existing = int(str(current_timeout).strip()) if current_timeout else 0
-    except (TypeError, ValueError):
-        existing = 0
-    if existing >= desired:
-        return None
-    return str(desired)
-
-
-@contextlib.contextmanager
-def _worker_profile_scope(hermes_home: str, *, bind_home: bool = True):
-    """Bind an assigned profile's runtime scope (secrets + terminal policy, optionally home) for
-    one dispatch-side read or spawn-env build.
-
-    The dispatcher runs detached from any turn, so nothing binds a profile for it: ``load_config``,
-    the toolset probes' ``get_secret`` reads and ``build_subprocess_env``'s passthrough resolution
-    all fall back to the LAUNCH profile's ambient ``os.environ`` / ``TERMINAL_*``. Binding was
-    previously conditional on ``is_multiplex_active()``, so on a single-profile host a worker for
-    profile B was built entirely from the dispatcher's own environment.
-
-    ``bind_home=False`` for the spawn-env build: which variables may cross into a child is the
-    DISPATCHER's ``terminal.env_passthrough`` policy (#109494, read through the home override) —
-    only their VALUES come from the assignee's scope, so that branch binds the secret scope alone.
-    Toolset resolution binds the home and the terminal policy, as it always has.
-
-    The secret mapping is never widened: a profile that is not this process's own home gets its own
-    ``.env`` + external sources ONLY, while the launch home keeps its established
-    env-over-``.env`` precedence (``launch_secret_scope``) so systemd / ``op run`` injection still
-    resolves for a standalone dispatcher.
-    """
-    from agent.secret_scope import build_profile_secret_scope, reset_secret_scope, set_secret_scope
-    from hermes_constants import get_process_hermes_home, reset_hermes_home_override, set_hermes_home_override
-    from tools.terminal_scope import install_profile_terminal_scope, reset_terminal_scope
-    from tui_gateway.launch_profile_policy import launch_secret_scope, launch_terminal_env
-
-    home = Path(hermes_home)
-    is_launch_home = str(home.resolve()) == str(Path(get_process_hermes_home()).resolve())
-    home_token = secret_token = terminal_token = None
-    try:
-        home_token = set_hermes_home_override(str(home)) if bind_home else None
-        secret_token = set_secret_scope(
-            launch_secret_scope(home) if is_launch_home else build_profile_secret_scope(home),
-            profile_home=None if is_launch_home else str(home))
-        terminal_token = install_profile_terminal_scope(
-            home, env_overlay=launch_terminal_env() if is_launch_home else None) if bind_home else None
-        yield
-    finally:
-        if terminal_token is not None:
-            reset_terminal_scope(terminal_token)
-        if secret_token is not None:
-            reset_secret_scope(secret_token)
-        if home_token is not None:
-            reset_hermes_home_override(home_token)
-
-
-def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[str]]:
-    """Return the assigned profile's effective CLI toolsets for a worker.
-
-    Resolved at dispatch time and passed as an explicit ``--toolsets`` pin so
-    worker startup cannot fall back to a stale root/active-profile config or a
-    profile whose top-level ``toolsets`` is only the kanban orchestrator
-    surface. ``model_tools`` still appends the task-scoped kanban lifecycle
-    tools when ``HERMES_KANBAN_TASK`` is set.
-    """
-    if not hermes_home:
-        return None
-    try:
-        from hermes_cli.config import load_config
-        from hermes_cli.tools_config import _get_platform_tools
-
-        with _worker_profile_scope(hermes_home):
-            cfg = load_config()
-            toolsets = sorted(_get_platform_tools(cfg, "cli"))
-        return toolsets or None
-    except Exception as exc:
-        _kb._log.debug(
-            "kanban worker: could not resolve CLI toolsets for HERMES_HOME=%r (%s)",
-            hermes_home,
-            exc,
-        )
-        return None
-
-
 _retagged_workspace_roots: set[str] = set()
 
 def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
@@ -2757,19 +2564,6 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     """The profile owner executes; this subprocess only waits for its receipt."""
     import sys
     return [sys.executable, "-m", "hermes_cli.kanban_worker_client"]
-
-
-def _open_worker_log(task: Task, board: Optional[str]):
-    """Append-mode per-task log (a re-run on unblock appends, never overwrites),
-    rotated first. Anchored at the board root (not the shared kanban root) so
-    `hermes kanban log` reads its own file and boards sharing task ids don't
-    collide."""
-    log_dir = _kb.worker_logs_dir(board=board)
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"{task.id}.log"
-    from hermes_cli.kanban_worker_log import rotate_worker_log, worker_log_rotation_config
-    rotate_worker_log(log_path, *worker_log_rotation_config())
-    return open(log_path, "ab")
 
 
 def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
@@ -2823,7 +2617,7 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None, w
         raise ValueError(f"task {task.id} has no assignee")
 
     if worker_path_snapshot is None:
-        worker_path_snapshot = _kb._snapshot_worker_path_lib(os.environ)
+        worker_path_snapshot = kanban_worker_path._snapshot_worker_path_lib(os.environ)
 
     from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
 
@@ -2936,7 +2730,7 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None, w
     from tools.process_registry import systemd_user_bus_env
     env = systemd_user_bus_env(env)
     source_image = worker_path_snapshot.open_source_image()
-    cmd = ["/bin/bash", "-c", _kb._WORKER_PATH_EXEC_SCRIPT, "hermes-worker-path",
+    cmd = ["/bin/bash", "-c", kanban_worker_path._WORKER_PATH_EXEC_SCRIPT, "hermes-worker-path",
            worker_path_snapshot.source_path_for(source_image.fileno()), *cmd]
     log_f = None
     try:
@@ -3092,7 +2886,6 @@ def _target_dispatch_preflight_reason(
     return None
 
 
-
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -3124,7 +2917,7 @@ def dispatch_once(
     worker_path_snapshot = None
     if spawn_fn is None and not dry_run:
         try:
-            worker_path_snapshot = _kb._snapshot_worker_path_lib(os.environ)
+            worker_path_snapshot = kanban_worker_path._snapshot_worker_path_lib(os.environ)
         except RuntimeError as exc:
             reason = str(exc)
             return DispatchResult(

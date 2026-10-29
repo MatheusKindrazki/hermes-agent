@@ -171,6 +171,15 @@ const activityEntrances = new WeakMap<SVGSVGElement, { mood: string; since: numb
 
 const greetings = new WeakMap<SVGSVGElement, { amount: number; time: number }>()
 
+function greetingAmount(svg: SVGSVGElement, t: number, reduced: boolean) {
+  const greeting = greetings.get(svg) || { amount: 0, time: t - 1 / 15 }
+  const target = !reduced && svg.getAttribute('data-hb-hover') === '1' ? 1 : 0
+  const blend = 1 - Math.exp(-Math.max(0, Math.min(0.1, t - greeting.time)) / 0.12)
+  const hello = reduced ? 0 : greeting.amount + (target - greeting.amount) * blend
+  greetings.set(svg, { amount: hello, time: t })
+  return hello
+}
+
 export function paintIllustratedFace(
   svg: SVGSVGElement,
   t: number,
@@ -181,11 +190,7 @@ export function paintIllustratedFace(
 ) {
   const role = svg.getAttribute('data-hb-painted')
   const sleepy = role === 'chief' || role === 'skeptical'
-  const greeting = greetings.get(svg) || { amount: 0, time: t - 1 / 15 }
-  const target = !reduced && svg.getAttribute('data-hb-hover') === '1' ? 1 : 0
-  const blend = 1 - Math.exp(-Math.max(0, Math.min(0.1, t - greeting.time)) / 0.12)
-  const hello = reduced ? 0 : greeting.amount + (target - greeting.amount) * blend
-  greetings.set(svg, { amount: hello, time: t })
+  const hello = greetingAmount(svg, t, reduced)
   const mood = svg.getAttribute('data-hb-mood') || 'idle'
   const working = mood === 'work'
   const thinking = mood === 'think'
@@ -224,24 +229,7 @@ export function paintIllustratedFace(
     pupil.setAttribute('cx', String(31 + i * 30 + gazeX * 2 + hello * 4))
     pupil.setAttribute('cy', String(47 + gazeY * 1.8))
   })
-  const brows = svg.querySelector('[data-hb-painted-brows]')
-  brows?.setAttribute('transform', `translate(0 ${-hello * 2})`)
-
-  if (role === 'skeptical') {
-    brows?.setAttribute('d', 'M23 23 Q31 30 40 27 M60 22 Q69 16 76 25')
-  }
-
-  if (role === 'detective') {
-    brows?.setAttribute('d', 'M24 23 Q32 17 40 22 M60 29 Q69 32 77 27')
-  }
-
-  const mouth = svg.querySelector('[data-hb-painted-mouth]')
-
-  if (role === 'detective') {
-    mouth?.setAttribute('d', 'M46 75 Q50 69 54 75')
-  } else if (sleepy) {
-    mouth?.setAttribute('d', 'M43 73 Q51 79 59 72')
-  }
+  paintExpression(svg, role, sleepy, hello)
 
   const tap = reduced ? 0 : Math.max(0, Math.sin(t * 6))
   svg.querySelector('[data-hb-tapping-hand]')?.setAttribute('transform', `translate(${tap * 1.5} ${-tap * 1.5})`)
@@ -261,4 +249,26 @@ export function paintIllustratedFace(
       `translate(0 ${Math.min(0, step) * (working ? 3 : 1.3) - hello * (i ? 0 : 1)}) rotate(${step * (working ? 7 : 3) + hello * (i ? -7 : 7)} ${i ? 65 : 35} 91)`
     )
   })
+}
+
+function paintExpression(svg: SVGSVGElement, role: string | null, sleepy: boolean, hello: number) {
+  const brows = svg.querySelector('[data-hb-painted-brows]')
+  brows?.setAttribute('transform', `translate(0 ${-hello * 2})`)
+
+  if (role === 'skeptical') {
+    brows?.setAttribute('d', 'M23 23 Q31 30 40 27 M60 22 Q69 16 76 25')
+  }
+
+  if (role === 'detective') {
+    brows?.setAttribute('d', 'M24 23 Q32 17 40 22 M60 29 Q69 32 77 27')
+  }
+
+  const mouth = svg.querySelector('[data-hb-painted-mouth]')
+
+  if (role === 'detective') {
+    mouth?.setAttribute('d', 'M46 75 Q50 69 54 75')
+  } else if (sleepy) {
+    mouth?.setAttribute('d', 'M43 73 Q51 79 59 72')
+  }
+
 }

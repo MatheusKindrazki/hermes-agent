@@ -196,10 +196,7 @@ class TestSummaryRoutePinSingleUse:
         import contextvars
 
         def _probe():
-            from agent.context_compressor import (
-                pin_summary_route,
-                take_pinned_summary_route,
-            )
+            from agent.context_compressor_route import (pin_summary_route, take_pinned_summary_route)
 
             route = {"provider": "fallback-prov", "model": "fallback-model"}
             with pin_summary_route(route):
@@ -219,10 +216,7 @@ class TestSummaryRoutePinSingleUse:
         import contextvars
 
         def _consume_in_isolated_context():
-            from agent.context_compressor import (
-                pin_summary_route,
-                take_pinned_summary_route,
-            )
+            from agent.context_compressor_route import (pin_summary_route, take_pinned_summary_route)
 
             with pin_summary_route({"provider": "p", "model": "m"}):
                 take_pinned_summary_route()
@@ -231,7 +225,7 @@ class TestSummaryRoutePinSingleUse:
         ctx.run(_consume_in_isolated_context)
 
         # Outer context never saw the pin.
-        from agent.context_compressor import take_pinned_summary_route
+        from agent.context_compressor_route import (take_pinned_summary_route)
 
         assert take_pinned_summary_route() is None
 

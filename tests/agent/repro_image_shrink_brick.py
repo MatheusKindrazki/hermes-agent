@@ -40,9 +40,7 @@ if str(_REPO_ROOT) not in sys.path:
 PIL = pytest.importorskip("PIL", reason="Pillow required for the real-resize proof")
 from PIL import Image, ImageDraw
 
-from agent.conversation_compression import (
-    try_shrink_image_parts_in_messages,
-)
+from agent.conversation_image_recovery import (try_shrink_image_parts_in_messages)
 
 # The many-image per-side cap Anthropic reported in the wild (issue #48013).
 MANY_IMAGE_CAP = 2000

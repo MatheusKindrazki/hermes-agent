@@ -868,6 +868,7 @@ async def get_desktop_api_capabilities(profile: Optional[str] = None):
             try:
                 return active_context_v1_enabled(load_config())
             except Exception:
+                logging.getLogger(__name__).debug('get_desktop_api_capabilities._read_active_context_gate: optional operation failed', exc_info=True)
                 _log.exception(
                     "Desktop capability config read failed; active_context_v2 remains off"
                 )

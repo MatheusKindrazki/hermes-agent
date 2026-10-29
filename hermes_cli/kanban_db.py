@@ -35,13 +35,12 @@ from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
 from toolsets import get_toolset_names
+from hermes_cli.kanban_db_artifacts import (
+    _persist_scratch_completion_artifacts, _insert_completion_attachment, _discard_staged_copies,
+)
 
 _log = logging.getLogger(__name__)
 
-# Keep the worker-path probe independent from tests/custom launchers that
-# replace ``subprocess.Popen`` to capture the actual worker invocation. The
-# probe is a distinct security boundary and must still execute real bash.
-_REAL_SUBPROCESS_POPEN = subprocess.Popen
 
 
 # --- Shared micro-helpers (row access, JSON, env, git) ---
@@ -2993,134 +2992,14 @@ def _merge_completion_prose_artifacts(
     return updated
 
 
-def _persist_scratch_completion_artifacts(
-    conn: sqlite3.Connection, task_id: str, metadata: dict,
-) -> None:
-    """Copy scratch-workspace completion artifacts before cleanup removes them."""
-    raw_artifacts = metadata.get("artifacts")
-    if not isinstance(raw_artifacts, (list, tuple)):
-        return
-
-    workspace = _scratch_workspace(conn, task_id)
-    if workspace is None:
-        return
-    is_managed, board = _managed_scratch_path_info(workspace)
-    if not is_managed:
-        return
-
-    try:
-        workspace_root = workspace.resolve()
-    except OSError:
-        return
-
-    attachment_dir = task_attachments_dir(task_id, board=board)
-    persisted: list[str] = []
-    used_destinations: set[Path] = set()
-    changed = False
-
-    def _discard_copies() -> None:
-        _discard_staged_copies(used_destinations, attachment_dir)
-
-    for item in raw_artifacts:
-        artifact = str(item).strip() if isinstance(item, str) else ""
-        if not artifact:
-            continue
-        src = Path(artifact).expanduser()
-        try:
-            resolved_src = src.resolve()
-        except OSError:
-            persisted.append(artifact)
-            continue
-
-        if not resolved_src.is_relative_to(workspace_root):
-            persisted.append(artifact)
-            continue
-
-        problem = None
-        if not src.is_file():
-            problem = f"declared scratch artifact is unavailable or not a regular file: {artifact}"
-        elif resolved_src.stat().st_size > KANBAN_ATTACHMENT_MAX_BYTES:
-            problem = (
-                f"declared scratch artifact exceeds the "
-                f"{KANBAN_ATTACHMENT_MAX_BYTES}-byte limit: {artifact}"
-            )
-        if problem:
-            _discard_copies()
-            raise ArtifactPreservationError(problem)
-
-        dest: Optional[Path] = None
-        try:
-            attachment_dir.mkdir(parents=True, exist_ok=True)
-            dest = _unique_attachment_path(attachment_dir, resolved_src.name, used_destinations)
-            _copy_capped(resolved_src, dest, artifact)
-        except Exception as exc:
-            if dest is not None:
-                with contextlib.suppress(OSError):
-                    dest.unlink(missing_ok=True)
-            _discard_copies()
-            if isinstance(exc, ArtifactPreservationError):
-                raise
-            raise ArtifactPreservationError(
-                f"could not preserve declared scratch artifact {artifact}: {exc}"
-            ) from exc
-        used_destinations.add(dest)
-        persisted.append(str(dest.resolve()))
-        changed = True
-
-    if changed:
-        metadata["artifacts"] = persisted
-        metadata["_staged_artifacts"] = [
-            path for path in persisted if path.startswith(str(attachment_dir.resolve()))
-        ]
 
 
-def _discard_staged_copies(copies: Iterable[Path], attachment_dir: Path) -> None:
-    """Remove staged attachment copies whose DB rows never committed; a leaked
-    copy would make the retry stage ``name_1.ext`` next to an orphan."""
-    for copied in copies:
-        with contextlib.suppress(OSError):
-            Path(copied).unlink(missing_ok=True)
-    with contextlib.suppress(OSError):
-        attachment_dir.rmdir()
 
 
-def _copy_capped(src: Path, dest: Path, artifact: str) -> None:
-    """Chunked copy that aborts if the file grows past the attachment cap mid-copy."""
-    with src.open("rb") as source_file, dest.open("xb") as destination_file:
-        copied = 0
-        while chunk := source_file.read(1024 * 1024):
-            copied += len(chunk)
-            if copied > KANBAN_ATTACHMENT_MAX_BYTES:
-                raise ArtifactPreservationError(
-                    f"declared scratch artifact grew beyond the size limit: {artifact}"
-                )
-            destination_file.write(chunk)
 
 
-def _insert_completion_attachment(
-    conn: sqlite3.Connection, task_id: str, *, filename: str, stored_path: str, size: int,
-    created_at: int, uploaded_by: str = "kanban_complete",
-) -> None:
-    """Record a worker-produced artifact in the existing attachment table."""
-    conn.execute(
-        "INSERT INTO task_attachments "
-        "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at) "
-        "VALUES (?, ?, ?, NULL, ?, ?, ?)",
-        (task_id, filename, stored_path, size, uploaded_by, created_at),
-    )
-    _append_event(conn, task_id, "attached", {"filename": filename, "size": size, "by": uploaded_by})
 
 
-def _unique_attachment_path(directory: Path, filename: str, used: set[Path]) -> Path:
-    """Return a non-conflicting path under ``directory`` for ``filename``."""
-    safe_name = Path(filename).name or "artifact"
-    stem, suffix = Path(safe_name).stem or "artifact", Path(safe_name).suffix
-    candidate = directory / safe_name
-    idx = 1
-    while candidate in used or candidate.exists():
-        candidate = directory / f"{stem}_{idx}{suffix}"
-        idx += 1
-    return candidate
 
 
 def edit_task(
@@ -4305,163 +4184,5 @@ from hermes_cli.kanban_db_workspace import (
     _managed_scratch_path_info,
     _scratch_workspace,
 )
-from hermes_cli.kanban_db_dispatch import (
-    DEFAULT_FAILURE_LIMIT,
-    DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
-    DispatchResult,
-    _clear_failure_counter,
-    _defer_reclaim_for_live_worker,
-    _pid_alive,
-    _record_task_failure,
-    _terminate_reclaimed_worker,
-    _worker_alive,
-    _worker_survived_termination,
-    _worker_terminal_timeout_env,
-)
-
-
-_WORKER_PATH_SOURCE_SCRIPT = r'''
-source "$1" || {
-  rc=$?
-  printf '%s\n' worker_path_source_failed >&2
-  exit "$rc"
-}
-'''
-
-_WORKER_PATH_EXEC_SCRIPT = _WORKER_PATH_SOURCE_SCRIPT + r'''
-shift
-exec "$@"
-'''
-
-
-@dataclass(frozen=True)
-class _WorkerPathSnapshot:
-    approved_bytes: bytes
-    original_path: str
-    sha256: str
-
-    def open_source_image(self):
-        """Return an unlinked, read-only FD containing approved bytes."""
-        write_fd, temp_path = tempfile.mkstemp(prefix="hermes-worker-path-")
-        try:
-            view = memoryview(self.approved_bytes)
-            while view:
-                written = os.write(write_fd, view)
-                view = view[written:]
-            os.fsync(write_fd)
-        finally:
-            os.close(write_fd)
-        try:
-            read_fd = os.open(temp_path, os.O_RDONLY)
-        finally:
-            os.unlink(temp_path)
-        return os.fdopen(read_fd, "rb")
-
-    # Tests and callers can use one stable spelling without knowing the FD
-    # until an immutable per-process image is opened.
-    @staticmethod
-    def source_path_for(fd: int) -> str:
-        return f"/dev/fd/{fd}"
-
-    @property
-    def fd(self) -> int:
-        image = getattr(self, "_test_image", None)
-        if image is None:
-            image = self.open_source_image()
-            object.__setattr__(self, "_test_image", image)
-        return image.fileno()
-
-    @property
-    def source_path(self) -> str:
-        return self.source_path_for(self.fd)
-
-    def close(self) -> None:
-        image = getattr(self, "_test_image", None)
-        if image is not None:
-            image.close()
-            object.__setattr__(self, "_test_image", None)
-
-
-def _probe_worker_path_snapshot(
-    snapshot: _WorkerPathSnapshot,
-    env: Mapping[str, str],
-) -> None:
-    image = snapshot.open_source_image()
-    try:
-        probe = _REAL_SUBPROCESS_POPEN(
-            [
-                "/bin/bash",
-                "-c",
-                _WORKER_PATH_SOURCE_SCRIPT,
-                "hermes-worker-path-probe",
-                snapshot.source_path_for(image.fileno()),
-            ],
-            env=dict(env),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            pass_fds=(image.fileno(),),
-        )
-        probe.communicate()
-    finally:
-        image.close()
-    if probe.returncode != 0:
-        raise RuntimeError("worker_path_source_failed")
-
-
-def _snapshot_worker_path_lib(env: Mapping[str, str]) -> _WorkerPathSnapshot:
-    """Read once, hash once, then source only immutable approved bytes.
-
-    The configured pathname is opened exactly once with ``O_NOFOLLOW`` when
-    available. Probe and launcher receive separate unlinked read-only images
-    of the same immutable ``bytes`` object, so replacing or rewriting the
-    configured pathname after approval cannot change what gets sourced.
-    """
-    lib_value = (env.get("HERMES_WORKER_PATH_LIB") or "").strip()
-    if not lib_value:
-        raise RuntimeError("worker_path_lib_missing")
-    lib_path = Path(lib_value)
-    if not lib_path.is_absolute():
-        raise RuntimeError("worker_path_lib_invalid")
-
-    expected = (env.get("K5_WORKER_PATH_SHA256") or "").strip().lower()
-    if not re.fullmatch(r"[0-9a-f]{64}", expected):
-        raise RuntimeError("worker_path_hash_invalid")
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    try:
-        source_fd = os.open(str(lib_path), flags)
-        try:
-            if not stat.S_ISREG(os.fstat(source_fd).st_mode):
-                raise RuntimeError("worker_path_lib_invalid")
-            chunks = []
-            while True:
-                chunk = os.read(source_fd, 65536)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-            approved_bytes = b"".join(chunks)
-        finally:
-            os.close(source_fd)
-    except RuntimeError:
-        raise
-    except OSError as exc:
-        raise RuntimeError("worker_path_hash_unavailable") from exc
-    actual = hashlib.sha256(approved_bytes).hexdigest()
-    if not secrets.compare_digest(actual, expected):
-        raise RuntimeError("worker_path_hash_mismatch")
-
-    snapshot = _WorkerPathSnapshot(
-        approved_bytes=approved_bytes,
-        original_path=str(lib_path),
-        sha256=expected,
-    )
-    _probe_worker_path_snapshot(snapshot, env)
-    return snapshot
-
-
-def _validate_worker_path_lib(env: Mapping[str, str]) -> tuple[str, str]:
-    """Backward-compatible validation helper backed by immutable snapshot."""
-    snapshot = _snapshot_worker_path_lib(env)
-    return snapshot.original_path, snapshot.sha256
+from hermes_cli.kanban_db_dispatch import DEFAULT_FAILURE_LIMIT, DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS, DispatchResult, _clear_failure_counter, _defer_reclaim_for_live_worker, _pid_alive, _record_task_failure, _terminate_reclaimed_worker, _worker_alive, _worker_survived_termination
+from hermes_cli.kanban_worker_command import _worker_terminal_timeout_env

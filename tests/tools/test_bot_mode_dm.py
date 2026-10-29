@@ -5,6 +5,7 @@ canonical Bot Chat session on a Bot-Mode-managed install, and must refuse to
 deliver from anywhere else even if a schema leaks.
 """
 
+from agent.durable_observation import ObservationWriter
 import json
 import os
 import shlex
@@ -80,7 +81,7 @@ def test_observe_admission_failure_delivers_once_with_durable_gap(tmp_path, monk
     monkeypatch.setenv(da.ENV_MODE, "observe")
     monkeypatch.setattr(da, "_settings", lambda: {"tenant": "personal", "machine": "mini", "profile": "default"})
     monkeypatch.setattr(da, "_active_profile", lambda: "default")
-    writer = da.ObservationWriter(tmp_path / "receipts", code_sha="a" * 40)
+    writer = ObservationWriter(tmp_path / "receipts", code_sha="a" * 40)
     monkeypatch.setattr(da, "_OBSERVER", writer)
     writer.checkpoint()
     calls = []

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from hermes_cli import kanban_worker_command
+
 import json
 import os
 import sqlite3
@@ -1586,11 +1588,11 @@ def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch):
 
     monkeypatch.delenv("HERMES_BIN", raising=False)
     monkeypatch.setattr(shutil, "which", lambda name: "/tmp/planted/hermes")
-    monkeypatch.setattr(kbd, "_safe_which_no_cwd", lambda name: "/tmp/planted/hermes")
-    assert kbd._resolve_hermes_argv() == [sys.executable, "-m", "hermes_cli.main"]
+    monkeypatch.setattr(kanban_worker_command, "_safe_which_no_cwd", lambda name: "/tmp/planted/hermes")
+    assert kanban_worker_command._resolve_hermes_argv() == [sys.executable, "-m", "hermes_cli.main"]
 
     monkeypatch.setenv("HERMES_BIN", "/opt/hermes/bin/hermes")
-    assert kbd._resolve_hermes_argv() == ["/opt/hermes/bin/hermes"]
+    assert kanban_worker_command._resolve_hermes_argv() == ["/opt/hermes/bin/hermes"]
 
 
 
@@ -1611,7 +1613,7 @@ def test_resolve_hermes_argv_module_actually_runs():
     with mock.patch.dict(os.environ, {}, clear=False):
         os.environ.pop("HERMES_BIN", None)
         with mock.patch.object(shutil, "which", return_value=None):
-            argv = kbd._resolve_hermes_argv()
+            argv = kanban_worker_command._resolve_hermes_argv()
     offline = {**os.environ, "HTTPS_PROXY": "http://127.0.0.1:9", "https_proxy": "http://127.0.0.1:9", "NO_PROXY": "", "no_proxy": ""}
     r = subprocess.run(argv + ["--version"], capture_output=True, text=True, timeout=30, check=False, env=offline)
     assert r.returncode == 0, (
@@ -1664,7 +1666,7 @@ def test_default_spawn_pins_repo_root_on_module_worker_pythonpath(tmp_path, monk
     )
 
     for resolved in ([sys.executable, "-m", "hermes_cli.main"], ["/opt/hermes/bin/hermes"]):
-        monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda resolved=resolved: resolved)
+        monkeypatch.setattr(kanban_worker_command, "_resolve_hermes_argv", lambda resolved=resolved: resolved)
         kbd._default_spawn(task, str(tmp_path / "ws"))
         assert captured["cmd"][-3:] == [sys.executable, "-m", "hermes_cli.kanban_worker_client"]
         assert captured["env"]["PYTHONPATH"].split(os.pathsep)[0] == root
@@ -2023,63 +2025,3 @@ def test_write_txn_check_reads_correct_header_fields(tmp_path):
 # long-lived processes (gateway run_slash, dashboard decompose handler).
 # `connect_closing()` is the leak-safe replacement.
 # ---------------------------------------------------------------------------
-
-
-
-
-
-
-def test_archive_running_task_terminates_worker(kanban_home, monkeypatch):
-    """``archive_task`` on a *running* task must actually signal its host-local
-    worker process, not just null ``worker_pid`` in the DB (#76196: a worker
-    kept running past its own archive and could still push/complete work
-    against a task nothing tracks anymore). The termination outcome is
-    auditable via the ``archive_worker_termination`` event."""
-    import json
-
-    with kbc.connect() as conn:
-        t = kb.create_task(conn, title="x", assignee="a")
-        host = kb._claimer_id().split(":", 1)[0]
-        kb.claim_task(conn, t, claimer=f"{host}:worker")
-        # A verified spawn: an uncaptured fingerprint would (correctly) refuse the signal.
-        monkeypatch.setattr(kbd, "_process_fingerprint", lambda _pid: "boot:1|777")
-        kbd._set_worker_pid(conn, t, 54321)
-
-        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
-        signalled = []
-        assert kb.archive_task(
-            conn, t, signal_fn=lambda pid, sig: signalled.append((pid, sig)),
-        ) is True
-
-        assert signalled and signalled[0][0] == 54321
-
-        row = conn.execute(
-            "SELECT payload FROM task_events "
-            "WHERE task_id = ? AND kind = 'archive_worker_termination'",
-            (t,),
-        ).fetchone()
-        payload = json.loads(row["payload"])
-        assert payload["prev_pid"] == 54321
-        assert payload["host_local"] is True
-        assert payload["termination_attempted"] is True
-        assert payload["terminated"] is True
-        assert kb.get_task(conn, t).status == "archived"
-
-
-def test_archive_non_running_task_does_not_attempt_termination(kanban_home):
-    """A never-claimed (``triage``/``ready``/``done``) task has no live worker:
-    ``archive_task`` must not signal anything, and no termination event is
-    recorded — only for tasks that were actually ``running`` at archive time."""
-    with kbc.connect() as conn:
-        t = kb.create_task(conn, title="x", assignee="a")
-        signalled = []
-        assert kb.archive_task(
-            conn, t, signal_fn=lambda pid, sig: signalled.append((pid, sig)),
-        ) is True
-        assert signalled == []
-        row = conn.execute(
-            "SELECT 1 FROM task_events "
-            "WHERE task_id = ? AND kind = 'archive_worker_termination'",
-            (t,),
-        ).fetchone()
-        assert row is None

@@ -231,17 +231,25 @@ function useReconcileRosterOwner(
   }, [data, error, selectionHydrated, roster, sourceSnapshot, allMeta])
 }
 
+function readRosterView(): 'now' | 'all' {
+  try {
+    return window.localStorage.getItem('hermes-bots:roster-view') === 'all' ? 'all' : 'now'
+  } catch {
+    return 'now'
+  }
+}
+
+function rosterSnapshot(data: ReturnType<typeof useRoster>['data'], error: unknown) {
+  const live = Array.isArray(data?.profiles) ? data.profiles : null
+  const source = live ?? (error ? $lastRoster.get() : [])
+  return { live, source }
+}
+
 export function BotsPane() {
   const { t } = useI18n()
   const b = useBots()
 
-  const [rosterView, setRosterView] = useState<'now' | 'all'>(() => {
-    try {
-      return window.localStorage.getItem('hermes-bots:roster-view') === 'all' ? 'all' : 'now'
-    } catch {
-      return 'now'
-    }
-  })
+  const [rosterView, setRosterView] = useState<'now' | 'all'>(readRosterView)
 
   useEffect(() => {
     try {
@@ -257,7 +265,7 @@ export function BotsPane() {
   const turnBusy = useTurnBusy()
   const liveSessionWork = useSessionWork()
   const workingOwner = focusedRosterOwner(useValue($focusedBotOwner))
-  const activeConnectionId = host.state.connectionId?.get?.() || 'local'
+  const activeConnectionId = rosterConnectionId()
   const [createOpen, setCreateOpen] = useState(false)
   const [groupCreateOpen, setGroupCreateOpen] = useState(false)
   const [editing, setEditing] = useState<null | RosterRow>(null)
@@ -308,8 +316,7 @@ export function BotsPane() {
   // roster the user already had — mixed local+cloud gateways and remotes
   // waking from sleep fail transiently. Render the last good snapshot with
   // a notice; the full error card is reserved for "never had a roster".
-  const live = Array.isArray(data?.profiles) ? data.profiles : null
-  const source = live ?? (error ? $lastRoster.get() : [])
+  const { live, source } = rosterSnapshot(data, error)
   const sourceSnapshot = Array.isArray(data?.sources) ? data.sources : rememberedSources
 
   const sourceWithSelectedOwner =
@@ -606,4 +613,8 @@ export function BotsPane() {
       })}
     </div>
   )
+}
+
+function rosterConnectionId() {
+  return host.state.connectionId?.get?.() || 'local'
 }

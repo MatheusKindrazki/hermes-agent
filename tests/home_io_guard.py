@@ -74,24 +74,29 @@ class HomeIOGuard:
         self.checking = threading.local()
         self.directories: dict[int, Path] = {}
 
+    def _resolve_candidate(self, value, dir_fd):
+        """Expand a filesystem operand while retaining descriptor-relative ownership."""
+        candidate = os.fsdecode(value)
+        if candidate.startswith("~"):
+            # A test may have patched Path.expanduser to fail; the guard must not
+            # turn that into its own crash — the unexpanded path is checked instead.
+            try:
+                candidate = os.fspath(Path(candidate).expanduser())
+            except Exception:
+                pass
+        if dir_fd is not None and not os.path.isabs(candidate):
+            parent = self.directories.get(dir_fd)
+            if parent is None:
+                raise AssertionError("TEST BUG: untracked dir_fd in guarded filesystem I/O")
+            candidate = os.path.join(os.fspath(parent), candidate)
+        return candidate
+
     def check(self, value, *, dir_fd=None, metadata=False, destructive=False):
         if value is None or isinstance(value, int) or getattr(self.checking, "active", False):
             return
         self.checking.active = True
         try:
-            candidate = os.fsdecode(value)
-            if candidate.startswith("~"):
-                # A test may have patched Path.expanduser to fail; the guard must not
-                # turn that into its own crash — the unexpanded path is checked instead.
-                try:
-                    candidate = os.fspath(Path(candidate).expanduser())
-                except Exception:
-                    pass
-            if dir_fd is not None and not os.path.isabs(candidate):
-                parent = self.directories.get(dir_fd)
-                if parent is None:
-                    raise AssertionError("TEST BUG: untracked dir_fd in guarded filesystem I/O")
-                candidate = os.path.join(os.fspath(parent), candidate)
+            candidate = self._resolve_candidate(value, dir_fd)
             absolute = _normcase(os.path.abspath(candidate))
             # /proc/<pid>/fd/N is descriptor inspection (deleted-WAL holder scans stat the magic
             # link to compare inode identity); resolving it names whatever file that fd holds,

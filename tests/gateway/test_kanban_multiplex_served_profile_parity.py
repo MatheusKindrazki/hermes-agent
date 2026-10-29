@@ -5,6 +5,7 @@ config.
 """
 
 import asyncio
+import os
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -60,6 +61,9 @@ def test_worker_for_served_profile_gets_its_own_env_and_toolset_pin(served, monk
         spawned["argv"], spawned["env"] = argv, kwargs["env"]
         return SimpleNamespace(pid=4242)
 
+    from tests.e2e.core._worker_path import signed_worker_path_env
+    for key, value in signed_worker_path_env(served.root, os.environ).items():
+        monkeypatch.setenv(key, value)
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     monkeypatch.setattr(kbd, "_open_worker_log", lambda task, board: open("/dev/null", "w"))
     monkeypatch.setattr(kbd, "_hermes_argv", lambda: ["hermes"], raising=False)

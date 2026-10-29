@@ -1,5 +1,6 @@
 """Durable, opt-in local Bot Chat delivery. POSIX worker; no new model tool."""
 from __future__ import annotations
+import logging
 
 import argparse
 import contextlib
@@ -291,7 +292,7 @@ def serve(queue: Queue):
                     try:
                         queue.notify(job)
                     except Exception:
-                        pass  # durable notified=0 makes the next poll retry
+                        logging.getLogger(__name__).debug('serve: optional operation failed', exc_info=True)
                 elif len(children) < 4 and job["id"] not in children:
                     with _try_lock(queue.folder(job["id"]) / ".lock") as idle:
                         if not idle:

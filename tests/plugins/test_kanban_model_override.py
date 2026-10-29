@@ -8,6 +8,10 @@ PATCH/bulk/model-options surfaces.
 
 from __future__ import annotations
 
+from hermes_cli import kanban_worker_command
+
+from hermes_cli import kanban_worker_path
+
 import importlib.util
 import json
 import hashlib
@@ -153,7 +157,7 @@ def test_spawn_resolves_claimed_task_policy(
     worker_path.chmod(0o700)
     monkeypatch.setenv("HERMES_WORKER_PATH_LIB", str(worker_path))
     monkeypatch.setenv("K5_WORKER_PATH_SHA256", hashlib.sha256(worker_path.read_bytes()).hexdigest())
-    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kanban_worker_command, "_resolve_hermes_argv", lambda: ["hermes"])
     captured = {}
 
     def fake_popen(cmd, **kwargs):
@@ -163,7 +167,7 @@ def test_spawn_resolves_claimed_task_policy(
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     kbd._default_spawn(task, str(workspace))
-    assert captured["cmd"][:4] == ["/bin/bash", "-c", kb._WORKER_PATH_EXEC_SCRIPT, "hermes-worker-path"]
+    assert captured["cmd"][:4] == ["/bin/bash", "-c", kanban_worker_path._WORKER_PATH_EXEC_SCRIPT, "hermes-worker-path"]
     assert captured["cmd"][4].startswith("/dev/fd/")
     assert captured["cmd"][5:] == [sys.executable, "-m", "hermes_cli.kanban_worker_client"]
     assert captured["env"]["HERMES_HOME"] == str(profile)

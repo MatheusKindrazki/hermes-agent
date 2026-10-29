@@ -816,6 +816,18 @@ function settlePose(svg: SVGSVGElement, mood: string, target: FacePose, t: numbe
   return pose
 }
 
+function paintMathBody(body: Element | null, shape: string, pose: FacePose) {
+  if (body) {
+    if (shape === 'cloud') {
+      body.setAttribute('d', 'M11 32 a7.5 7.5 0 0 1 -1 -14.9 A9.5 9.5 0 0 1 29 12.5 A7 7 0 0 1 30 32 Z')
+    } else {
+      const ring = sampleFaceRing(shape).map(([x, y]) => projectFacePoint(x, y, pose.turn, pose.tilt, pose.roll))
+      body.setAttribute('d', ringToPath(ring))
+    }
+  }
+
+}
+
 function paintMathFace(svg: SVGSVGElement, t: number) {
   const mood = svg.getAttribute('data-hb-mood') || 'idle'
   const shape = svg.getAttribute('data-hb-shape') || 'circle'
@@ -835,14 +847,7 @@ function paintMathFace(svg: SVGSVGElement, t: number) {
     mouth.setAttribute('d', `M${x - 2.5} 26.5 Q${x} ${26.5 + pose.smile * 2.3} ${x + 2.5} 26.5`)
   }
 
-  if (body) {
-    if (shape === 'cloud') {
-      body.setAttribute('d', 'M11 32 a7.5 7.5 0 0 1 -1 -14.9 A9.5 9.5 0 0 1 29 12.5 A7 7 0 0 1 30 32 Z')
-    } else {
-      const ring = sampleFaceRing(shape).map(([x, y]) => projectFacePoint(x, y, pose.turn, pose.tilt, pose.roll))
-      body.setAttribute('d', ringToPath(ring))
-    }
-  }
+  paintMathBody(body, shape, pose)
 
   const eyeY = (shape === 'cloud' ? 22 : 17.2) + pose.gazeY
   const eyeL = 15.4 + pose.gazeX
@@ -940,6 +945,70 @@ declare global {
   }
 }
 
+function paintBlobFace(face: SVGSVGElement, faceTime: number, reducedMotion: boolean) {
+  const mood = face.getAttribute('data-hb-mood') || 'idle'
+
+  const pose = settlePose(
+    face,
+    mood,
+    facePose(mood, faceTime, face.getAttribute('data-bot-face') || ''),
+    faceTime
+  )
+
+  const eyes = face.querySelector<SVGGElement>('[data-hb-blob-eyes]')
+  const body = face.querySelector<SVGGElement>('g:not([data-hb-blob-eyes])')
+  const mouth = face.querySelector('[data-hb-blob-mouth]')
+
+  if (mouth) {
+    const x = 50 + pose.gazeX * 1.25
+    mouth.setAttribute('d', `M${x - 6} 67 Q${x} ${67 + pose.smile * 5} ${x + 6} 67`)
+  }
+
+  if (body) {
+    body.style.transformBox = 'fill-box'
+    body.style.transformOrigin = 'center'
+    body.style.transform = reducedMotion
+      ? 'none'
+      : `translate(${pose.gazeX * 0.4}px, ${pose.gazeY * 0.25}px) rotate(${pose.roll}deg) scale(${1 - Math.abs(pose.gazeX) * 0.006}, 1)`
+  }
+
+  face.style.transform = reducedMotion ? 'none' : avatarMotion(faceTime)
+  face.style.transformOrigin = '50% 50%'
+
+  if (eyes) {
+    eyes.style.opacity = '1'
+    eyes.style.transformBox = 'fill-box'
+    eyes.style.transformOrigin = 'center'
+    eyes.style.transform = reducedMotion
+      ? 'none'
+      : `translate(${pose.gazeX * 2.5}px, ${pose.gazeY * 2.5}px) rotate(${pose.eyeLean * 0.3}deg) scale(${pose.eyeWidth}, ${pose.eyeOpen})`
+  }
+}
+
+function paintAnimatedFace(svg: SVGSVGElement, t: number, reducedMotion: boolean) {
+  const face = svg as SVGSVGElement
+  const phase = sigilRng(face.getAttribute('data-bot-face') || 'agent')() * 12
+  const faceTime = reducedMotion ? 0 : t + phase
+
+  if (face.hasAttribute('data-hb-painted')) {
+    const pose = facePose(
+      face.getAttribute('data-hb-mood') || 'idle',
+      faceTime,
+      face.getAttribute('data-bot-face') || ''
+    )
+
+    paintIllustratedFace(face, faceTime, pose.gazeX, pose.gazeY, pose.eyeOpen, Boolean(reducedMotion))
+  } else if (face.hasAttribute('data-hb-blob')) {
+    paintBlobFace(face, faceTime, reducedMotion)
+  } else {
+    paintMathFace(face, faceTime)
+
+    if (reducedMotion) {
+      face.style.transform = 'none'
+    }
+  }
+}
+
 export function startFaceClock() {
   if (typeof window === 'undefined') {
     return
@@ -1025,63 +1094,7 @@ export function startFaceClock() {
 
     for (const svg of facesToPaint) {
       if (svg.isConnected) {
-        const face = svg as SVGSVGElement
-        const phase = sigilRng(face.getAttribute('data-bot-face') || 'agent')() * 12
-        const faceTime = reducedMotion ? 0 : t + phase
-
-        if (face.hasAttribute('data-hb-painted')) {
-          const pose = facePose(
-            face.getAttribute('data-hb-mood') || 'idle',
-            faceTime,
-            face.getAttribute('data-bot-face') || ''
-          )
-
-          paintIllustratedFace(face, faceTime, pose.gazeX, pose.gazeY, pose.eyeOpen, Boolean(reducedMotion))
-        } else if (face.hasAttribute('data-hb-blob')) {
-          const mood = face.getAttribute('data-hb-mood') || 'idle'
-
-          const pose = settlePose(
-            face,
-            mood,
-            facePose(mood, faceTime, face.getAttribute('data-bot-face') || ''),
-            faceTime
-          )
-
-          const eyes = face.querySelector<SVGGElement>('[data-hb-blob-eyes]')
-          const body = face.querySelector<SVGGElement>('g:not([data-hb-blob-eyes])')
-          const mouth = face.querySelector('[data-hb-blob-mouth]')
-
-          if (mouth) {
-            const x = 50 + pose.gazeX * 1.25
-            mouth.setAttribute('d', `M${x - 6} 67 Q${x} ${67 + pose.smile * 5} ${x + 6} 67`)
-          }
-
-          if (body) {
-            body.style.transformBox = 'fill-box'
-            body.style.transformOrigin = 'center'
-            body.style.transform = reducedMotion
-              ? 'none'
-              : `translate(${pose.gazeX * 0.4}px, ${pose.gazeY * 0.25}px) rotate(${pose.roll}deg) scale(${1 - Math.abs(pose.gazeX) * 0.006}, 1)`
-          }
-
-          face.style.transform = reducedMotion ? 'none' : avatarMotion(faceTime)
-          face.style.transformOrigin = '50% 50%'
-
-          if (eyes) {
-            eyes.style.opacity = '1'
-            eyes.style.transformBox = 'fill-box'
-            eyes.style.transformOrigin = 'center'
-            eyes.style.transform = reducedMotion
-              ? 'none'
-              : `translate(${pose.gazeX * 2.5}px, ${pose.gazeY * 2.5}px) rotate(${pose.eyeLean * 0.3}deg) scale(${pose.eyeWidth}, ${pose.eyeOpen})`
-          }
-        } else {
-          paintMathFace(face, faceTime)
-
-          if (reducedMotion) {
-            face.style.transform = 'none'
-          }
-        }
+        paintAnimatedFace(svg as SVGSVGElement, t, Boolean(reducedMotion))
       }
     }
   }

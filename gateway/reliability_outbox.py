@@ -105,10 +105,11 @@ def resolve_outbox_settings(
     home = Path(hermes_home) if hermes_home is not None else get_hermes_home()
     if config is None:
         try:
-            from hermes_cli.config import load_config
+            from hermes_cli.config_effective import load_user_config_effective
 
-            config = load_config()
+            config = load_user_config_effective()
         except Exception:
+            logging.getLogger(__name__).debug('resolve_outbox_settings: optional operation failed', exc_info=True)
             logger.warning("Could not load reliability outbox config; using off")
             config = {}
     gateway = _mapping(_mapping(config).get("gateway"))

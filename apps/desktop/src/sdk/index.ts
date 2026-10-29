@@ -1,3 +1,5 @@
+import { $viewport, type ViewportRect } from './viewport'
+export type { ViewportRect } from './viewport'
 /**
  * @hermes/plugin-sdk — THE plugin language. The vscode-module model: plugin
  * authors import exactly one module and get everything — they never touch
@@ -28,7 +30,6 @@ import { openSession, type OpenSessionIntent } from '@/app/open-session'
 import { syncWorkspaceRoute } from '@/app/routes'
 import type { ClientSessionState } from '@/app/types'
 import {
-  $narrowViewport,
   $newSessionTabAction,
   $paneVisible,
   adoptContributedPanes,
@@ -221,19 +222,6 @@ const $focusedSessionProfile = computed(
 )
 
 /** Window geometry + the app's responsive posture, one readonly rect. */
-export interface ViewportRect {
-  width: number
-  height: number
-  /** Below the app's sidebar-collapse breakpoint (rails become overlays). */
-  narrow: boolean
-}
-
-const readViewport = (): ViewportRect => ({
-  width: typeof window === 'undefined' ? 0 : window.innerWidth,
-  height: typeof window === 'undefined' ? 0 : window.innerHeight,
-  narrow: $narrowViewport.get()
-})
-
 /** Runtime session id → mid-turn. Not gateway socket state. */
 const $busyBySession = computed($sessionStates, states => {
   const map: Record<string, boolean> = {}
@@ -244,14 +232,6 @@ const $busyBySession = computed($sessionStates, states => {
 
   return map
 })
-
-const $viewport = atom<ViewportRect>(readViewport())
-
-if (typeof window !== 'undefined') {
-  const refresh = () => $viewport.set(readViewport())
-  window.addEventListener('resize', refresh)
-  $narrowViewport.listen(refresh)
-}
 
 /** Live usage of the FOCUSED session, projected out of the streamed session
  *  state — the same readout the core statusbar's context chip paints. */

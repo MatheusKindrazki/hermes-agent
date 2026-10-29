@@ -80,6 +80,13 @@ Manual `/compress` on every surface (CLI, gateway, TUI, ACP) runs through
 `agent/conversation_compression_manual.py::compress_now` (one parser for `here [N]` / focus /
 `--preview` / `--aggressive`; surfaces only parse their own argv, install `after_messages` and render).
 
+Durable turn spooling and lineage fences live in `conversation_compression_spool.py`;
+snapshot/state capture in `conversation_compression_state.py`; image recovery in
+`conversation_image_recovery.py`; summary route pins in `context_compressor_route.py`.
+The compression lease retires its spool epoch before releasing ownership, so a timed-out
+worker cannot cancel a newer fallback attempt. Observation storage is owned by
+`durable_observation.py`, while `durable_admission.py` owns admission policy.
+
 Two layers: gateway session hygiene (85% threshold) and the agent `ContextCompressor` (50%,
 configurable; per-model overrides; failure cooldown after provider-proven overflow). The algorithm
 prunes old tool results first (no LLM call), then picks boundaries, then generates a structured

@@ -213,30 +213,32 @@ describe('context-menu mutations hydrate the alias first', () => {
   })
 })
 
-describe('age label reflects the last worker run, not only the last conversation (#105874)', () => {
+describe('clean character rows omit activity ages', () => {
   const nowSec = () => Date.now() / 1000
 
-  it('shows the worker-run age for a delegate-only bot whose worker is past the liveness window', () => {
+  it('keeps the character visible without a worker-run timestamp', () => {
     // A specialist driven only via delegate_task: its newest human conversation is 11 days old,
     // but it ran a `tool`/`kanban` worker 2h ago (well past the 150s liveness window). The label
-    // must read "2h", not "11d" — the busiest bot in the system used to read as the most idle.
+    // stays compact regardless of which activity was most recent.
     renderRow({
       name: 'auswerter',
       last_session: { last_active: nowSec() - 11 * 86400 },
       worker_session: { last_active: nowSec() - 2 * 3600 }
     } as RosterRow)
 
-    expect(screen.getByText('2h')).toBeTruthy()
+    expect(screen.getByText('Auswerter')).toBeTruthy()
+    expect(screen.queryByText('2h')).toBeNull()
     expect(screen.queryByText('11d')).toBeNull()
   })
 
-  it('falls back to conversation age when there is no worker session', () => {
+  it('omits conversation timestamps when there is no worker session', () => {
     // worker_session can be absent (None past the 20-row window); the max degrades to the chat age.
     renderRow({
       name: 'chatty',
       last_session: { last_active: nowSec() - 3 * 86400 }
     } as RosterRow)
 
-    expect(screen.getByText('3d')).toBeTruthy()
+    expect(screen.getByText('Chatty')).toBeTruthy()
+    expect(screen.queryByText('3d')).toBeNull()
   })
 })

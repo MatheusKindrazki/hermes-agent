@@ -8,6 +8,8 @@ late-bound (``_sched`` / module refs at the bottom) so monkeypatching the defini
 
 from __future__ import annotations
 
+from cron.scheduler_bot_notification import BOT_CHAT_NOTIFY_PLATFORM, parse_bot_chat_notify_deliver_token, _deliver_to_bot_chat_notify
+
 import asyncio
 import concurrent.futures
 import contextlib
@@ -1773,13 +1775,7 @@ def _unresolved_delivery_outcome(job: dict, for_failure: bool) -> Optional[str]:
     return msg
 
 
-def _deliver_result(
-    job: dict, content: str, adapters=None, loop=None, *, for_failure: bool = False
-) -> Optional[str]:
-    """Deliver job output to the configured target(s). With ``adapters``/``loop`` (gateway
-    running) the live adapter is tried first (E2EE rooms can't use the standalone HTTP path), then
-    standalone fallback. ``for_failure=True`` routes failure-category notices through the job's
-    ``failure_deliver`` override when present (NS-788). Returns None on success, else an error."""
+def _deliver_to_notification_inbox(job: dict, content: str, *, for_failure: bool):
     # An explicit focus preference routes scheduled output to a separate
     # profile-local transcript, before any connector or Bot Chat turn starts.
     # Local jobs keep their existing output-only behavior.
@@ -1798,9 +1794,42 @@ def _deliver_result(
                 delivery_id=delivery_id, source="cron",
                 origin_session=str((job.get("origin") or {}).get("chat_id") or ""),
             )
-            return None
+            return True, None
     except Exception as exc:
-        return f"notification inbox delivery failed: {type(exc).__name__}: {exc}"
+        logging.getLogger(__name__).debug('_deliver_result: optional operation failed', exc_info=True)
+        return True, f"notification inbox delivery failed: {type(exc).__name__}: {exc}"
+
+    return False, None
+
+
+def _wrapped_delivery_content(job, content, wrap_response):
+    """Apply the configured cron response framing before media parsing."""
+    if wrap_response:
+        task_name = job.get("name", job["id"])
+        delivery_content = (
+            f"Cronjob Response: {task_name}\n"
+            f"(job_id: {job.get('id', '')})\n"
+            f"-------------\n\n"
+            f"{content}\n\n"
+            "To stop or manage this job, send me a new message "
+            f"(e.g. \"stop reminder {task_name}\")."
+        )
+    else:
+        delivery_content = content
+
+    return delivery_content
+
+
+def _deliver_result(
+    job: dict, content: str, adapters=None, loop=None, *, for_failure: bool = False
+) -> Optional[str]:
+    """Deliver job output to the configured target(s). With ``adapters``/``loop`` (gateway
+    running) the live adapter is tried first (E2EE rooms can't use the standalone HTTP path), then
+    standalone fallback. ``for_failure=True`` routes failure-category notices through the job's
+    ``failure_deliver`` override when present (NS-788). Returns None on success, else an error."""
+    inbox_handled, inbox_error = _deliver_to_notification_inbox(job, content, for_failure=for_failure)
+    if inbox_handled:
+        return inbox_error
 
     job.pop("_bot_chat_delivery_receipts", None)
     job.pop("_notification_all_targets_suppressed", None)
@@ -1844,18 +1873,7 @@ def _deliver_result(
     # Targets acked with NO evidence (bare SendResult(success=True) — Slack/Matrix/Mattermost);
     # persisted as ``last_delivery_unverified`` so `hermes cron list` shows it.
     unverified_targets: list = []
-    if wrap_response:
-        task_name = job.get("name", job["id"])
-        delivery_content = (
-            f"Cronjob Response: {task_name}\n"
-            f"(job_id: {job.get('id', '')})\n"
-            f"-------------\n\n"
-            f"{content}\n\n"
-            "To stop or manage this job, send me a new message "
-            f"(e.g. \"stop reminder {task_name}\")."
-        )
-    else:
-        delivery_content = content
+    delivery_content = _wrapped_delivery_content(job, content, wrap_response)
 
     from gateway.platforms.base import BasePlatformAdapter
     # Bridge media-policy config into the env vars the path validator reads. The gateway does this
@@ -1928,6 +1946,7 @@ def _deliver_result(
             try:
                 config = load_gateway_config()
             except Exception as exc:
+                logging.getLogger(__name__).debug('_deliver_result: optional operation failed', exc_info=True)
                 config_error = f"failed to load gateway config: {exc}"
                 delivery_errors.append(config_error)
         if config_error is not None:
@@ -1965,120 +1984,3 @@ from cron import scheduler as _sched
 from cron import scheduler_delivery_origin as _origin
 from cron import scheduler_preflight as _preflight
 from cron import scheduler_script as _script
-BOT_CHAT_NOTIFY_PLATFORM = "bot-chat-notify"
-
-def parse_bot_chat_notify_deliver_token(part: str) -> Optional[str]:
-    """Return the profile in a passive ``bot-chat-notify`` target."""
-    raw = (part or "").strip()
-    lowered = raw.lower()
-    if lowered == BOT_CHAT_NOTIFY_PLATFORM:
-        return ""
-    prefix = BOT_CHAT_NOTIFY_PLATFORM + ":"
-    if lowered.startswith(prefix):
-        return raw[len(prefix):].strip()
-    return None
-
-
-def _deliver_to_bot_chat_notify(
-    job: dict, content: str, profile: str
-) -> Optional[str]:
-    """Append scheduled output to a canonical Bot Chat without an agent turn.
-
-    This is the passive counterpart to :func:`_deliver_to_bot_chat`.  It uses
-    the exact title registry that Bot Mode itself uses, follows a compression
-    continuation to its live tip, and writes one typed transcript row.  The
-    normal SessionDB guards refuse a concurrent turn or compression instead
-    of splicing into a moving transcript.
-    """
-    db = None
-    try:
-        if profile:
-            from hermes_cli.profiles import get_profile_dir
-
-            profile_home = get_profile_dir(profile)
-        else:
-            from hermes_constants import get_hermes_home
-
-            profile_home = get_hermes_home()
-
-        from hermes_state import SessionDB
-
-        db = SessionDB(db_path=profile_home / "state.db")
-        canonical = db.get_session_by_title("Bot Chat")
-        if not canonical:
-            return (
-                "bot-chat-notify delivery failed: canonical Bot Chat does "
-                f"not exist for profile '{profile or '(own)'}'"
-            )
-        session_id = db.get_compression_tip(str(canonical["id"])) or str(
-            canonical["id"]
-        )
-        job_name = str(job.get("name") or job.get("id") or "cron job")
-        fire_claim = job.get("fire_claim")
-        fire_at = (
-            str(fire_claim.get("at") or "")
-            if isinstance(fire_claim, dict)
-            else ""
-        )
-        delivery_id = "cron-notify:" + str(
-            uuid.uuid5(
-                uuid.NAMESPACE_URL,
-                "\0".join(
-                    (
-                        str(job.get("id") or ""),
-                        fire_at or str(job.get("last_run_at") or "manual"),
-                        content,
-                    )
-                ),
-            )
-        )
-        if db.has_platform_message_id(session_id, delivery_id):
-            logger.info(
-                "Job '%s': passive Bot Chat delivery already persisted",
-                job.get("id", "?"),
-            )
-            return None
-        message = (
-            f"[Cron delivery: {job_name}]\n"
-            "Scheduled output; no agent turn was started.\n\n"
-            f"{content}"
-        )
-        db.append_message(
-            session_id=session_id,
-            role="user",
-            content=message,
-            platform_message_id=delivery_id,
-            display_kind="internal_notification",
-            display_metadata={
-                "source": "cron",
-                "job_id": str(job.get("id") or ""),
-                "passive": True,
-            },
-        )
-        try:
-            db.touch_session_activity(
-                session_id,
-                description=f"cron notification: {job_name}",
-            )
-        except Exception:
-            logger.debug(
-                "Job '%s': passive Bot Chat activity stamp failed",
-                job.get("id", "?"),
-                exc_info=True,
-            )
-        logger.info(
-            "Job '%s': passively delivered to Bot Chat of profile '%s'",
-            job.get("id", "?"),
-            profile or "(own)",
-        )
-        return None
-    except Exception as exc:
-        message = (
-            f"bot-chat-notify delivery to profile '{profile or '(own)'}' "
-            f"failed: {type(exc).__name__}: {str(exc) or 'unknown error'}"
-        )
-        logger.warning("Job '%s': %s", job.get("id", "?"), message)
-        return message
-    finally:
-        if db is not None:
-            db.close()

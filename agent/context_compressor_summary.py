@@ -69,7 +69,7 @@ class SummaryDispatchMixin:
         """Run the summary LLM; a cancellation rolls back the handoff scan's self-heal mutation first.
         A deterministic pin (repeated stall, #112420) skips the LLM: ``None`` lets Phase 3 insert the static
         fallback summary, or abort under ``abort_on_summary_failure`` exactly like a failed summary call."""
-        from agent.context_compressor import take_deterministic_summary_pin
+        from agent.context_compressor_route import (take_deterministic_summary_pin)
         if take_deterministic_summary_pin():
             # A detached stale attempt must not stamp error state or mutate the shared telemetry dict
             # the fallback owns; unwind as a cancellation before any write lands.

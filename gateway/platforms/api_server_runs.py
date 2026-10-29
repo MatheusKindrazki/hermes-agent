@@ -746,6 +746,94 @@ async def _admit_run_to_authority(
     return None
 
 
+def _replay_legacy_run(self, request, body, idempotency_key, room_dispatch,
+                       idempotency_scope, idempotency_fingerprint, gateway_session_key, _openai_error):
+    """Resolve a fork-era run before admitting a fresh run to the native store."""
+    legacy = None
+    if idempotency_key and room_dispatch is None and not self._room_grant_token(request):
+        from gateway.run_idempotency import RunIdempotencyConflict
+        try:
+            legacy = _legacy_run_record(self, body, idempotency_key)
+        except RunIdempotencyConflict:
+            return None, _json_error(_openai_error, "Idempotency-Key was reused for a different payload",
+                               code="idempotency_payload_mismatch", status=409)
+        if legacy is not None and legacy.state != "claimed":
+            status = _legacy_run_status(legacy)
+            outcome, record = self._run_idempotency_store.reserve(
+                idempotency_scope, idempotency_key, idempotency_fingerprint, legacy.run_id,
+                status, owner_pid=0, owner_started=0,
+                retention_until=_room_retention_until(request))
+            if outcome == "created":
+                self._run_idempotency_store.retain_permanently(legacy.run_id)
+            return legacy, _replay_or_conflict(self, request, outcome, record,
+                                      gateway_session_key, _openai_error)
+    return legacy, None
+
+
+async def _resolve_run_session_history(self, session_id, gateway_session_key,
+                                       previous_response_id, conversation_history, run_id):
+    """Select the canonical live session before consuming persisted deliveries."""
+    # Same precedence as /v1/responses: body session_id > response chain > X-Hermes-Session-Key
+    # conversation > run_id (which would otherwise re-key every affinity surface per run).
+    # An explicit or chained session owns its routing key and is never rebound to the header.
+    _declared_selected = not session_id and bool(gateway_session_key)
+    selected_session_id = session_id or (
+        await asyncio.to_thread(self._declared_conversation_session, gateway_session_key)
+        if _declared_selected else None)
+    # A client-addressed id from before a compression rotation must adopt the live tip (#98619):
+    # history loads from it, the turn writes to it, and a detached delivery row persisted to it
+    # is what the next same-id run consumes below.
+    if selected_session_id:
+        selected_session_id = await _resolve_live_session_id(self, str(selected_session_id))
+    session_id = selected_session_id or run_id
+    # History loads for the session the request actually selected — including one resolved from
+    # a declared X-Hermes-Session-Key, whose persisted delivery rows must reach the next
+    # same-key run's context (#98619).  previous_response_id continuations keep their
+    # ResponseStore snapshot as history (they cannot consume a SessionDB delivery row and are
+    # accordingly denied wake capability in _run_agent_sync); the fresh run_id fallback has
+    # nothing persisted to load yet.  Wake authority is fixed here, before the load can
+    # overwrite ``conversation_history``: a caller-supplied history is authoritative for this
+    # turn, never consumes the SessionDB delivery row, and is denied on the same contract.
+    session_history_delivery = not previous_response_id and not conversation_history
+    if not conversation_history and selected_session_id and not previous_response_id:
+        conversation_history = await self._conversation_history_for_session(str(selected_session_id))
+    return session_id, conversation_history, session_history_delivery, selected_session_id, _declared_selected
+
+
+def _run_idempotency_error(self, idempotency_key, _openai_error):
+    """Reject malformed or non-durable admission keys before any reservation."""
+    if len(idempotency_key) > 255 or any(ord(ch) < 33 or ord(ch) > 126 for ch in idempotency_key):
+        return _json_error(
+            _openai_error, "Idempotency-Key must be 1-255 visible ASCII characters",
+            code="invalid_idempotency_key", status=400)
+    if idempotency_key and not self._run_idempotency_store.durable:
+        return _json_error(_openai_error, "Durable idempotency storage unavailable",
+                           code="idempotency_storage_unavailable", status=503)
+    return None
+
+
+def _needs_permanent_run_receipt(body, legacy):
+    """Fork request hashes retain evidence across normal idempotency expiry."""
+    metadata = body.get("metadata")
+    return legacy is not None or body.get("request_sha256") or (
+        isinstance(metadata, dict) and metadata.get("request_sha256"))
+
+
+def _activate_run_task(self, launch, admitted, _api_server):
+    """Start and register exactly one admitted execution for shutdown tracking."""
+    run_id = launch.run_id
+    self._activate_admitted_request()
+    if admitted is not None:
+        task = self._active_run_tasks[run_id] = asyncio.create_task(
+            _execute_run_via_live_owner(self, launch, *admitted, _api_server=_api_server))
+    else:
+        task = self._active_run_tasks[run_id] = asyncio.create_task(_execute_run(self, launch, _api_server=_api_server))
+    with suppress(TypeError):
+        self._background_tasks.add(task)  # tracked for shutdown drain
+    if hasattr(task, "add_done_callback"):
+        task.add_done_callback(self._background_tasks.discard)
+
+
 async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Response:
     """POST /v1/runs — start an agent run, return run_id immediately."""
     _openai_error = _api_server._openai_error
@@ -765,13 +853,9 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
             (body.get("hosted_room_dispatch"), body.get("_room_execution_policy"))
             if isinstance(body, dict) else (None, None)))
     idempotency_key = request.headers.get("Idempotency-Key", "").strip()
-    if len(idempotency_key) > 255 or any(ord(ch) < 33 or ord(ch) > 126 for ch in idempotency_key):
-        return _json_error(
-            _openai_error, "Idempotency-Key must be 1-255 visible ASCII characters",
-            code="invalid_idempotency_key", status=400)
-    if idempotency_key and not self._run_idempotency_store.durable:
-        return _json_error(_openai_error, "Durable idempotency storage unavailable",
-                           code="idempotency_storage_unavailable", status=503)
+    idempotency_error = _run_idempotency_error(self, idempotency_key, _openai_error)
+    if idempotency_error is not None:
+        return idempotency_error
     idempotency_scope, idempotency_fingerprint = _run_idempotency_identity(
         self, request, body, gateway_session_key, idempotency_key)
     # Retain the fork dashboard message field while honoring explicit native input.
@@ -805,53 +889,18 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
             retention_until=_room_retention_until(request))
         if outcome == "conflict" or (outcome == "reused" and record is not None):
             return _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error)
-    legacy = None
-    if idempotency_key and room_dispatch is None and not self._room_grant_token(request):
-        from gateway.run_idempotency import RunIdempotencyConflict
-        try:
-            legacy = _legacy_run_record(self, body, idempotency_key)
-        except RunIdempotencyConflict:
-            return _json_error(_openai_error, "Idempotency-Key was reused for a different payload",
-                               code="idempotency_payload_mismatch", status=409)
-        if legacy is not None and legacy.state != "claimed":
-            status = _legacy_run_status(legacy)
-            outcome, record = self._run_idempotency_store.reserve(
-                idempotency_scope, idempotency_key, idempotency_fingerprint, legacy.run_id,
-                status, owner_pid=0, owner_started=0,
-                retention_until=_room_retention_until(request))
-            if outcome == "created":
-                self._run_idempotency_store.retain_permanently(legacy.run_id)
-            return _replay_or_conflict(self, request, outcome, record,
-                                      gateway_session_key, _openai_error)
+    legacy, replay_response = _replay_legacy_run(
+        self, request, body, idempotency_key, room_dispatch,
+        idempotency_scope, idempotency_fingerprint, gateway_session_key, _openai_error)
+    if replay_response is not None:
+        return replay_response
     # Enforce concurrency only for a genuinely new run.
     limited = self._concurrency_limited_response()
     if limited is not None:
         return limited
     run_id = legacy.run_id if legacy is not None else f"run_{uuid.uuid4().hex}"
-    # Same precedence as /v1/responses: body session_id > response chain > X-Hermes-Session-Key
-    # conversation > run_id (which would otherwise re-key every affinity surface per run).
-    # An explicit or chained session owns its routing key and is never rebound to the header.
-    _declared_selected = not session_id and bool(gateway_session_key)
-    selected_session_id = session_id or (
-        await asyncio.to_thread(self._declared_conversation_session, gateway_session_key)
-        if _declared_selected else None)
-    # A client-addressed id from before a compression rotation must adopt the live tip (#98619):
-    # history loads from it, the turn writes to it, and a detached delivery row persisted to it
-    # is what the next same-id run consumes below.
-    if selected_session_id:
-        selected_session_id = await _resolve_live_session_id(self, str(selected_session_id))
-    session_id = selected_session_id or run_id
-    # History loads for the session the request actually selected — including one resolved from
-    # a declared X-Hermes-Session-Key, whose persisted delivery rows must reach the next
-    # same-key run's context (#98619).  previous_response_id continuations keep their
-    # ResponseStore snapshot as history (they cannot consume a SessionDB delivery row and are
-    # accordingly denied wake capability in _run_agent_sync); the fresh run_id fallback has
-    # nothing persisted to load yet.  Wake authority is fixed here, before the load can
-    # overwrite ``conversation_history``: a caller-supplied history is authoritative for this
-    # turn, never consumes the SessionDB delivery row, and is denied on the same contract.
-    session_history_delivery = not previous_response_id and not conversation_history
-    if not conversation_history and selected_session_id and not previous_response_id:
-        conversation_history = await self._conversation_history_for_session(str(selected_session_id))
+    session_id, conversation_history, session_history_delivery, selected_session_id, _declared_selected = await _resolve_run_session_history(
+        self, session_id, gateway_session_key, previous_response_id, conversation_history, run_id)
     created_at = time.time()
     initial_status = dict(run_id=run_id, status="queued", created_at=created_at,
                           session_id=session_id, model=body.get("model", self._model_name))
@@ -866,8 +915,7 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
             # Leave a durable tombstone before a worker can perform effects. Even a store
             # replacement or rollback may not resurrect the old unattached claim.
             _legacy_run_ledger(self).update_state(run_id, "migrated", initial_status)
-        metadata = body.get("metadata")
-        if legacy is not None or body.get("request_sha256") or (isinstance(metadata, dict) and metadata.get("request_sha256")):
+        if _needs_permanent_run_receipt(body, legacy):
             self._run_idempotency_store.retain_permanently(run_id)
         self._run_idempotency_ids.add(run_id)
     self._run_owners[run_id] = self._run_idempotency_scope(request)
@@ -900,16 +948,7 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
             idempotency_scope, idempotency_key, _openai_error)
         if refused is not None:
             return refused
-    self._activate_admitted_request()
-    if admitted is not None:
-        task = self._active_run_tasks[run_id] = asyncio.create_task(
-            _execute_run_via_live_owner(self, launch, *admitted, _api_server=_api_server))
-    else:
-        task = self._active_run_tasks[run_id] = asyncio.create_task(_execute_run(self, launch, _api_server=_api_server))
-    with suppress(TypeError):
-        self._background_tasks.add(task)  # tracked for shutdown drain
-    if hasattr(task, "add_done_callback"):
-        task.add_done_callback(self._background_tasks.discard)
+    _activate_run_task(self, launch, admitted, _api_server)
     if legacy is not None:
         headers = {"X-Hermes-Session-Key": gateway_session_key} if gateway_session_key else {}
         return web.json_response({"run_id": run_id, "status": "started", "reattached": True},

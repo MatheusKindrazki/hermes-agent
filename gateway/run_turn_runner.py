@@ -787,14 +787,15 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
 
     def _load_turn_history(self, agent, reused_cached_agent):
         from gateway.run import (
-            _build_gateway_agent_history, _collect_history_media_paths, _message_timestamps_enabled,
+            _build_gateway_agent_history, _message_timestamps_enabled,
             _select_cached_agent_history,
         )
+        from gateway.run_media_history import _collect_history_media_paths
         ctx = self._ctx
         from gateway.session_api_turn import api_execution
         api = api_execution.get()
         if api is not None and api['history'] is not None:
-            from gateway.run import _collect_history_media_paths
+            from gateway.run_media_history import _collect_history_media_paths
             history = api['history']
             tail = history[-1] if history else None
             if api.get('resume_unanswered') and isinstance(tail, dict) and tail.get('role') == 'user':
@@ -923,6 +924,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         """Wrap the user turn as an OpenAI-style multimodal content list when
         _prepare_inbound_message_text buffered image paths; consume-and-clear so later turns on the
         same runner never re-attach stale images. Falls back to plain text when nothing is readable."""
+        from gateway.run_media_history import _collect_history_media_paths
         ctx = self._ctx
         from gateway.session_api_turn import api_execution
         api = api_execution.get()
@@ -1132,6 +1134,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
     def _combined_ephemeral_prompt(self) -> str:
         """Platform context + YAML channel_prompts hint + channel_overrides system_prompt (or global
         ephemeral) + the gateway ephemeral prompt."""
+        from gateway.run_media_history import _collect_history_media_paths
         ctx = self._ctx
         from gateway.session_api_turn import api_execution
         api = api_execution.get()
@@ -1154,7 +1157,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         extract_media() delivers each file once. Scoped to THIS turn (slice at len(agent_history)) so
         a stale MEDIA: path from an earlier turn never rides a later reply; the history-path dedup is
         the secondary guard — and the sole one when mid-run compression shrank the list."""
-        from gateway.run import _collect_auto_append_media_tags
+        from gateway.run_media_history import _collect_auto_append_media_tags
         if "MEDIA:" in final_response:
             return final_response
         # Scan tool results for MEDIA:<path> tags that need to be delivered as native audio/file
@@ -1471,6 +1474,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 session_id=str(ctx.session_id or ctx.session_key or ""),
             )
         except Exception as exc:
+            logging.getLogger(__name__).debug('TurnRunner._run_sync_with_request_context: optional operation failed', exc_info=True)
             return {
                 "final_response": f"⚠️ Provider authentication failed: {exc}",
                 "messages": [],

@@ -15,6 +15,7 @@ evidence for a contract: the real CLI covers the same ground beside them.
 
 from __future__ import annotations
 
+from agent.durable_observation import ObservationWriter
 import json
 import os
 import subprocess
@@ -97,7 +98,7 @@ def test_observation_writer_reserves_once_and_latches_first_failure(tmp_path, mo
     monkeypatch.setattr(durable_admission, "_settings", lambda: {"tenant": "personal", "machine": "mini", "profile": "default"})
     monkeypatch.setattr(durable_admission, "_active_profile", lambda: "default")
     root = tmp_path / "receipts"
-    writer = durable_admission.ObservationWriter(root, code_sha="a" * 40)
+    writer = ObservationWriter(root, code_sha="a" * 40)
     writer.checkpoint(now=1000)
     origin = durable_admission.capture_effect_origin("chat-original", "telegram:123")
     first = writer.reserve(origin, "destination", "secret outgoing body", now=1001)
@@ -123,8 +124,8 @@ def test_observation_writer_reserves_once_and_latches_first_failure(tmp_path, mo
 
 def test_observation_channel_rejects_a_second_live_writer(tmp_path):
     root = tmp_path / "channel-owner"
-    first = durable_admission.ObservationWriter(root, code_sha="a" * 40)
-    second = durable_admission.ObservationWriter(root, code_sha="a" * 40)
+    first = ObservationWriter(root, code_sha="a" * 40)
+    second = ObservationWriter(root, code_sha="a" * 40)
     first.checkpoint()
     before = (root / "observation-channel.json").read_bytes()
     try:
@@ -137,7 +138,7 @@ def test_observation_channel_rejects_a_second_live_writer(tmp_path):
 
 @pytest.mark.parametrize("getter", [None, lambda: (_ for _ in ()).throw(RuntimeError("uid unavailable"))])
 def test_observation_missing_ownership_latches_broken(tmp_path, monkeypatch, getter):
-    writer = durable_admission.ObservationWriter(tmp_path / "no-owner", code_sha="a" * 40)
+    writer = ObservationWriter(tmp_path / "no-owner", code_sha="a" * 40)
     with monkeypatch.context() as scoped:
         scoped.setattr(os, "getuid", getter)
         with pytest.raises(OSError):
@@ -150,7 +151,7 @@ def test_observation_missing_ownership_latches_broken(tmp_path, monkeypatch, get
 def test_observation_json_reads_bom_and_writes_plain_utf8(tmp_path, with_bom):
     root = tmp_path / "unicode"
     root.mkdir(mode=0o700)
-    writer = durable_admission.ObservationWriter(root, code_sha="a" * 40)
+    writer = ObservationWriter(root, code_sha="a" * 40)
     path = root / "fixture.json"
     writer._write(path, {"note": "ação 日本語"})
     assert not path.read_bytes().startswith(b"\xef\xbb\xbf")
@@ -162,13 +163,13 @@ def test_observation_json_reads_bom_and_writes_plain_utf8(tmp_path, with_bom):
 def test_observation_channel_lock_excludes_another_process(tmp_path):
     import sys
     root = tmp_path / "process-channel"
-    first = durable_admission.ObservationWriter(root, code_sha="a" * 40)
+    first = ObservationWriter(root, code_sha="a" * 40)
     first.checkpoint()
     before = (root / "observation-channel.json").read_bytes()
     code = """
 import sys
 from pathlib import Path
-from agent.durable_admission import ObservationWriter
+from agent.durable_observation import ObservationWriter
 writer = ObservationWriter(Path(sys.argv[1]), code_sha='a' * 40)
 try:
     writer.checkpoint()
@@ -192,7 +193,7 @@ def test_observation_sequence_across_boots_and_concurrent_reservations(tmp_path,
     monkeypatch.setattr(durable_admission, "_settings", lambda: {"tenant": "personal", "machine": "mini", "profile": "default"})
     monkeypatch.setattr(durable_admission, "_active_profile", lambda: "default")
     root = tmp_path / "receipts"
-    writer = durable_admission.ObservationWriter(root, code_sha="a" * 40)
+    writer = ObservationWriter(root, code_sha="a" * 40)
     writer.checkpoint(now=1000)
     origin = durable_admission.capture_effect_origin("chat-original", "telegram:123")
     with ThreadPoolExecutor(max_workers=4) as pool:
@@ -201,7 +202,7 @@ def test_observation_sequence_across_boots_and_concurrent_reservations(tmp_path,
     writer.checkpoint(now=1002, stopped=True)
     writer.checkpoint(now=1003)
     assert json.loads((root / "observation-channel.json").read_text())["state"] == "stopped"
-    reboot = durable_admission.ObservationWriter(root, code_sha="a" * 40)
+    reboot = ObservationWriter(root, code_sha="a" * 40)
     reboot.checkpoint(now=1004)
     channel = json.loads((root / "observation-channel.json").read_text())
     assert channel["sequence"] == 4 and channel["state"] == "starting"

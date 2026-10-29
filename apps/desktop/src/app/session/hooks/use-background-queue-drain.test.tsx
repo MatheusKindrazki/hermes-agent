@@ -112,7 +112,6 @@ describe('useBackgroundQueueDrain', () => {
         submission_id: entry.id,
         attachments: [],
         fromQueue: true,
-        submission_id: expect.stringMatching(/^[0-9a-f-]{36}$/),
         sessionId: 'rt-session-a',
         storedSessionId: 'stored-session-a'
       })
@@ -289,7 +288,6 @@ describe('useBackgroundQueueDrain', () => {
         submission_id: entry.id,
         attachments: [],
         fromQueue: true,
-        submission_id: expect.stringMatching(/^[0-9a-f-]{36}$/),
         sessionId: null,
         storedSessionId: 'stored-session-a'
       })
@@ -363,7 +361,6 @@ describe('useBackgroundQueueDrain', () => {
 
     await waitFor(() => {
       expect(submitText).toHaveBeenCalledWith('send after load', {
-        submission_id: expect.stringMatching(/^[0-9a-f-]{36}$/),
         attachments: [],
         fromQueue: true,
         sessionId: 'rt-session-a',

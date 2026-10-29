@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from agent.durable_observation import ObservationWriter
 import json
 import os
 from contextlib import nullcontext
@@ -37,7 +38,7 @@ def test_observe_effect_four_stores_exact_release_and_ack_replay(tmp_path, monke
     collector = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(collector)
     spool = tmp_path / "spool"
-    writer = da.ObservationWriter(spool, code_sha="a" * 40)
+    writer = ObservationWriter(spool, code_sha="a" * 40)
     monkeypatch.setattr(da, "_OBSERVER", writer)
     monkeypatch.setenv(da.ENV_MODE, "observe")
     monkeypatch.setenv("HERMES_KERNEL_SHADOW_PRODUCER_ENABLED", "1")

@@ -1,3 +1,4 @@
+import { looksBinary, previewFileMetadata } from './preview-file-metadata'
 import { createExecutorReader, createExecutorSender } from './parallel-executor'
 import { type ChildProcess, execFileSync, spawn } from 'node:child_process'
 
@@ -1765,57 +1766,6 @@ const PREVIEW_LANGUAGE_BY_EXT = {
   '.yaml': 'yaml',
   '.yml': 'yaml',
   '.zsh': 'shell'
-}
-
-function looksBinary(buffer) {
-  if (!buffer.length) {
-    return false
-  }
-
-  let suspicious = 0
-
-  for (const byte of buffer) {
-    if (byte === 0) {
-      return true
-    }
-
-    // Allow common whitespace controls: tab, LF, CR.
-    if (byte < 32 && byte !== 9 && byte !== 10 && byte !== 13) {
-      suspicious += 1
-    }
-  }
-
-  return suspicious / buffer.length > 0.12
-}
-
-function previewFileMetadata(filePath, mimeType) {
-  let byteSize = 0
-  let binary = false
-
-  try {
-    const stat = fs.statSync(filePath)
-    byteSize = stat.size
-
-    if (!mimeType.startsWith('image/')) {
-      const fd = fs.openSync(filePath, 'r')
-
-      try {
-        const sample = Buffer.alloc(Math.min(byteSize, 4096))
-        const bytesRead = fs.readSync(fd, sample, 0, sample.length, 0)
-        binary = looksBinary(sample.subarray(0, bytesRead))
-      } finally {
-        fs.closeSync(fd)
-      }
-    }
-  } catch {
-    // Metadata is best-effort; the read handlers surface hard errors later.
-  }
-
-  return {
-    binary,
-    byteSize,
-    large: byteSize > TEXT_PREVIEW_MAX_BYTES
-  }
 }
 
 // Display branding must never redirect the existing connection/session store.
@@ -4934,23 +4884,6 @@ async function resolveHermesBackend(backendArgs: string[]): Promise<ResolvedHerm
     }
   }
 
-  // 1. Explicit override -- HERMES_DESKTOP_HERMES_ROOT points at a developer
-  //    checkout. Honour it as-is (no bootstrap; the user is driving).
-  const overrideRoot: string | undefined =
-    process.env.HERMES_DESKTOP_HERMES_ROOT && path.resolve(process.env.HERMES_DESKTOP_HERMES_ROOT)
-
-  if (overrideRoot && isHermesSourceRoot(overrideRoot)) {
-    const backend: SourceBackend | null = createSourcePythonBackend(
-      overrideRoot,
-      await findPythonForRoot(overrideRoot),
-      backendArgs
-    )
-
-    if (backend) {
-      return backend
-    }
-  }
-
   // 2. Development source -- when running `npm run dev` from a checkout, the
   //    cloned repo at SOURCE_REPO_ROOT takes precedence over ACTIVE and any
   //    installed `hermes` on PATH so local Python edits are actually exercised.
@@ -5021,40 +4954,6 @@ async function resolveHermesBackend(backendArgs: string[]): Promise<ResolvedHerm
     }
 
     throw new Error('The explicit HERMES_DESKTOP_HERMES command is unavailable. Correct or remove that override; no automatic installation was started.')
-  }
-
-  if (payload) {
-    if (!IS_WINDOWS) {
-      provisionCliLinks(payload.commands, path.join(os.homedir(), '.local', 'bin'), rememberLog)
-    }
-
-    return {
-      kind: 'python',
-      label: `bundled payload at ${payload.root}`,
-      command: payload.shim,
-      args: [...backendArgs],
-      env: { ...buildDesktopBackendEnv(), HERMES_RUNTIME_DIR: payload.toolsDir },
-      root: payload.repoDir,
-      bootstrap: false,
-      shell: false,
-      local: 'bundled'
-    }
-  }
-
-  // Development source -- when running `npm run dev` from a checkout, the
-  //    cloned repo at SOURCE_REPO_ROOT takes precedence over ACTIVE and any
-  //    installed `hermes` on PATH so local Python edits are actually exercised.
-  //    (In dev with no checkout, SOURCE_REPO_ROOT won't pass isHermesSourceRoot.)
-  if (!IS_PACKAGED && isHermesSourceRoot(SOURCE_REPO_ROOT)) {
-    const backend: SourceBackend | null = createSourcePythonBackend(
-      SOURCE_REPO_ROOT,
-      await findPythonForRoot(SOURCE_REPO_ROOT),
-      backendArgs
-    )
-
-    if (backend) {
-      return backend
-    }
   }
 
   // 4. ACTIVE_HERMES_ROOT — the canonical install at
@@ -5813,7 +5712,7 @@ async function previewFileTarget(rawTarget, baseDir) {
   ;({ resolvedPath: resolved } = await resolveReadableFileForIpc(resolved, { purpose: 'Preview target' }))
 
   const mimeType = mimeTypeForPath(resolved)
-  const metadata = previewFileMetadata(resolved, mimeType)
+  const metadata = previewFileMetadata(resolved, mimeType, TEXT_PREVIEW_MAX_BYTES)
   const isHtml = PREVIEW_HTML_EXTENSIONS.has(ext)
   const isImage = mimeType.startsWith('image/')
   const isPdf = PREVIEW_PDF_EXTENSIONS.has(ext) || mimeType === 'application/pdf'

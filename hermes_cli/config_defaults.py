@@ -17,20 +17,19 @@ DEFAULT_VERCEL_IMAGE = "vercel/sandbox/universal:latest"
 LEGACY_VERCEL_RUNTIME = "node24"  # the seeded pre-49 default, never a user choice
 
 
-def _aux(timeout, *, reasoning_effort=True, **extra):
-    """Standard auxiliary-task model block (see DEFAULT_CONFIG["auxiliary"]).
-
-    reasoning_effort=False omits that key (MoA blocks configure depth per slot);
-    ``extra`` keys are appended after the standard ones.
-    """
-    d = {"provider": "auto", "model": "", "base_url": "", "api_key": "", "timeout": timeout, "extra_body": {}}
-    if reasoning_effort:
-        d["reasoning_effort"] = ""
-    d.update(extra)
-    return d
+from hermes_cli.config_aux_defaults import _aux
 
 
 DEFAULT_CONFIG = {
+    # Fork operational integrations are opt-in and scoped to the owning profile.
+    "operations": {
+        "shadow_receipt_dir": "",
+        "shadow_producer_enabled": False,
+        "tone_gate_bin": "",
+        "tone_schema_sha256": "",
+        "work_control_projection_enabled": False,
+        "work_control_projection_url": "",
+    },
     "model": "",
     "providers": {},
     "fallback_providers": [],

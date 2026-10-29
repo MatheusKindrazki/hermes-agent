@@ -7,6 +7,8 @@ retries, fallbacks, compression, post-turn hooks). Symbols that callers patch on
 
 from __future__ import annotations
 
+from agent.conversation_turn_identity import stage_turn_input_identity, refresh_turn_credentials
+
 import inspect
 import json
 import logging
@@ -18,7 +20,7 @@ from typing import Any, Dict, List, Optional
 from agent.agent_runtime_helpers_placeholders import hidden_interrupt_placeholder_row
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.durable_admission import admit_turn_or_block
-from agent.conversation_compression import ensure_compression_turn_identity, spool_deferred_compression_turn
+from agent.conversation_compression_spool import (ensure_compression_turn_identity, spool_deferred_compression_turn)
 from agent.fast_mode import begin_turn as begin_fast_mode_turn
 from agent.message_metadata import append_message, without_persistence_fields
 from agent.message_sanitization import _repair_tool_call_arguments, _sanitize_surrogates
@@ -1195,12 +1197,13 @@ def _compression_deferred_result(agent, messages: list[dict], api_call_count: in
             token_count=int(token_count or 0),
         )
     except Exception as exc:
+        logging.getLogger(__name__).debug('_compression_deferred_result: optional operation failed', exc_info=True)
         spool_error = type(exc).__name__
         logger.warning("compression turn durable handoff failed: %s", exc)
     try:
         agent._flush_status_buffer()
     except Exception:
-        pass
+        logging.getLogger(__name__).debug('_compression_deferred_result: optional operation failed', exc_info=True)
     accepted = bool(receipt and receipt.get("durable"))
     if accepted:
         _final = (
@@ -1708,40 +1711,9 @@ def _run_conversation_turn(
     if _admission_block is not None:
         return _admission_block
 
-    # Bind a durable, per-input identity before build_turn_context performs
-    # its crash-resilience append. The staged mapping is the same object the
-    # turn prologue adopts, so the ID reaches both SessionDB display metadata
-    # and a later compression spool without changing provider-visible content.
-    _expected_persist_content = (
-        persist_user_message if persist_user_message is not None else user_message
-    )
-    _staged_user = getattr(agent, "_pending_cli_user_message", None)
-    if not (
-        isinstance(_staged_user, dict)
-        and _staged_user.get("content") == _expected_persist_content
-    ):
-        _staged_user = {"role": "user", "content": _expected_persist_content}
-        if persist_user_timestamp is not None:
-            _staged_user["timestamp"] = persist_user_timestamp
-        agent._pending_cli_user_message = _staged_user
-    _typed_metadata = (
-        dict(persist_user_display_metadata)
-        if isinstance(persist_user_display_metadata, dict)
-        else {}
-    )
-    _typed_metadata.pop("_compression_turn_id", None)
-    _staged_metadata = _staged_user.get("display_metadata")
-    if not isinstance(_staged_metadata, dict):
-        _staged_metadata = {}
-    else:
-        _staged_metadata = dict(_staged_metadata)
-    _staged_metadata.update(_typed_metadata)
-    _staged_user["display_metadata"] = _staged_metadata
-    ensure_compression_turn_identity(_staged_user)
-    if persist_user_display_kind or persist_user_display_metadata is not None:
-        # turn_context applies typed metadata after adopting this staged dict;
-        # pass the merged mapping so that assignment retains the internal ID.
-        persist_user_display_metadata = _staged_user["display_metadata"]
+    persist_user_display_metadata = stage_turn_input_identity(
+        agent, user_message, persist_user_message, persist_user_timestamp,
+        persist_user_display_kind, persist_user_display_metadata)
 
     # The gateway caches agents across turns; compression state is per-turn, or a stale
     # in-place boundary would make a later uncompressed result look compacted.
@@ -1751,10 +1723,7 @@ def _run_conversation_turn(
 
     # Adopt ~/.hermes/.env credential/base-url edits made since the last turn — a
     # Settings save updates .env, not this worker's client (#67821). No-op if unchanged.
-    try:
-        agent._try_refresh_env_client_credentials()
-    except Exception:
-        logger.debug("per-turn env credential refresh failed", exc_info=True)
+    refresh_turn_credentials(agent)
 
     # Per-turn setup: build_turn_context mutates ``agent`` and returns the locals the loop reads.
     try:
