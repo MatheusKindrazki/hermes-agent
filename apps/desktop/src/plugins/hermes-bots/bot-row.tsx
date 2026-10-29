@@ -193,6 +193,8 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, onNewSection, showHandl
     fromBot ? (previewSession?.preview || '').replace(A2A_PREFIX_RE, '').trim() || '…' : previewSession?.preview || ''
   )
 
+  const compactPreview = displayPreview.length > 42 ? displayPreview.slice(0, 42).trimEnd() + '…' : displayPreview
+
   const activityStatuses = useActivityStatus()
   const activityTools = useActivityTools()
   const livePreview = activityPreview(bot, botMood, activityStatuses, activityTools, Boolean(attention))
@@ -316,7 +318,7 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, onNewSection, showHandl
           ) : null}
         </div>
         {showDetailsRow ? (
-          <div className="flex min-w-0 items-center gap-1.5 text-xs text-(--ui-text-tertiary)">
+          <div className="mt-0.5 flex min-w-0 items-center gap-1.5 text-[0.6875rem] leading-snug text-(--ui-text-tertiary)">
             {showHandle ? (
               <span className="shrink-0 font-mono text-[0.6875rem] text-(--ui-text-quaternary)">{`@${handle}`}</span>
             ) : null}
@@ -334,7 +336,9 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, onNewSection, showHandl
                 {livePreview}
               </span>
             ) : displayPreview ? (
-              <span className={cn('min-w-0 truncate', fromBot && 'italic')}>{displayPreview}</span>
+              <span className={cn('min-w-0 truncate', fromBot && 'italic')} title={displayPreview}>
+                {compactPreview}
+              </span>
             ) : null}
           </div>
         ) : null}
