@@ -297,7 +297,6 @@ def _background_runner(tmp_path, monkeypatch, *, adapter_absent=False):
 
     def _adapter_for_source(source):
         reached.append(source)
-        return None
 
     runner._delivery_adapter_for = _adapter_for_source
     return runner, reached
@@ -388,9 +387,9 @@ def _outcome(tag: str):
         seam="none",
         idempotency_key=tag,
         content_sha256=durable_admission.content_sha256(tag),
-        request_key="k8-%s" % tag,
-        event_id="evt.probe.%s" % tag,
-        session_id="sess-%s" % tag,
+        request_key=f"k8-{tag}",
+        event_id=f"evt.probe.{tag}",
+        session_id=f"sess-{tag}",
         model_may_run=True,
         signal_persisted=True,
     )

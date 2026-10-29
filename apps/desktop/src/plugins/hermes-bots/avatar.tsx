@@ -8,7 +8,9 @@
 
 import * as sdk from '@hermes/plugin-sdk'
 import { profileColor } from '@hermes/plugin-sdk'
+import { useId } from 'react'
 
+import { PaintedAvatar, paintIllustratedFace } from './painted-avatar'
 import type { AvatarAppearance, AvatarShape, BotMeta, FaceMood } from './types'
 
 // Deterministic blob avatars (name → face). Feature-detected: older SDKs
@@ -189,9 +191,8 @@ export function blobShapeString(seedPart: string, kind: string) {
   return seedPart ? `blobatar:${seedPart}` : 'blobatar'
 }
 
-/** Static SVG markup for a blob face, tagged data-bot-face so the roster's
- *  PNG backfill (pushLocalAvatars → rasterizeSvgToPng) still finds it. */
-function blobMarkup(shape: null | string | undefined, name: string, size: number) {
+/** Inline blob face, preserving the tag used by the roster's PNG backfill. */
+function blobMarkup(shape: null | string | undefined, name: string, size: number, materialId: string, mood: FaceMood) {
   if (!blobatarSvg) {
     return null
   }
@@ -209,10 +210,53 @@ function blobMarkup(shape: null | string | undefined, name: string, size: number
   }
 
   try {
-    return blobatarSvg(seed, opts).replace('<svg ', '<svg data-bot-face=' + JSON.stringify(name) + ' ')
+    let markup = blobatarSvg(seed, opts)
+    const bodyColor = markup.match(/<g fill="(#[\da-f]{6})">/i)?.[1]
+
+    if (bodyColor) {
+      markup = markup.replace(/<g fill="#[\da-f]{6}">/i, `<g fill="url(#${materialId})">`)
+      markup = markup.replace('</g><g ', '</g><g data-hb-blob-eyes="1" ')
+      markup = markup.replace(/(<svg[^>]*>)/, `$1${materialMarkup(materialId, bodyColor)}`)
+      const persona = personaFor(name)
+
+      if (persona.role !== 'neutral') {
+        const eyeColor = markup.match(/data-hb-blob-eyes="1" fill="(#[\da-f]{6})"/i)?.[1] || '#f4ead5'
+        markup = markup.replace(
+          '</svg>',
+          `<path data-hb-blob-mouth="1" d="M44 67 Q50 ${67 + persona.smile * 5} 56 67" fill="none" stroke="${eyeColor}" stroke-width="2" stroke-linecap="round" opacity="0.65"/></svg>`
+        )
+      }
+    }
+
+    return markup.replace(
+      '<svg ',
+      `<svg data-hb-blob="1" data-hb-mood="${mood}" data-bot-face=` + JSON.stringify(name) + ' '
+    )
   } catch {
     return null
   }
+}
+
+/** Keep the selected hue; light and shade give the small silhouette volume. */
+function materialColor(color: string, amount: number) {
+  if (!/^#[\da-f]{6}$/i.test(color)) {
+    return color
+  }
+
+  const channels = [1, 3, 5].map(offset => {
+    const channel = parseInt(color.slice(offset, offset + 2), 16)
+    const target = amount > 0 ? 255 : 0
+
+    return Math.round(channel + (target - channel) * Math.abs(amount))
+      .toString(16)
+      .padStart(2, '0')
+  })
+
+  return `#${channels.join('')}`
+}
+
+function materialMarkup(id: string, color: string) {
+  return `<defs><radialGradient id="${id}" cx="28%" cy="20%" r="85%"><stop stop-color="${materialColor(color, 0.45)}"/><stop offset="0.45" stop-color="${color}"/><stop offset="1" stop-color="${materialColor(color, -0.4)}"/></radialGradient></defs>`
 }
 
 /** The SVG presentation props shapeNode spreads onto a <path>. Named so the
@@ -591,6 +635,10 @@ function ringToPath(pts: FacePoint[]) {
  *  working dots' opacities. */
 interface FacePose {
   blink: boolean
+  eyeOpen: number
+  eyeWidth: number
+  eyeLean: number
+  smile: number
   d0: number
   d1: number
   d2: number
@@ -601,47 +649,119 @@ interface FacePose {
   turn: number
 }
 
-/** Working poses lean and sway; idle stays small. */
-function facePose(mood: FaceMood | string, t: number): FacePose {
-  if (mood === 'think') {
-    return {
-      turn: -18 + Math.sin(t * 0.55) * 14,
-      tilt: Math.sin(t * 0.48) * 12 + Math.sin(t * 1.35) * 3,
-      roll: Math.sin(t * 0.95) * 10,
-      gazeX: Math.sin(t * 0.7) * 3.6,
-      gazeY: -2.2 + Math.sin(t * 0.4) * 2.2,
-      blink: t % 1.45 > 1.26,
-      d0: 0.2 + 0.8 * Math.max(0, Math.sin(t * 2.4)),
-      d1: 0.2 + 0.8 * Math.max(0, Math.sin(t * 2.4 - 0.7)),
-      d2: 0.2 + 0.8 * Math.max(0, Math.sin(t * 2.4 - 1.4))
-    }
+interface BotPersona {
+  role: string
+  pace: number
+  openness: number
+  width: number
+  lean: number
+  glance: number
+  lift: number
+  smile: number
+}
+
+const PERSONAS: Record<string, BotPersona> = {
+  chief: { role: 'chief', pace: 1.45, openness: 0.5, width: 1.2, lean: 0, glance: 0.65, lift: 0.3, smile: -0.2 },
+  curious: { role: 'curious', pace: 0.85, openness: 1.35, width: 1.12, lean: -15, glance: 1.05, lift: -0.5, smile: 1 },
+  alert: { role: 'alert', pace: 0.4, openness: 1.15, width: 0.8, lean: 8, glance: 1.1, lift: -0.2, smile: 0.2 },
+  skeptical: {
+    role: 'skeptical',
+    pace: 1.2,
+    openness: 0.6,
+    width: 1.3,
+    lean: -13,
+    glance: 0.7,
+    lift: 0.5,
+    smile: -0.5
+  },
+  detective: { role: 'detective', pace: 0.9, openness: 0.8, width: 0.95, lean: -22, glance: 1, lift: -0.2, smile: 0 },
+  dreamer: { role: 'dreamer', pace: 1.1, openness: 1.25, width: 0.95, lean: -6, glance: 0.75, lift: -1.1, smile: 1.2 },
+  neutral: { role: 'neutral', pace: 1, openness: 1, width: 1, lean: 0, glance: 1, lift: 0, smile: 0 }
+}
+
+/** Profiles keep their visual identity across titles and conversation states. */
+export function personaFor(name: string): BotPersona {
+  const roles: Record<string, string> = {
+    hermes: 'chief',
+    default: 'chief',
+    applausestaff: 'chief',
+    ceiastaff: 'curious',
+    applauseinbox: 'alert',
+    financas: 'skeptical',
+    applausefinanceiro: 'skeptical',
+    applausebug: 'detective',
+    projetospessoais: 'dreamer',
+    kindraconteudo: 'dreamer'
   }
 
-  if (mood === 'work') {
-    return {
-      turn: -11 + Math.sin(t * 0.48) * 8,
-      tilt: Math.sin(t * 0.42) * 8 + Math.sin(t * 1.1) * 1.6,
-      roll: Math.sin(t * 0.75) * 4.2,
-      gazeX: Math.sin(t * 0.55) * 3.6,
-      gazeY: -1.6 + Math.sin(t * 0.38) * 2,
-      blink: t % 1.45 > 1.26,
-      d0: 0.2 + 0.8 * Math.max(0, Math.sin(t * 2.6)),
-      d1: 0.2 + 0.8 * Math.max(0, Math.sin(t * 2.6 - 0.7)),
-      d2: 0.2 + 0.8 * Math.max(0, Math.sin(t * 2.6 - 1.4))
-    }
-  }
+  return PERSONAS[roles[name.toLowerCase()] || 'neutral']
+}
+
+/** Hold a glance, ease into the next one, then let the head follow the eyes. */
+function facePose(mood: FaceMood | string, t: number, name = ''): FacePose {
+  const persona = personaFor(name)
+  const thinking = mood === 'think'
+  const working = mood === 'work'
+  const dwell = (working ? 2.6 : thinking ? 3.8 : 5.2) * persona.pace
+
+  const looks: FacePoint[] = thinking
+    ? [
+        [0, -1.8],
+        [2.2, -2],
+        [0.6, -1.2],
+        [-1.4, -1.5]
+      ]
+    : working
+      ? [
+          [-2.2, 0.5],
+          [1.8, 0.5],
+          [0, -0.5],
+          [1.2, 0.2]
+        ]
+      : [
+          [0, 0],
+          [2.6, -0.5],
+          [0, 0],
+          [-2.2, 0.4],
+          [0, 0],
+          [0.8, -1.2]
+        ]
+
+  const time = (((t / dwell) % looks.length) + looks.length) % looks.length
+  const index = Math.floor(time)
+  const previous = looks[(index + looks.length - 1) % looks.length]
+  const next = looks[index]
+  const progress = Math.min(1, (time - index) / 0.13)
+  const eased = progress * progress * (3 - 2 * progress)
+  const gazeX = (previous[0] + (next[0] - previous[0]) * eased) * persona.glance
+  const gazeY = (previous[1] + (next[1] - previous[1]) * eased) * persona.glance + persona.lift
+  const blinkPeriod = (working ? 3.7 : 4.9) * Math.max(0.65, persona.pace)
+  const blinkTime = ((t % blinkPeriod) + blinkPeriod) % blinkPeriod
+  const closing = Math.max(0, 1 - Math.abs(blinkTime - (blinkPeriod - 0.16)) / 0.15)
+  const lid = 1 - 0.96 * Math.sin((closing * Math.PI) / 2)
+  const expression = thinking ? 1.12 : working ? 0.84 : 1
 
   return {
-    turn: Math.sin(t * 0.5) * 1.5,
-    tilt: Math.sin(t * 0.27),
-    roll: Math.sin(t * 0.85) * 1.2,
-    gazeX: 0,
-    gazeY: 0,
-    blink: t % 3.2 > 3.02,
-    d0: 0,
-    d1: 0,
-    d2: 0
+    turn: gazeX * 2.4,
+    tilt: gazeY * 1.2,
+    roll: gazeX * 0.45 + Math.sin(t * 0.8) * 0.4,
+    gazeX,
+    gazeY,
+    blink: lid < 0.08,
+    eyeOpen: lid * expression * persona.openness,
+    eyeWidth: (thinking ? 0.88 : working ? 1.06 : 1) * persona.width,
+    eyeLean: persona.lean + (thinking ? -5 : working ? 2 : 0),
+    smile: persona.smile,
+    d0: working || thinking ? 0.2 + 0.8 * Math.max(0, Math.sin(t * 2.4)) : 0,
+    d1: working || thinking ? 0.2 + 0.8 * Math.max(0, Math.sin(t * 2.4 - 0.7)) : 0,
+    d2: working || thinking ? 0.2 + 0.8 * Math.max(0, Math.sin(t * 2.4 - 1.4)) : 0
   }
+}
+
+function avatarMotion(t: number) {
+  const breathe = Math.sin(t * 0.85) * 0.008
+
+  return `translateY(${Math.sin(t * 0.85) * 0.35}px) scale(${1 + breathe}, ${1 - breathe * 0.65})`
 }
 
 /** The eyes and catchlights are positioned with raw numbers.
@@ -671,7 +791,21 @@ function settlePose(svg: SVGSVGElement, mood: string, target: FacePose, t: numbe
   const progress = Math.min(1, Math.max(0, (t - state.since) / 0.4))
   const blend = 1 - (1 - progress) ** 2
   const pose = { ...target }
-  const keys = ['turn', 'tilt', 'roll', 'gazeX', 'gazeY', 'd0', 'd1', 'd2'] as const
+
+  const keys = [
+    'turn',
+    'tilt',
+    'roll',
+    'gazeX',
+    'gazeY',
+    'eyeOpen',
+    'eyeWidth',
+    'eyeLean',
+    'smile',
+    'd0',
+    'd1',
+    'd2'
+  ] as const
 
   for (const key of keys) {
     pose[key] = state.from[key] + (target[key] - state.from[key]) * blend
@@ -682,17 +816,7 @@ function settlePose(svg: SVGSVGElement, mood: string, target: FacePose, t: numbe
   return pose
 }
 
-function paintMathFace(svg: SVGSVGElement, t: number) {
-  const mood = svg.getAttribute('data-hb-mood') || 'idle'
-  const shape = svg.getAttribute('data-hb-shape') || 'circle'
-  const pose = settlePose(svg, mood, facePose(mood, t), t)
-  const body = svg.querySelector('[data-hb-body]')
-  const open = svg.querySelector('[data-hb-open]')
-  const shut = svg.querySelector('[data-hb-shut]')
-  const el: NumericAttrNode | null = svg.querySelector('[data-hb-el]')
-  const er: NumericAttrNode | null = svg.querySelector('[data-hb-er]')
-  const dots = svg.querySelectorAll('[data-hb-dot]')
-
+function paintMathBody(body: Element | null, shape: string, pose: FacePose) {
   if (body) {
     if (shape === 'cloud') {
       body.setAttribute('d', 'M11 32 a7.5 7.5 0 0 1 -1 -14.9 A9.5 9.5 0 0 1 29 12.5 A7 7 0 0 1 30 32 Z')
@@ -702,18 +826,57 @@ function paintMathFace(svg: SVGSVGElement, t: number) {
     }
   }
 
+}
+
+function paintMathFace(svg: SVGSVGElement, t: number) {
+  const mood = svg.getAttribute('data-hb-mood') || 'idle'
+  const shape = svg.getAttribute('data-hb-shape') || 'circle'
+  const pose = settlePose(svg, mood, facePose(mood, t, svg.getAttribute('data-bot-face') || ''), t)
+  const body = svg.querySelector('[data-hb-body]')
+  const open = svg.querySelector('[data-hb-open]')
+  const shut = svg.querySelector('[data-hb-shut]')
+  const el: NumericAttrNode | null = svg.querySelector('[data-hb-el]')
+  const er: NumericAttrNode | null = svg.querySelector('[data-hb-er]')
+  const dots = svg.querySelectorAll('[data-hb-dot]')
+  const mouth = svg.querySelector('[data-hb-mouth]')
+  const brows = svg.querySelector('[data-hb-brows]')
+  const persona = personaFor(svg.getAttribute('data-bot-face') || '')
+
+  if (mouth) {
+    const x = 20 + pose.gazeX * 0.5
+    mouth.setAttribute('d', `M${x - 2.5} 26.5 Q${x} ${26.5 + pose.smile * 2.3} ${x + 2.5} 26.5`)
+  }
+
+  paintMathBody(body, shape, pose)
+
   const eyeY = (shape === 'cloud' ? 22 : 17.2) + pose.gazeY
   const eyeL = 15.4 + pose.gazeX
   const eyeR = 24.6 + pose.gazeX
 
+  if (brows) {
+    const y = eyeY - 4.6
+    const raised = persona.role === 'detective' ? 1.8 : 0
+    const slant = persona.role === 'skeptical' ? 0.8 : 0
+    brows.setAttribute(
+      'd',
+      `M${eyeL - 2.6} ${y - slant} L${eyeL + 2.6} ${y + slant} M${eyeR - 2.6} ${y + slant - raised} L${eyeR + 2.6} ${y - slant - raised}`
+    )
+  }
+
   if (el) {
     el.setAttribute('cx', eyeL)
     el.setAttribute('cy', eyeY)
+    el.setAttribute('rx', 1.9 * pose.eyeWidth)
+    el.setAttribute('ry', 3.1 * pose.eyeOpen)
+    el.setAttribute('transform', `rotate(${pose.eyeLean} ${eyeL} ${eyeY})`)
   }
 
   if (er) {
     er.setAttribute('cx', eyeR)
     er.setAttribute('cy', eyeY)
+    er.setAttribute('rx', 1.9 * pose.eyeWidth)
+    er.setAttribute('ry', 3.1 * pose.eyeOpen * (persona.role === 'detective' ? 1.3 : 1))
+    er.setAttribute('transform', `rotate(${-pose.eyeLean * 0.5} ${eyeR} ${eyeY})`)
   }
 
   // Catchlights ride the pupils (upper-left offset) — without this they
@@ -748,8 +911,8 @@ function paintMathFace(svg: SVGSVGElement, t: number) {
     const o = i === 0 ? pose.d0 : i === 1 ? pose.d1 : pose.d2
     dot.setAttribute('opacity', String(o))
   })
-  svg.style.transform = `rotate(${pose.tilt}deg)`
-  svg.style.transformOrigin = '50% 70%'
+  svg.style.transform = avatarMotion(t)
+  svg.style.transformOrigin = '50% 50%'
 }
 
 function walkMathFaces(root: Document | ShadowRoot | null, acc: SVGSVGElement[]): SVGSVGElement[] {
@@ -757,7 +920,9 @@ function walkMathFaces(root: Document | ShadowRoot | null, acc: SVGSVGElement[])
     return acc
   }
 
-  root.querySelectorAll<SVGSVGElement>('svg[data-hb-math]').forEach(node => acc.push(node))
+  root
+    .querySelectorAll<SVGSVGElement>('svg[data-hb-math], svg[data-hb-blob], svg[data-hb-painted]')
+    .forEach(node => acc.push(node))
   root.querySelectorAll('*').forEach(el => {
     if (el.shadowRoot) {
       walkMathFaces(el.shadowRoot, acc)
@@ -780,6 +945,70 @@ declare global {
   }
 }
 
+function paintBlobFace(face: SVGSVGElement, faceTime: number, reducedMotion: boolean) {
+  const mood = face.getAttribute('data-hb-mood') || 'idle'
+
+  const pose = settlePose(
+    face,
+    mood,
+    facePose(mood, faceTime, face.getAttribute('data-bot-face') || ''),
+    faceTime
+  )
+
+  const eyes = face.querySelector<SVGGElement>('[data-hb-blob-eyes]')
+  const body = face.querySelector<SVGGElement>('g:not([data-hb-blob-eyes])')
+  const mouth = face.querySelector('[data-hb-blob-mouth]')
+
+  if (mouth) {
+    const x = 50 + pose.gazeX * 1.25
+    mouth.setAttribute('d', `M${x - 6} 67 Q${x} ${67 + pose.smile * 5} ${x + 6} 67`)
+  }
+
+  if (body) {
+    body.style.transformBox = 'fill-box'
+    body.style.transformOrigin = 'center'
+    body.style.transform = reducedMotion
+      ? 'none'
+      : `translate(${pose.gazeX * 0.4}px, ${pose.gazeY * 0.25}px) rotate(${pose.roll}deg) scale(${1 - Math.abs(pose.gazeX) * 0.006}, 1)`
+  }
+
+  face.style.transform = reducedMotion ? 'none' : avatarMotion(faceTime)
+  face.style.transformOrigin = '50% 50%'
+
+  if (eyes) {
+    eyes.style.opacity = '1'
+    eyes.style.transformBox = 'fill-box'
+    eyes.style.transformOrigin = 'center'
+    eyes.style.transform = reducedMotion
+      ? 'none'
+      : `translate(${pose.gazeX * 2.5}px, ${pose.gazeY * 2.5}px) rotate(${pose.eyeLean * 0.3}deg) scale(${pose.eyeWidth}, ${pose.eyeOpen})`
+  }
+}
+
+function paintAnimatedFace(svg: SVGSVGElement, t: number, reducedMotion: boolean) {
+  const face = svg as SVGSVGElement
+  const phase = sigilRng(face.getAttribute('data-bot-face') || 'agent')() * 12
+  const faceTime = reducedMotion ? 0 : t + phase
+
+  if (face.hasAttribute('data-hb-painted')) {
+    const pose = facePose(
+      face.getAttribute('data-hb-mood') || 'idle',
+      faceTime,
+      face.getAttribute('data-bot-face') || ''
+    )
+
+    paintIllustratedFace(face, faceTime, pose.gazeX, pose.gazeY, pose.eyeOpen, Boolean(reducedMotion))
+  } else if (face.hasAttribute('data-hb-blob')) {
+    paintBlobFace(face, faceTime, reducedMotion)
+  } else {
+    paintMathFace(face, faceTime)
+
+    if (reducedMotion) {
+      face.style.transform = 'none'
+    }
+  }
+}
+
 export function startFaceClock() {
   if (typeof window === 'undefined') {
     return
@@ -794,6 +1023,9 @@ export function startFaceClock() {
   }
 
   const t0 = performance.now()
+  const motionPreference = window.matchMedia?.('(prefers-reduced-motion: reduce)')
+  const motionChanged = () => window.__hbFaceClock?.wake()
+  motionPreference?.addEventListener('change', motionChanged)
   // A large roster can mount hundreds of faces. Observe the cached nodes so
   // off-screen cards do not consume a full animation frame by themselves.
   let faces: SVGSVGElement[] = []
@@ -856,13 +1088,13 @@ export function startFaceClock() {
       lastScan = now
     }
 
-    const t = (now - t0) / 1000
-    const facesToPaint = observer ? visibleFaces : faces
+    const reducedMotion = motionPreference?.matches
+    const t = reducedMotion ? 0 : (now - t0) / 1000
+    const facesToPaint = reducedMotion ? faces : observer ? visibleFaces : faces
 
     for (const svg of facesToPaint) {
       if (svg.isConnected) {
-        // Both caches only ever hold nodes matched by `svg[data-hb-math]`.
-        paintMathFace(svg as SVGSVGElement, t)
+        paintAnimatedFace(svg as SVGSVGElement, t, Boolean(reducedMotion))
       }
     }
   }
@@ -874,9 +1106,11 @@ export function startFaceClock() {
   // short-circuits to the observer itself. createBudgetedLoop declares
   // idleWhen as `() => boolean`; null is falsy so the loop keeps running as
   // intended today. Hence the assertion at the idleWhen call below.
-  const idle = () => faces.length === 0 || (observer && visibleFaces.size === 0)
+  const idle = () => Boolean(motionPreference?.matches || faces.length === 0 || (observer && visibleFaces.size === 0))
 
   const teardownCaches = () => {
+    motionPreference?.removeEventListener('change', motionChanged)
+
     if (observer) {
       observer.disconnect()
     }
@@ -979,6 +1213,7 @@ export function stopFaceClock() {
 }
 
 interface BotFaceProps {
+  hovered?: boolean
   color: string
   image?: null | string
   mood?: FaceMood
@@ -993,8 +1228,30 @@ interface BotFaceProps {
  * Live math face. Photos still use <img>. Shape avatars stay SVG so
  * the clock can move them (a baked PNG cannot).
  */
-export function BotFace({ shape, color, image, size = 36, name = 'agent', mood = 'idle' }: BotFaceProps) {
+export function BotFace({
+  shape,
+  color,
+  image,
+  size = 36,
+  name = 'agent',
+  mood = 'idle',
+  hovered = false
+}: BotFaceProps) {
+  const materialId = `hb-material-${useId().replace(/[^a-zA-Z0-9_-]/g, '')}`
   startFaceClock()
+
+  const paintedRole = personaFor(name).role
+
+  if (paintedRole !== 'neutral') {
+    return <PaintedAvatar hovered={hovered} id={materialId} mood={mood} name={name} role={paintedRole} size={size} />
+  }
+
+  // The personal chief's gray mascot needs live eyelids rather than its baked image.
+  if (['hermes', 'default'].includes(name.toLowerCase()) && image) {
+    image = null
+    shape = 'circle'
+    color = '#6c707c'
+  }
 
   if (image) {
     return (
@@ -1013,13 +1270,11 @@ export function BotFace({ shape, color, image, size = 36, name = 'agent', mood =
     )
   }
 
-  // Blobatar shapes: the library draws the whole face (body + eyes + its own
-  // name-derived palette). Inline SVG via innerHTML so the roster PNG
-  // backfill's `svg[data-bot-face=…]` query still finds it; the math clock
-  // ignores it (no data-hb-math). Falls back to the legacy math face when the
-  // SDK predates the export.
+  // Keep the library's seed, silhouette and palette. Inline SVG lets the
+  // shared visibility-budgeted clock animate it and PNG backfill find it.
+  // Older SDKs still fall back to the deterministic math face.
   if (isBlobShape(shape)) {
-    const markup = blobMarkup(shape, name, size)
+    const markup = blobMarkup(shape, name, size, materialId, mood)
 
     if (markup) {
       return (
@@ -1069,7 +1324,7 @@ export function BotFace({ shape, color, image, size = 36, name = 'agent', mood =
   // maroon/ink/oxblood avatars.
   const hlFill = isDarkColor(color) ? 'rgba(0,0,0,0.6)' : 'rgba(255,255,255,0.85)'
   const ring = sampleFaceRing(shape)
-  const rest = facePose(mood, 0)
+  const rest = facePose(mood, 0, name)
   // Shape-aware initial eye line — the cloud body sits lower, so its eyes
   // (and their catchlights) start at the cloud position instead of jumping
   // there on the first clock paint.
@@ -1087,6 +1342,13 @@ export function BotFace({ shape, color, image, size = 36, name = 'agent', mood =
       viewBox="0 0 40 44"
       width={size}
     >
+      <defs>
+        <radialGradient cx="28%" cy="20%" id={materialId} r="85%">
+          <stop stopColor={materialColor(color, 0.45)} />
+          <stop offset="0.45" stopColor={color} />
+          <stop offset="1" stopColor={materialColor(color, -0.4)} />
+        </radialGradient>
+      </defs>
       <path
         d={
           shape === 'cloud'
@@ -1094,14 +1356,36 @@ export function BotFace({ shape, color, image, size = 36, name = 'agent', mood =
             : ringToPath(ring)
         }
         data-hb-body="1"
-        fill={color}
+        fill={`url(#${materialId})`}
       />
       <g data-hb-open="1">
-        <ellipse cx={15.4} cy={eyeY0} data-hb-el="1" fill={eyeFill} rx={2.2} ry={working ? 2.6 : 2.3} />
-        <ellipse cx={24.6} cy={eyeY0} data-hb-er="1" fill={eyeFill} rx={2.2} ry={working ? 2.6 : 2.3} />
+        <ellipse cx={15.4} cy={eyeY0} data-hb-el="1" fill={eyeFill} rx={1.9} ry={working ? 2.7 : 3.1} />
+        <ellipse cx={24.6} cy={eyeY0} data-hb-er="1" fill={eyeFill} rx={1.9} ry={working ? 2.7 : 3.1} />
         <circle cx={14.8} cy={eyeY0 - 0.7} data-hb-hl-l="1" fill={hlFill} r={0.65} />
         <circle cx={24} cy={eyeY0 - 0.7} data-hb-hl-r="1" fill={hlFill} r={0.65} />
       </g>
+      {personaFor(name).role !== 'neutral' && (
+        <path
+          d={`M17.5 26.5 Q20 ${26.5 + rest.smile * 2.3} 22.5 26.5`}
+          data-hb-mouth="1"
+          fill="none"
+          opacity={0.65}
+          stroke={eyeFill}
+          strokeLinecap="round"
+          strokeWidth={1}
+        />
+      )}
+      {['chief', 'skeptical', 'detective'].includes(personaFor(name).role) && (
+        <path
+          d="M12.8 12.6 L18 12.6 M22 12.6 L27.2 12.6"
+          data-hb-brows="1"
+          fill="none"
+          opacity={0.65}
+          stroke={eyeFill}
+          strokeLinecap="round"
+          strokeWidth={0.9}
+        />
+      )}
       <path
         d={`M12.8 ${eyeY0} L18 ${eyeY0} M22 ${eyeY0} L27.2 ${eyeY0}`}
         data-hb-shut="1"

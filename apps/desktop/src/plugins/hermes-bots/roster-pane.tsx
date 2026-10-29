@@ -15,6 +15,7 @@ import {
   parseRosterKey,
   saveSelectedRosterBot
 } from './bot-state'
+import { CanonicalGroupList } from './canonical-group-registry'
 /**
  * The Bots pane itself: the roster's selection reconciliation, the
  * workspace-ownership reads its lifecycle keys off, and the pane that lists
@@ -35,10 +36,12 @@ import {
 import { $groupChats, $groupChatWorkspace, $groupClarify, $groupNeedsYou } from './group-chat'
 import { GroupChatWorkspace, openGroupChat } from './group-chat-view'
 import { groupChatMemberBots } from './group-membership'
-import { $groupMainTabsRev, shouldRenderGroupChatInPane } from './group-panes'
+import { $groupMainTabsRev, groupOpenOrigin, shouldRenderGroupChatInPane } from './group-panes'
 import { $activeGroupMemberKeys } from './group-presence'
+import { groupHasPendingClarify } from './group-turns'
 import { $showHiddenBots, isBotHidden } from './hidden-bots'
 import { useBots } from './i18n'
+import { NowView } from './now-view'
 import { $activityToasts } from './roster-actions'
 import { renderRosterContent } from './roster-pane-content'
 import { deriveRosterPresentation, deriveRosterRows, sortRosterBots } from './roster-pane-derivation'
@@ -49,7 +52,7 @@ import { rosterSectionRenderers } from './roster-pane-sections'
 import { renderRosterToolbar } from './roster-pane-toolbar'
 import { botNeedsHandleLabel, rosterGatewayOptions } from './roster-sections'
 import { botWorkspaceOwnerKey, setBotsWorkspaceOwner } from './routing'
-import { activeBots, useTurnBusy } from './row-helpers'
+import { activeBots, useSessionWork, useTurnBusy } from './row-helpers'
 import type { BotMeta, GatewaySource, GroupMember, RosterActivityFilter, RosterKindFilter, RosterRow } from './types'
 import {
   $botSections,
@@ -228,16 +231,41 @@ function useReconcileRosterOwner(
   }, [data, error, selectionHydrated, roster, sourceSnapshot, allMeta])
 }
 
+function readRosterView(): 'now' | 'all' {
+  try {
+    return window.localStorage.getItem('hermes-bots:roster-view') === 'all' ? 'all' : 'now'
+  } catch {
+    return 'now'
+  }
+}
+
+function rosterSnapshot(data: ReturnType<typeof useRoster>['data'], error: unknown) {
+  const live = Array.isArray(data?.profiles) ? data.profiles : null
+  const source = live ?? (error ? $lastRoster.get() : [])
+  return { live, source }
+}
+
 export function BotsPane() {
   const { t } = useI18n()
   const b = useBots()
+
+  const [rosterView, setRosterView] = useState<'now' | 'all'>(readRosterView)
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('hermes-bots:roster-view', rosterView)
+    } catch {
+      /* The view still works without persistence. */
+    }
+  }, [rosterView])
   const { data, error, isLoading, refetch } = useRoster()
   const gatewayState = useValue(host.state.gateway)
   const gatewayUp = gatewayState === 'open'
 
   const turnBusy = useTurnBusy()
+  const liveSessionWork = useSessionWork()
   const workingOwner = focusedRosterOwner(useValue($focusedBotOwner))
-  const activeConnectionId = host.state.connectionId?.get?.() || 'local'
+  const activeConnectionId = rosterConnectionId()
   const [createOpen, setCreateOpen] = useState(false)
   const [groupCreateOpen, setGroupCreateOpen] = useState(false)
   const [editing, setEditing] = useState<null | RosterRow>(null)
@@ -288,8 +316,7 @@ export function BotsPane() {
   // roster the user already had — mixed local+cloud gateways and remotes
   // waking from sleep fail transiently. Render the last good snapshot with
   // a notice; the full error card is reserved for "never had a roster".
-  const live = Array.isArray(data?.profiles) ? data.profiles : null
-  const source = live ?? (error ? $lastRoster.get() : [])
+  const { live, source } = rosterSnapshot(data, error)
   const sourceSnapshot = Array.isArray(data?.sources) ? data.sources : rememberedSources
 
   const sourceWithSelectedOwner =
@@ -316,7 +343,9 @@ export function BotsPane() {
   const groupKeys = useValue($activeGroupMemberKeys)
 
   const activeRosterKeys = new Set(
-    activeBots(roster, workingOwner, turnBusy, Date.now(), activeConnectionId, groupKeys).map(botRosterKey)
+    activeBots(roster, workingOwner, turnBusy, Date.now(), activeConnectionId, groupKeys, liveSessionWork).map(
+      botRosterKey
+    )
   )
 
   const gatewayOptions = rosterGatewayOptions(sourceSnapshot, roster)
@@ -420,7 +449,7 @@ export function BotsPane() {
   const groupChatMembers = groupChatName ? groupChatMemberBots(groupChatName, roster, allMeta) : []
 
   if (shouldRenderGroupChatInPane(groupChatName) && groupChatMembers.length) {
-    return <GroupChatWorkspace group={groupChatName} members={groupChatMembers} />
+    return <GroupChatWorkspace group={groupChatName} members={groupChatMembers} origin={groupOpenOrigin(groupChatName)} />
   }
 
   const renderBotRow = (bot: RosterRow, keyPrefix = '') => (
@@ -447,7 +476,7 @@ export function BotsPane() {
       members={row.members}
       onDisband={setDeletingGroup}
       onNewSection={target => setSectionDialog({ group: target, mode: 'create' })}
-      onOpen={openGroupChat}
+      onOpen={group => openGroupChat(group, 'name')}
       sortedGroupRows={sortedGroupRows}
     />
   )
@@ -470,8 +499,24 @@ export function BotsPane() {
 
   return (
     <div className="flex h-full flex-col">
+      <CanonicalGroupList onOpen={openGroupChat} />
       {renderRosterToolbar({
         b,
+        navigation: (
+          <div aria-label="Visão dos bots" className="flex min-w-0 items-center gap-5" role="group">
+            {(['now', 'all'] as const).map(view => (
+              <button
+                aria-pressed={rosterView === view}
+                className={`relative py-2 text-[0.8125rem] font-semibold transition-colors focus-visible:outline focus-visible:outline-2 ${rosterView === view ? 'text-(--ui-text-primary) after:absolute after:inset-x-0 after:bottom-0 after:h-0.5 after:rounded-full after:bg-(--ui-text-primary)' : 'text-(--ui-text-tertiary) hover:text-(--ui-text-primary)'}`}
+                key={view}
+                onClick={() => setRosterView(view)}
+                type="button"
+              >
+                {view === 'now' ? 'Agora' : 'Todos'}
+              </button>
+            ))}
+          </div>
+        ),
         activityToasts,
         activeSourceRoster,
         roster,
@@ -482,7 +527,13 @@ export function BotsPane() {
         showRosterSearch,
         showRosterFilters,
         query,
-        setQuery,
+        setQuery: value => {
+          setQuery(value)
+
+          if (value.trim()) {
+            setRosterView('all')
+          }
+        },
         activeFilterCount,
         gatewayOptions,
         rowKindFilter,
@@ -492,36 +543,53 @@ export function BotsPane() {
         gatewayFilter,
         setGatewayFilter
       })}
-      {renderRosterContent({
-        b,
-        staleNotice,
-        isLoading,
-        initialRosterLoading,
-        roster,
-        error,
-        gatewayUp,
-        refetch,
-        allBotsHidden,
-        hiddenExpanded,
-        rosterRows,
-        matchingHiddenBots,
-        query,
-        selectedGateway,
-        showGatewaySections,
-        sortedGroupRows,
-        gatewaySections,
-        showHiddenSection,
-        hiddenSectionRef,
-        hasRosterConstraint,
-        hiddenBots,
-        showHiddenRows,
-        hiddenGatewaySections,
-        renderBotRow,
-        renderGroupChatSection,
-        renderGatewaySection,
-        renderUserSections,
-        renderHiddenGatewaySection
-      })}
+      {rosterView === 'now' && roster.length && !initialRosterLoading ? (
+        <NowView
+          bots={rosterRows.flatMap(row => (row.kind === 'bot' ? [row.bot] : []))}
+          loading={isLoading}
+          onShowAll={() => setRosterView('all')}
+          renderBot={renderBotRow}
+          renderRoom={renderGroupRow}
+          rooms={sortedGroupRows.map(row => ({
+            ...row,
+            waiting: Boolean(groupNeedsYou[row.name]) || groupHasPendingClarify(groupClarify, row.name),
+            running: Boolean(groupRooms[row.name]?.running),
+            updated: row.activity
+          }))}
+          stale={Boolean(error || staleNotice)}
+        />
+      ) : (
+        renderRosterContent({
+          b,
+          staleNotice,
+          isLoading,
+          initialRosterLoading,
+          roster,
+          error,
+          gatewayUp,
+          refetch,
+          allBotsHidden,
+          hiddenExpanded,
+          rosterRows,
+          matchingHiddenBots,
+          query,
+          selectedGateway,
+          showGatewaySections,
+          sortedGroupRows,
+          gatewaySections,
+          showHiddenSection,
+          hiddenSectionRef,
+          hasRosterConstraint,
+          hiddenBots,
+          showHiddenRows,
+          hiddenGatewaySections,
+          renderBotRow,
+          renderGroupChatSection,
+          renderGatewaySection,
+          renderUserSections,
+          renderHiddenGatewaySection
+        })
+      )}
       {renderRosterDialogs({
         b,
         t,
@@ -545,4 +613,8 @@ export function BotsPane() {
       })}
     </div>
   )
+}
+
+function rosterConnectionId() {
+  return host.state.connectionId?.get?.() || 'local'
 }

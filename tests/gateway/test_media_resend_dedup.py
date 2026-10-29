@@ -37,7 +37,8 @@ from gateway.platforms.base import (
     SendResult,
 )
 from gateway.platforms.event import MessageEvent, MessageType
-from gateway.run import GatewayRunner, _collect_auto_append_media_tags, _collect_history_media_paths
+from gateway.run import GatewayRunner
+from gateway.run_media_history import _collect_auto_append_media_tags, _collect_history_media_paths
 from gateway.session import SessionSource, build_session_key
 
 
@@ -383,7 +384,6 @@ async def test_history_lookup_saturation_fails_open_without_new_worker(monkeypat
             if calls == 2:
                 two_started.set()
         release.wait(timeout=10)
-        return None
 
     monkeypatch.setattr(adapter, "_history_media_paths_for_session", blocked_lookup)
     first = asyncio.create_task(adapter._bounded_history_media_paths_for_session("one"))
@@ -483,10 +483,9 @@ async def test_streamed_explicit_media_resend_is_delivered(tmp_path, monkeypatch
     accidental echo of auto-appended history)."""
     img = _allowed_file(tmp_path, monkeypatch, "flyer.png")
     adapter = _stream_adapter()
-    runner = SimpleNamespace(
-        _thread_metadata_for_source=lambda source, anchor=None: {},
-        _reply_anchor_for_event=lambda event: None,
-    )
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._thread_metadata_for_source = lambda source, anchor=None: {}
+    runner._reply_anchor_for_event = lambda event: None
 
     await GatewayRunner._deliver_media_from_response(
         runner,

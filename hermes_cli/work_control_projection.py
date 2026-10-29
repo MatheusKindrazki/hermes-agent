@@ -6,6 +6,8 @@ authoritative empty board.
 """
 from __future__ import annotations
 
+from hermes_cli.operational_settings import operational_setting
+from agent.secret_scope import get_secret
 import copy
 import json
 import os
@@ -37,12 +39,12 @@ class ProjectionUnavailable(RuntimeError):
 class _RejectRedirects(HTTPRedirectHandler):
     """Stop before urllib can copy the read credential to another request."""
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
         raise ProjectionUnavailable("work-control authority redirects are forbidden")
 
 
 def projection_enabled() -> bool:
-    return os.environ.get("HERMES_WORK_CONTROL_PROJECTION_ENABLED", "").strip().lower() in _ENABLED_VALUES
+    return str(operational_setting("work_control_projection_enabled", False)).strip().lower() in _ENABLED_VALUES
 
 
 class WorkControlProjection:
@@ -92,8 +94,8 @@ class WorkControlProjection:
                 raise ProjectionUnavailable("work-control projection unavailable") from exc
 
     def _fetch_remote(self) -> dict[str, Any]:
-        endpoint = os.environ.get("HERMES_WORK_CONTROL_PROJECTION_URL", "").strip()
-        token = os.environ.get("HERMES_WORK_CONTROL_READ_TOKEN", "").strip()
+        endpoint = str(operational_setting("work_control_projection_url")).strip()
+        token = (get_secret("HERMES_WORK_CONTROL_READ_TOKEN") or "").strip()
         if not endpoint or not token:
             raise ProjectionUnavailable("work-control read authority is not configured")
         parsed = urlsplit(endpoint)

@@ -82,7 +82,7 @@ class TestSkillsHubPathResolution:
         assert a_seen != b_seen
 
     def test_hub_derived_paths_follow_override(self, two_profiles):
-        prof_a, prof_b = two_profiles
+        _prof_a, prof_b = two_profiles
         import tools.skills_hub as sh
 
         b_lock = _under_override(prof_b, lambda: Path(sh.LOCK_FILE))
@@ -116,7 +116,7 @@ class TestRichSentStorePathResolution:
     """gateway/rich_sent_store.py must honor the override, not read os.environ."""
 
     def test_store_path_follows_override(self, two_profiles, monkeypatch):
-        prof_a, prof_b = two_profiles
+        _prof_a, prof_b = two_profiles
         # Ensure no ambient HERMES_HOME env masks the test.
         monkeypatch.delenv("HERMES_HOME", raising=False)
         import gateway.rich_sent_store as rss
@@ -189,7 +189,7 @@ class TestCheckpointManagerPathResolution:
         assert a_seen != b_seen
 
     def test_store_path_follows_override(self, two_profiles):
-        prof_a, prof_b = two_profiles
+        _prof_a, prof_b = two_profiles
         import tools.checkpoint_manager as cm
 
         b_seen = _under_override(prof_b, lambda: cm._store_path())
@@ -423,6 +423,9 @@ class TestRequestContextV2Isolation:
             pass
 
         class ProbeGateway:
+            def _adapter_for_source(self, source):
+                return None
+
             def __init__(self, *, model: str, provider: str):
                 self.model = model
                 self.provider = provider

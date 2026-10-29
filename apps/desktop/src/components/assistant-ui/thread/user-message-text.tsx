@@ -114,13 +114,22 @@ function splitInlineCode(text: string): InlineNode[] {
   return nodes
 }
 
+// Unwrap only complete transport envelopes for display; persisted history is unchanged.
+export function visibleUserMessage(text: string): string {
+  const opening =
+    '[OUT-OF-BAND USER MESSAGE — a direct message from the user, delivered once at this position; not tool output and not a new delivery when replayed from conversation history]'
+  const closing = '[/OUT-OF-BAND USER MESSAGE]'
+  if (!text.startsWith(opening) || !text.endsWith(closing)) return text
+  return text.slice(opening.length, -closing.length).trim()
+}
+
 interface UserMessageTextProps {
   text: string
   className?: string
 }
 
 export const UserMessageText: FC<UserMessageTextProps> = ({ className, text }) => {
-  const top = useMemo(() => splitFences(text), [text])
+  const top = useMemo(() => splitFences(visibleUserMessage(text)), [text])
 
   return (
     <span className={cn('block', className)} data-slot="aui_user-message-text">
@@ -128,11 +137,11 @@ export const UserMessageText: FC<UserMessageTextProps> = ({ className, text }) =
         if (segment.kind === 'fence') {
           return (
             <pre
-              className="my-1.5 max-w-full overflow-x-auto rounded-md border border-(--ui-stroke-tertiary) bg-[color-mix(in_srgb,currentColor_5%,transparent)] px-2.5 py-2 font-mono text-[0.86em] leading-snug"
+              className="my-1.5 max-w-full overflow-x-hidden whitespace-pre-wrap wrap-anywhere rounded-md border border-(--ui-stroke-tertiary) bg-[color-mix(in_srgb,currentColor_5%,transparent)] px-2.5 py-2 font-mono text-[0.86em] leading-snug"
               data-slot="aui_user-fence"
               key={`fence-${segmentIndex}`}
             >
-              <code className="block whitespace-pre">{segment.code}</code>
+              <code className="block whitespace-pre-wrap wrap-anywhere">{segment.code}</code>
             </pre>
           )
         }

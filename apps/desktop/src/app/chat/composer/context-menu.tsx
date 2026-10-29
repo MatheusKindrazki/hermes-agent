@@ -18,6 +18,8 @@ import { useI18n } from '@/i18n'
 import { Clipboard, FileText, FolderOpen, type IconComponent, ImageIcon, Link, MessageSquareText } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 
+import { ComputerUseMenu } from '../computer-use-menu'
+
 import { useComposerAttachmentProviders } from './contrib'
 import { GHOST_ICON_BTN } from './controls'
 import type { ChatBarState } from './types'
@@ -26,6 +28,7 @@ const SNIPPET_KEYS = ['codeReview', 'implementationPlan', 'explainThis']
 
 export function ContextMenu({
   state,
+  sessionId,
   onInsertText,
   onOpenUrlDialog,
   onPasteClipboardImage,
@@ -40,6 +43,7 @@ export function ContextMenu({
   // window (composer "+" anchor), so we promoted it to a real Dialog —
   // easier to grow with search / descriptions, and no positioning math.
   const [snippetsOpen, setSnippetsOpen] = useState(false)
+  const [computerUseOpen, setComputerUseOpen] = useState(false)
   // `composer.attachments` contributions — plugin/core-registered rows that
   // extend this menu through the same registry as every other surface.
   const attachmentProviders = useComposerAttachmentProviders()
@@ -89,6 +93,13 @@ export function ContextMenu({
           </ContextMenuItem>
 
           <DropdownMenuSeparator />
+          <DropdownMenuItem
+            className="text-[length:var(--conversation-tool-font-size)] focus:bg-(--ui-bg-tertiary)"
+            onSelect={() => setComputerUseOpen(true)}
+          >
+            <Codicon name="device-desktop" size="0.875rem" />
+            <span>Computer Use</span>
+          </DropdownMenuItem>
 
           <ContextMenuItem icon={MessageSquareText} onSelect={() => setSnippetsOpen(true)}>
             {c.promptSnippets}
@@ -116,6 +127,7 @@ export function ContextMenu({
         </DropdownMenuContent>
       </DropdownMenu>
 
+      <ComputerUseMenu onOpenChange={setComputerUseOpen} open={computerUseOpen} sessionId={sessionId} />
       <PromptSnippetsDialog onInsertText={onInsertText} onOpenChange={setSnippetsOpen} open={snippetsOpen} />
     </>
   )
@@ -185,6 +197,7 @@ interface ContextMenuItemProps {
 }
 
 interface ContextMenuProps {
+  sessionId?: string | null
   onInsertText: (text: string) => void
   onOpenUrlDialog: () => void
   onPasteClipboardImage?: (opts?: { silent?: boolean }) => Promise<boolean> | void

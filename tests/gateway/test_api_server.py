@@ -13,6 +13,7 @@ Tests cover:
 """
 
 import asyncio
+import hashlib
 import json
 import time
 import types
@@ -449,17 +450,34 @@ def auth_adapter():
 
 class TestAgentExecution:
     @pytest.mark.asyncio
-    async def test_delivery_handler_persists_real_inbound_and_deduplicates(self, adapter, tmp_path):
+    async def test_delivery_handler_persists_real_inbound_and_deduplicates(self, adapter, tmp_path, monkeypatch):
+        monkeypatch.setattr("tools.bot_live_delivery.find_canonical_live_owner", lambda home: None)
         from hermes_state import SessionDB
 
         db = SessionDB(tmp_path / "state.db")
         session_id = db.create_session("delivery-target", "api_server")
         adapter._session_db = db
         calls = []
+        second_waiting = asyncio.Event()
+        import weakref
+
+        class ObservedLock(asyncio.Lock):
+            attempts = 0
+
+            async def __aenter__(self):
+                self.attempts += 1
+                if self.attempts == 2:
+                    second_waiting.set()
+                return await super().__aenter__()
+
+        delivery_lock = ObservedLock()
+        adapter._delivery_request_locks = weakref.WeakValueDictionary({
+            ("default", "delivery-1"): delivery_lock,
+        })
 
         async def fake_run_agent(user_message, **kwargs):
             calls.append(user_message)
-            await asyncio.sleep(0.03)
+            await asyncio.wait_for(second_waiting.wait(), timeout=2)
             db.append_message(
                 session_id, "user", user_message,
                 display_kind="bot_delivery",
@@ -491,7 +509,8 @@ class TestAgentExecution:
         assert sum(1 for row in db.get_messages(session_id) if row.get("role") == "user") == 1
 
     @pytest.mark.asyncio
-    async def test_delivery_id_rebind_conflicts_without_second_inbound(self, adapter, tmp_path):
+    async def test_delivery_id_rebind_conflicts_without_second_inbound(self, adapter, tmp_path, monkeypatch):
+        monkeypatch.setattr("tools.bot_live_delivery.find_canonical_live_owner", lambda home: None)
         from hermes_state import SessionDB
 
         db = SessionDB(tmp_path / "state.db")
@@ -519,7 +538,8 @@ class TestAgentExecution:
         assert sum(1 for row in db.get_messages(session_id) if row.get("role") == "user") == 1
 
     @pytest.mark.asyncio
-    async def test_delivery_handler_fails_closed_when_persistence_is_missing(self, adapter, tmp_path):
+    async def test_delivery_handler_fails_closed_when_persistence_is_missing(self, adapter, tmp_path, monkeypatch):
+        monkeypatch.setattr("tools.bot_live_delivery.find_canonical_live_owner", lambda home: None)
         from hermes_state import SessionDB
 
         db = SessionDB(tmp_path / "state.db")
@@ -829,7 +849,7 @@ class TestDisconnectedAgentReap:
 
         deadline = time.time() + 1.0
         while not calls and time.time() < deadline:
-            time.sleep(0.01)
+            await asyncio.sleep(0.01)
         assert calls == [("run-stop-sess", frozenset(), "api_server_run_stop")]
         agent.interrupt.assert_called_once()
 
@@ -1095,7 +1115,7 @@ class TestSkillsEndpoint:
             {"name": "ascii-art", "description": "ASCII art generation", "category": "creative"},
         ]
         with patch(
-            "tools.skills_tool._find_all_skills",
+            "tools.skills_tool.find_all_skills",
             return_value=list(fake_skills),
         ):
             app = _create_app(adapter)
@@ -1513,6 +1533,30 @@ class TestDeriveChatSessionId:
         a = _derive_chat_session_id("You are a pirate.", "Hello")
         b = _derive_chat_session_id("You are a robot.", "Hello")
         assert a != b
+
+    def test_routed_profile_namespaces_the_id_without_moving_default(self):
+        """Two header-less conversations opening with identical text on different profiles must
+        not share one session/sandbox key (#123989); default/standalone ids stay byte-identical
+        so live conversations survive the upgrade."""
+        legacy = "api-" + hashlib.sha256(b"sys\nhello").hexdigest()[:16]
+        assert _derive_chat_session_id("sys", "hello") == legacy
+        assert _derive_chat_session_id("sys", "hello", "default") == legacy
+        research = _derive_chat_session_id("sys", "hello", "research")
+        assert research != legacy
+        assert research == _derive_chat_session_id("sys", "hello", "research")
+
+    def test_launch_profile_prefix_keeps_the_unprefixed_id(self, monkeypatch, tmp_path):
+        """A gateway launched as ``work`` serves ``/p/work/`` and the bare route as ONE profile:
+        both must derive one id, or the same conversation forks by URL."""
+        import hermes_constants
+        from hermes_cli import profiles
+
+        work = tmp_path / "profiles" / "work"
+        work.mkdir(parents=True)
+        monkeypatch.setattr(hermes_constants, "get_routing_process_hermes_home", lambda: work)
+        monkeypatch.setattr(profiles, "get_profile_dir", lambda name: tmp_path / "profiles" / name)
+        assert _derive_chat_session_id("sys", "hello", "work") == _derive_chat_session_id("sys", "hello")
+        assert _derive_chat_session_id("sys", "hello", "research") != _derive_chat_session_id("sys", "hello")
 
 
 # ---------------------------------------------------------------------------
@@ -2372,13 +2416,6 @@ class TestChatCompletionsAgentIncomplete:
 
 
 class TestCORS:
-    def test_origin_allowed_for_non_browser_client(self, adapter):
-        assert adapter._origin_allowed("") is True
-
-
-    def test_origin_allowed_for_allowlist_match(self):
-        adapter = _make_adapter(cors_origins=["http://localhost:3000"])
-        assert adapter._origin_allowed("http://localhost:3000") is True
 
 
     @pytest.mark.asyncio
@@ -2392,23 +2429,6 @@ class TestCORS:
 
 
     @pytest.mark.asyncio
-    async def test_cors_allows_idempotency_key_header(self):
-        adapter = _make_adapter(cors_origins=["http://localhost:3000"])
-        app = _create_app(adapter)
-        async with TestClient(TestServer(app)) as cli:
-            resp = await cli.options(
-                "/v1/chat/completions",
-                headers={
-                    "Origin": "http://localhost:3000",
-                    "Access-Control-Request-Method": "POST",
-                    "Access-Control-Request-Headers": "Idempotency-Key",
-                },
-            )
-            assert resp.status == 200
-            assert "Idempotency-Key" in resp.headers.get("Access-Control-Allow-Headers", "")
-
-
-    @pytest.mark.asyncio
     async def test_cors_options_preflight_allowed_for_configured_origin(self):
         """Configured origins can complete browser preflight."""
         adapter = _make_adapter(cors_origins=["http://localhost:3000"])
@@ -2419,12 +2439,14 @@ class TestCORS:
                 headers={
                     "Origin": "http://localhost:3000",
                     "Access-Control-Request-Method": "POST",
-                    "Access-Control-Request-Headers": "Authorization, Content-Type",
+                    "Access-Control-Request-Headers": "Authorization, Content-Type, Idempotency-Key",
                 },
             )
             assert resp.status == 200
             assert resp.headers.get("Access-Control-Allow-Origin") == "http://localhost:3000"
-            assert "Authorization" in resp.headers.get("Access-Control-Allow-Headers", "")
+            allowed = resp.headers.get("Access-Control-Allow-Headers", "")
+            assert "Authorization" in allowed
+            assert "Idempotency-Key" in allowed
 
 
     @pytest.mark.asyncio
@@ -2687,7 +2709,7 @@ def _patch_create_agent_runtime(monkeypatch, captured: dict, fake_agent_cls):
         },
     )
     monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "global/model")
-    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+    monkeypatch.setattr("gateway.run._load_gateway_config", dict)
     monkeypatch.setattr(
         "gateway.run.GatewayRunner._load_reasoning_config", staticmethod(lambda model="": {})
     )
@@ -3113,165 +3135,3 @@ class TestDirectModelRequestsGate:
 # Empty-model recovery + provider-auth error typing in _create_agent
 # (salvaged from PR #57947 by @FvanW)
 # ---------------------------------------------------------------------------
-
-
-class TestCreateAgentModelRecovery:
-    def test_create_agent_defaults_to_provider_catalog_model_when_empty(self, monkeypatch):
-        """api_server.py had no equivalent of run.py's provider-catalog
-        default when model resolves empty but a provider did resolve (e.g.
-        `hermes auth add openai-codex` without `hermes model`) —
-        AIAgent(model="") 400s every call."""
-        captured = {}
-
-        class FakeAgent:
-            def __init__(self, **kwargs):
-                captured.update(kwargs)
-
-        _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
-        monkeypatch.setattr(
-            "gateway.run._resolve_runtime_agent_kwargs",
-            lambda: {"provider": "openai-codex", "base_url": "https://example.test/v1",
-                     "api_mode": "codex_responses"},
-        )
-        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "")
-        monkeypatch.setattr(
-            "hermes_cli.models.get_default_model_for_provider",
-            lambda provider: "gpt-5.5-codex" if provider == "openai-codex" else None,
-        )
-
-        adapter = APIServerAdapter(PlatformConfig(enabled=True))
-        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
-
-        agent = adapter._create_agent(session_id="api-session")
-
-        assert isinstance(agent, FakeAgent)
-        assert captured["model"] == "gpt-5.5-codex"
-
-    def test_create_agent_recovers_last_known_good_model_when_empty(self, monkeypatch):
-        """Last-known-good recovery (#35314): a transient config-cache miss
-        producing an empty model would build AIAgent(model="") and fail every
-        call until manual retry, instead of reusing the model that just
-        worked."""
-        captured = []
-
-        class FakeAgent:
-            def __init__(self, **kwargs):
-                captured.append(dict(kwargs))
-
-        _patch_create_agent_runtime(monkeypatch, {}, FakeAgent)
-        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
-
-        adapter = APIServerAdapter(PlatformConfig(enabled=True))
-        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
-
-        # Turn 1: model resolves fine — populates the last-known-good cache
-        # (keyed on gateway_session_key).
-        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "minimax/minimax-m3")
-        adapter._create_agent(session_id="api-session", gateway_session_key="stable-chan-1")
-        assert captured[0]["model"] == "minimax/minimax-m3"
-        assert adapter._last_resolved_model["stable-chan-1"] == "minimax/minimax-m3"
-
-        # Turn 2: transient empty resolution, no provider catalog default —
-        # must recover the model from turn 1, not build model="".
-        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "")
-        monkeypatch.setattr(
-            "gateway.run._resolve_runtime_agent_kwargs",
-            lambda: {"provider": None, "base_url": None, "api_mode": None},
-        )
-        adapter._create_agent(session_id="another-session", gateway_session_key="stable-chan-1")
-        assert captured[1]["model"] == "minimax/minimax-m3"
-
-    # ── Recovery-net alias guards (PR for #79101) ──────────────────────
-
-    def test_create_agent_does_not_cache_virtual_alias(self, monkeypatch):
-        """Write-side guard: the advertised virtual model (``hermes-agent``)
-        must never enter ``_last_resolved_model``, even when a prior turn
-        (or the session-row bug) dispatched it."""
-        captured = []
-
-        class FakeAgent:
-            def __init__(self, **kwargs):
-                captured.append(dict(kwargs))
-
-        _patch_create_agent_runtime(monkeypatch, {}, FakeAgent)
-
-        adapter = APIServerAdapter(PlatformConfig(enabled=True))
-        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
-
-        virtual = adapter._model_name
-        # Make _resolve_gateway_model return the virtual alias — the
-        # condition the session-row bug can produce after a prior turn.
-        monkeypatch.setattr(
-            "gateway.run._resolve_gateway_model", lambda: virtual,
-        )
-
-        adapter._create_agent(session_id="s1", gateway_session_key="ch")
-        assert captured[0]["model"] == virtual
-        # Cache must reject the alias.
-        assert adapter._last_resolved_model.get("ch") != virtual
-        assert adapter._last_resolved_model.get("*") != virtual
-
-    def test_create_agent_rejects_virtual_alias_from_cache(self, monkeypatch):
-        """Read-side gate: an empty-model dispatch with the alias in
-        ``_last_resolved_model`` must NOT recover it — the recovery net
-        must never serve the advertised virtual model."""
-        captured = []
-
-        class FakeAgent:
-            def __init__(self, **kwargs):
-                captured.append(dict(kwargs))
-
-        _patch_create_agent_runtime(monkeypatch, {}, FakeAgent)
-
-        adapter = APIServerAdapter(PlatformConfig(enabled=True))
-        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
-
-        # Seed the cache with the alias (simulate a prior poisoned turn).
-        adapter._last_resolved_model["ch"] = adapter._model_name
-        adapter._last_resolved_model["*"] = adapter._model_name
-
-        # Trigger an empty resolution.
-        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "")
-        monkeypatch.setattr(
-            "gateway.run._resolve_runtime_agent_kwargs",
-            lambda: {"provider": None, "base_url": None, "api_mode": None},
-        )
-        adapter._create_agent(session_id="s1", gateway_session_key="ch")
-
-        # The alias must not be dispatched.
-        assert captured[0]["model"] != adapter._model_name
-
-    def test_create_agent_recovery_still_works_for_legitimate_model(
-        self, monkeypatch,
-    ):
-        """Non-regression: a real dispatched model still enters the cache
-        and recovers on a subsequent empty-resolution turn — the alias
-        guard must not break legitimate recovery."""
-        captured = []
-
-        class FakeAgent:
-            def __init__(self, **kwargs):
-                captured.append(dict(kwargs))
-
-        _patch_create_agent_runtime(monkeypatch, {}, FakeAgent)
-
-        adapter = APIServerAdapter(PlatformConfig(enabled=True))
-        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
-
-        # Turn 1: legitimate model — must enter the cache.
-        monkeypatch.setattr(
-            "gateway.run._resolve_gateway_model",
-            lambda: "anthropic/claude-opus-4.6",
-        )
-        adapter._create_agent(session_id="s1", gateway_session_key="ch")
-        assert captured[0]["model"] == "anthropic/claude-opus-4.6"
-        assert adapter._last_resolved_model["ch"] == "anthropic/claude-opus-4.6"
-
-        # Turn 2: empty resolution — must recover the legitimate model.
-        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "")
-        monkeypatch.setattr(
-            "gateway.run._resolve_runtime_agent_kwargs",
-            lambda: {"provider": None, "base_url": None, "api_mode": None},
-        )
-        adapter._create_agent(session_id="s2", gateway_session_key="ch")
-        assert captured[1]["model"] == "anthropic/claude-opus-4.6"

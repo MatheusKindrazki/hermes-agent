@@ -151,6 +151,7 @@ def test_hidden_lookup_requires_title_filter_e2e(peer_gateway):
 
 
 def test_peer_delivery_returns_same_durable_ack_without_second_inbound(peer_gateway, monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr("tools.bot_live_delivery.find_canonical_live_owner", lambda home: None)
     monkeypatch.setattr(peer_cmd, "_load_peers", lambda: {"spark": {"url": peer_gateway.url}})
     monkeypatch.setattr(peer_cmd, "_peer_secret", lambda name: API_KEY)
     envelope = {

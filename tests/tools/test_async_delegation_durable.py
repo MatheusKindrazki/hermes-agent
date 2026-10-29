@@ -100,7 +100,6 @@ class _RecordingExecutor:
 
     def submit(self, fn, *args, **kwargs):
         self._sink.append(fn)
-        return None
 
 
 @pytest.fixture

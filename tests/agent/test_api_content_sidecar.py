@@ -392,7 +392,7 @@ class _MockHandler(BaseHTTPRequestHandler):
     captured_requests: list = []
     response_queue: list = []
 
-    def do_POST(self):  # noqa: N802 (http.server API)
+    def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         req = json.loads(self.rfile.read(length).decode())
         type(self).captured_requests.append(req)
@@ -584,7 +584,7 @@ class TestWireInvariant:
         assert current["content"] == "second question\n\nPLUGIN-CTX"
 
     def test_metadata_only_preserves_compression_identity_after_reload(self, wire_env):
-        make_agent, handler, db, sid = wire_env
+        make_agent, _handler, db, sid = wire_env
         agent = make_agent()
         agent.run_conversation("hello", conversation_history=[], task_id="metadata-only",
                                persist_user_display_metadata={"source": "native"})
@@ -592,7 +592,7 @@ class TestWireInvariant:
         reloaded = db.get_messages_as_conversation(sid)[0]
         assert reloaded["display_metadata"]["source"] == "native"
         assert reloaded["display_metadata"]["_compression_turn_id"] == durable_id
-        from agent.conversation_compression import ensure_compression_turn_identity
+        from agent.conversation_compression_spool import (ensure_compression_turn_identity)
         assert ensure_compression_turn_identity(reloaded) == durable_id
 
     def test_multimodal_turn_sends_persists_and_replays_context_part(self, wire_env):
@@ -667,7 +667,7 @@ class TestPrologueMoaAndInPlaceBackfill:
             get_active_compression_failure_cooldown=lambda: None,
         )
 
-        def _compress(messages, _system, approx_tokens=None, task_id=None):
+        def _compress(messages, _system, approx_tokens=None, task_id=None, trigger=None):
             # Emulate compress_context in in_place mode: archive_and_compact
             # already inserted these rows (api_content=NULL — the stamp has
             # not happened yet), fresh copies replace the live dicts.
@@ -859,7 +859,7 @@ class TestFlushSanitizeDivergenceCapture:
         """get_messages_as_conversation strips <memory-context> fences on
         load; the sent bytes must survive in the sidecar so a reloaded
         session replays what was actually on the wire."""
-        from agent.memory_manager import sanitize_context
+        from agent.memory_context import sanitize_context
 
         db = SessionDB(db_path=tmp_path / "state.db")
         sid = "sess-fence"

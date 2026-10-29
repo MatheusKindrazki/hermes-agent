@@ -108,7 +108,7 @@ def test_effect_origin_explicit_executor_scope_resets_on_failure(monkeypatch):
     def body():
         assert da.current_effect_origin() is origin
         raise RuntimeError("turn failed")
-    monkeypatch.setattr(runner, "_run_sync_inner", body)
+    monkeypatch.setattr(runner, "_run_sync_with_policy", body)
     async def exercise():
         gateway = GatewayRunner.__new__(GatewayRunner)
         with pytest.raises(RuntimeError, match="turn failed"):

@@ -191,6 +191,16 @@ export function resolveActiveContext({
     return result
   }
 
+  return validateContextCorrelation(result, observed, activeRuntimeSessionId)
+}
+
+/** Correlation checks run only after route ownership has been resolved. */
+function validateContextCorrelation(
+  result: ActiveContext,
+  observed: ActiveContextCorrelation | null,
+  activeRuntimeSessionId: string | null | undefined
+): ActiveContext {
+  const storedSessionId = result.storedSessionId
   const reasons: string[] = []
   const observedConnection = trimmed(observed?.connectionId)
   const observedProfile = trimmed(observed?.profile)
@@ -202,11 +212,11 @@ export function resolveActiveContext({
     reasons.push('correlation_missing')
   }
 
-  if (!base.connectionId || observedConnection !== base.connectionId) {
+  if (!result.connectionId || observedConnection !== result.connectionId) {
     reasons.push('connection_mismatch')
   }
 
-  if (!base.profile || observedProfile !== base.profile) {
+  if (!result.profile || observedProfile !== result.profile) {
     reasons.push('profile_mismatch')
   }
 
@@ -244,19 +254,12 @@ export function activeContextCanSubmit(context: ActiveContext, identityV2: boole
 
 /** Whether two contexts name the same destination (for change detection). */
 export function sameActiveContext(a: ActiveContext, b: ActiveContext): boolean {
-  return (
-    a.connectionId === b.connectionId &&
-    a.profile === b.profile &&
-    a.source === b.source &&
-    a.storedSessionId === b.storedSessionId &&
-    (a.tenant ?? null) === (b.tenant ?? null) &&
-    (a.machine ?? null) === (b.machine ?? null) &&
-    (a.gatewayGeneration ?? null) === (b.gatewayGeneration ?? null) &&
-    (a.runtimeSessionId ?? null) === (b.runtimeSessionId ?? null) &&
-    (a.xirpSessionId ?? null) === (b.xirpSessionId ?? null) &&
-    (a.workId ?? null) === (b.workId ?? null) &&
+  const exactKeys = ['connectionId', 'profile', 'source', 'storedSessionId'] as const
+  const optionalKeys = ['tenant', 'machine', 'gatewayGeneration', 'runtimeSessionId', 'xirpSessionId', 'workId'] as const
+
+  return exactKeys.every(key => a[key] === b[key]) &&
+    optionalKeys.every(key => (a[key] ?? null) === (b[key] ?? null)) &&
     (a.reasonCodes ?? []).join('\0') === (b.reasonCodes ?? []).join('\0')
-  )
 }
 
 /**

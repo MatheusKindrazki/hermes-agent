@@ -1,3 +1,4 @@
+import { $interfaceMode } from '@/store/interface-mode'
 /**
  * Bot Mode's pane layout contract, asserted by running the real `register()`
  * against a recording plugin context:
@@ -342,4 +343,21 @@ describe('a desktop without host.paneVisibility', () => {
     harness.dispose()
     host.paneVisibility = restore
   })
+})
+
+it('does not add the schedules rail when a bot is opened in Simple mode', async () => {
+  const previous = $interfaceMode.get()
+  $interfaceMode.set('simple')
+  const store = paneStores()
+  const harness = recordingContext()
+  try {
+    mocks.botChatOwnsWorkspace.mockReturnValue(true)
+    plugin.register(harness.ctx)
+    await settle()
+    store('hermes-bots:pane').set(true)
+    expect(harness.find('routines')).toBeUndefined()
+  } finally {
+    harness.dispose()
+    $interfaceMode.set(previous)
+  }
 })

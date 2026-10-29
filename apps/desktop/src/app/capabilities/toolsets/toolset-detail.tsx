@@ -72,12 +72,20 @@ export function ToolsetDetail({
           </div>
         </div>
       )}
-      {toolset.name === 'computer_use' && <ComputerUsePanel onConfiguredChange={onConfiguredChange} />}
+      {toolset.name === 'computer_use' && (
+        <ComputerUsePanel onConfiguredChange={onConfiguredChange} profile={profile} />
+      )}
       {/* Real-profile consent toggle ABOVE the backend/provider matrix — the
           config option users kept missing because its only GUI home was the
           generic Settings → Config editor. */}
       {toolset.name === 'browser' && <BrowserRealProfilePanel profile={profile} />}
-      {toolset.name === 'terminal' && <TerminalBackendPanel onConfiguredChange={onConfiguredChange} />}
+      {toolset.name === 'terminal' && (
+        <TerminalBackendPanel
+          key={profileScopeKey(profile)}
+          onConfiguredChange={onConfiguredChange}
+          profile={profile}
+        />
+      )}
       <ToolsetConfigPanel
         key={`${toolset.name}:${profileScopeKey(profile)}`}
         onConfiguredChange={onConfiguredChange}

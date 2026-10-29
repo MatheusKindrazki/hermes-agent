@@ -1,3 +1,5 @@
+
+from hermes_cli import kanban_worker_command
 """A kanban worker spawned for profile B must not inherit the DISPATCHER's credentials.
 
 ``_default_spawn`` gated the credential scrub on ``is_multiplex_active()``, so on a single-profile
@@ -7,6 +9,9 @@ The authority test is "does this worker act for a ROUTED home", exactly as ``ser
 decides it. The secret scope bound around the env build is what supplies B's OWN values for the
 dispatcher's declared ``terminal.env_passthrough`` names.
 """
+import os
+from pathlib import Path
+
 import pytest
 
 from hermes_cli import kanban_db_dispatch
@@ -34,7 +39,7 @@ def profile_b(tmp_path, monkeypatch):
 
 def test_worker_profile_scope_installs_the_assigned_profiles_terminal_policy(profile_b):
     """The toolset-resolution seam (``bind_home=True``) reads config under B's own policy."""
-    with kanban_db_dispatch._worker_profile_scope(str(profile_b)):
+    with kanban_worker_command._worker_profile_scope(str(profile_b)):
         scope = get_terminal_scope() or {}
     assert scope.get("TERMINAL_ENV") == "docker"
     assert scope.get("TERMINAL_DOCKER_IMAGE") == "b-image", (
@@ -101,3 +106,13 @@ def test_launch_profiles_own_worker_keeps_its_credentials(tmp_path, monkeypatch)
         kanban_db_dispatch._default_spawn(task, str(tmp_path / "ws"))
 
     assert captured and captured[0].get("OPENAI_API_KEY") == "dispatcher-launch-key"
+
+
+def test_worker_for_another_profile_can_still_import_hermes(profile_b, tmp_path, monkeypatch):
+    """The routed-profile scrub strips Hermes-owned PYTHONPATH entries, but the worker IS Hermes
+    (`-m hermes_cli.kanban_worker_client`): a PYTHONPATH-launched dispatcher must hand it a tree
+    it can import, or it dies on `No module named 'hermes_cli'` before reaching the owner."""
+    repo_root = Path(kanban_db_dispatch.__file__).resolve().parent.parent
+    monkeypatch.setenv("PYTHONPATH", str(repo_root))
+    env = _spawn_env_for_profile_b(monkeypatch, tmp_path)
+    assert str(repo_root) in env.get("PYTHONPATH", "").split(os.pathsep)

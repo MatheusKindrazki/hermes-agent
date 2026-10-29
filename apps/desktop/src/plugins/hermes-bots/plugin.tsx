@@ -15,6 +15,8 @@
  * bot-initiated sends use `hermes -p <bot> chat --in ~ -c "Bot Chat"`.
  */
 
+import { $interfaceMode } from '@/store/interface-mode'
+
 import {
   CHAT_EMPTY_AREA,
   COMPOSER_AREAS,
@@ -175,7 +177,7 @@ export default {
 
           for (const profile of offered) {
             const handle = botHandle(profile.name, profile)
-            const display = displayName(profile, $botMeta.get()[profile.name])
+            const display = displayName(profile, botRosterMeta(profile, $botMeta.get()))
             // Renamed bots complete on their friendly name — the tag is the
             // renamed slug when one exists, the profile handle otherwise.
             const tag = botMentionTag(profile)
@@ -545,6 +547,12 @@ export default {
       let restoreDismissedOnRegister = true
 
       const syncRoutinesPane = () => {
+        // Simple mode keeps schedules reachable via navigation, without an automatic rail.
+        if ($interfaceMode.get() === 'simple') {
+          unregisterRoutines?.()
+          unregisterRoutines = null
+          return
+        }
         if (botChatOwnsWorkspace()) {
           if (!unregisterRoutines) {
             unregisterRoutines = registerRoutinesPane(restoreDismissedOnRegister)
@@ -609,6 +617,7 @@ export default {
         syncRoutinesPane()
       })
 
+      const stopModeSync = $interfaceMode.listen(() => setTimeout(syncRoutinesPane, 0))
       const stopGroupSync = $groupChatWorkspace.listen(syncRoutinesPane)
 
       // React on the NEXT tick — a layout notification arrives mid-mutation,
@@ -714,6 +723,7 @@ export default {
         ctx.onDispose(() => {
           stopSidebarSync()
           stopGroupSync()
+          stopModeSync()
           stopFocusSync?.()
           stopReclaimSync?.()
         })

@@ -61,7 +61,9 @@ B-prime assumptions carried from K7
 """
 
 from __future__ import annotations
+from agent.durable_input_text import _turn_text
 
+from hermes_cli.operational_settings import operational_setting
 import contextvars
 import hashlib
 import hmac
@@ -81,6 +83,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
+
+from agent.durable_observation import ObservationWriter
 
 logger = logging.getLogger(__name__)
 
@@ -192,211 +196,6 @@ def effect_origin_scope(origin: Optional[EffectOrigin]):
         _EFFECT_ORIGIN.reset(token)
 
 
-def _observation_uid() -> int:
-    """Ownership has no fallback when the host cannot establish its UID."""
-    getter = getattr(os, "getuid", None)
-    if not callable(getter):
-        raise OSError("observation ownership unavailable")
-    try:
-        uid = getter()
-    except Exception as exc:
-        raise OSError("observation ownership unavailable") from exc
-    if type(uid) is not int or uid < 0:
-        raise OSError("observation ownership invalid")
-    return uid
-
-
-class ObservationWriter:
-    """Owner-only local CAS. Effect sequence never changes during settlement.
-
-    A write failure latches this boot broken. A missing disk cannot be made
-    observable by writing to it: the last checkpoint expires within 120s.
-    """
-
-    def __init__(self, root: Path, *, code_sha: str, boot_id: Optional[str] = None, profile: str = "default"):
-        if profile != "default" or not root.is_absolute() or not re.fullmatch(r"[0-9a-f]{40}", code_sha):
-            raise ValueError("observation configuration invalid")
-        self.profile = profile
-        self.root = root
-        self.code_sha = code_sha
-        self.boot_id = boot_id or str(uuid.uuid4())
-        self.broken = False
-        self.stopped = False
-        self._mutex = threading.RLock()
-        self._channel_fd = None
-
-    def _claim_channel(self):
-        """One live process/class owns a checkpoint stream until stopped."""
-        import fcntl
-
-        if self._channel_fd is not None:
-            return
-        fd = os.open(self.root / ".observation-channel-owner", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-        try:
-            info = os.fstat(fd)
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != _observation_uid()
-                    or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600):
-                raise OSError("observation owner unsafe")
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self._channel_fd = fd
-        except BaseException:
-            os.close(fd)
-            raise
-
-    def __del__(self):
-        if getattr(self, "_channel_fd", None) is not None:
-            os.close(self._channel_fd)
-            self._channel_fd = None
-
-    @contextmanager
-    def _locked(self):
-        with self._mutex:
-            try:
-                uid = _observation_uid()
-                import fcntl
-
-                for directory in (self.root, self.root / "observation-effects"):
-                    if directory.is_symlink():
-                        raise OSError("observation directory symlink")
-                    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-                    info = directory.stat()
-                    if info.st_uid != uid or stat.S_IMODE(info.st_mode) != 0o700:
-                        raise OSError("observation directory permissions")
-                fd = os.open(self.root / ".observation.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-                try:
-                    info = os.fstat(fd)
-                    if (not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_nlink != 1
-                            or stat.S_IMODE(info.st_mode) != 0o600):
-                        raise OSError("observation lock unsafe")
-                    deadline = time.monotonic() + 0.25
-                    while True:
-                        try:
-                            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                            break
-                        except BlockingIOError:
-                            if time.monotonic() >= deadline:
-                                raise TimeoutError("observation lock busy")
-                            time.sleep(0.005)
-                    yield
-                finally:
-                    os.close(fd)
-            except OSError:
-                self.broken = True
-                raise
-
-    def _read(self, path: Path) -> Optional[dict]:
-        try:
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-        except FileNotFoundError:
-            return None
-        with os.fdopen(fd, encoding="utf-8-sig") as stream:
-            info = os.fstat(stream.fileno())
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != _observation_uid() or stat.S_IMODE(info.st_mode) != 0o600
-                    or info.st_nlink != 1 or info.st_size > 65536):
-                raise OSError("observation file unsafe")
-            document = json.load(stream)
-        if not isinstance(document, dict):
-            raise ValueError("observation file invalid")
-        return document
-
-    def _write(self, path: Path, document: dict):
-        fd, temporary = tempfile.mkstemp(prefix=".observation-", dir=path.parent)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                json.dump(document, stream, sort_keys=True, separators=(",", ":"))
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, path)
-            directory_fd = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-        finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
-
-    def checkpoint(self, *, now: Optional[int] = None, stopped: bool = False):
-        now = int(time.time()) if now is None else now
-        self.stopped = self.stopped or stopped
-        with self._locked():
-            self._claim_channel()
-            previous = self._read(self.root / "observation-channel.json") or {}
-            records = [self._read(path) for path in (self.root / "observation-effects").glob("*.json")]
-            last = max((r["sequence"] for r in records if r and r["boot_id"] == self.boot_id), default=0)
-            self._write(self.root / "observation-channel.json", {
-                "schema": "hermes.kernel-observation-channel/v1", "profile": self.profile, "machine": "mini",
-                "code_sha": self.code_sha, "pid": os.getpid(), "boot_id": self.boot_id,
-                "sequence": previous.get("sequence", 0) + 1,
-                "state": "broken" if self.broken else "stopped" if self.stopped else "healthy" if previous.get("boot_id") == self.boot_id else "starting",
-                "checked_at": now, "valid_until": now + 120, "last_effect_sequence": last,
-            })
-            if self.stopped:
-                os.close(self._channel_fd)
-                self._channel_fd = None
-
-    def reserve(self, origin: EffectOrigin, destination: str, content: str, *, now: Optional[int] = None, include_created=False):
-        with effect_origin_scope(origin):
-            effect_id = hashlib.sha256(json.dumps([
-                "hermes-effect.v1", origin.session_id, origin.event_id, origin.tenant,
-                origin.profile, origin.machine, destination, content_sha256(content),
-            ], separators=(",", ":")).encode()).hexdigest()
-        now = int(time.time()) if now is None else now
-        with self._locked():
-            path = self.root / "observation-effects" / (effect_id + ".json")
-            existing = self._read(path)
-            if existing is not None:
-                return (existing, False) if include_created else existing
-            if self.broken or self.stopped:
-                raise OSError("observation boot not healthy")
-            records = [self._read(p) for p in path.parent.glob("*.json")]
-            sequence = max((r["sequence"] for r in records if r and r["boot_id"] == self.boot_id), default=0) + 1
-            record = {"schema": "hermes.kernel-effect-observation/v1", "effect_id": effect_id,
-                      "profile": origin.profile, "machine": origin.machine, "boot_id": self.boot_id,
-                      "sequence": sequence, "state": "reserved", "reserved_at": now, "updated_at": now,
-                      "origin_session_id": origin.session_id, "settlement": None, "gap_reason": None}
-            self._write(path, record)
-            return (record, True) if include_created else record
-
-    def transition(self, effect_id: str, state: str, *, settlement=None, gap_reason=None, now: Optional[int] = None):
-        if not re.fullmatch(r"[0-9a-f]{64}", effect_id) or state not in {"settled", "gap"}:
-            raise ValueError("invalid observation transition")
-        with self._locked():
-            path = self.root / "observation-effects" / (effect_id + ".json")
-            record = self._read(path)
-            if record is None:
-                raise ValueError("observation reservation missing")
-            if record["state"] != "reserved":
-                if (record["state"], record["settlement"], record["gap_reason"]) == (state, settlement, gap_reason):
-                    return record
-                raise ValueError("observation terminal transition")
-            if state == "gap" and (settlement is not None or gap_reason not in {
-                "admission_failed", "delivery_ambiguous", "delivery_failed", "ack_missing", "ledger_failed",
-                "spool_failed", "release_ambiguous", "release_failed", "identity_missing", "storage_failed",
-            }):
-                raise ValueError("invalid observation gap")
-            if state == "settled" and (not isinstance(settlement, dict) or gap_reason is not None):
-                raise ValueError("invalid observation settlement")
-            if state == "settled":
-                fields = {"work_id", "attempt_id", "generation", "delivery_id", "delivery_event_id", "ack_sha256",
-                          "ledger_sha256", "spool_sha256", "release_event_id", "release_source_event_id", "release_receipt_sha256"}
-                if (set(settlement) != fields or type(settlement["generation"]) is not int
-                        or not 1 <= settlement["generation"] <= 9007199254740991
-                        or any(not isinstance(settlement[k], str) or not _UUID7_RE.fullmatch(settlement[k])
-                               for k in ("work_id", "attempt_id", "release_event_id"))
-                        or any(not isinstance(settlement[k], str) or not re.fullmatch(r"[0-9a-f]{64}", settlement[k])
-                               for k in ("ack_sha256", "ledger_sha256", "spool_sha256", "release_receipt_sha256"))
-                        or any(not isinstance(settlement[k], str) or not re.fullmatch(r"[A-Za-z0-9._:@/-]{1,200}", settlement[k])
-                               for k in ("delivery_id", "delivery_event_id"))
-                        or not isinstance(settlement["release_source_event_id"], str)
-                        or not re.fullmatch(r"kernel-effect-[0-9a-f]{64}:release-[1-9][0-9]{0,15}", settlement["release_source_event_id"])):
-                    raise ValueError("invalid observation settlement")
-            updated = dict(record, state=state, settlement=settlement, gap_reason=gap_reason,
-                           updated_at=int(time.time()) if now is None else now)
-            self._write(path, updated)
-            return updated
-
-
 _OBSERVER: Optional[ObservationWriter] = None
 
 
@@ -421,7 +220,7 @@ def _start_observation_locked() -> Optional[ObservationWriter]:
         configured = (_settings().get("observation") or {}).get("code_sha")
         if code_sha != configured:
             raise ValueError("observation code pin mismatch")
-        root = Path(os.environ.get("HERMES_KERNEL_SHADOW_RECEIPT_DIR", ""))
+        root = Path(str(operational_setting("shadow_receipt_dir")))
         if _OBSERVER is not None:
             if _OBSERVER.root != root or _OBSERVER.code_sha != code_sha or _OBSERVER.profile != profile or _OBSERVER.stopped:
                 raise ValueError("observation owner cannot be rebound")
@@ -430,6 +229,7 @@ def _start_observation_locked() -> Optional[ObservationWriter]:
         candidate.checkpoint()
         _OBSERVER = candidate
     except Exception:
+        logging.getLogger(__name__).debug('_start_observation_locked: optional operation failed', exc_info=True)
         logger.error("observation startup unavailable; checkpoint must expire", exc_info=False)
         if _OBSERVER is not None:
             _OBSERVER.broken = True
@@ -443,12 +243,12 @@ def start_observation_heartbeat():
         writer = start_observation()
         if writer is None or writer.broken or _OBSERVER_HEARTBEAT is not None:
             return writer
-        context = contextvars.copy_context()
+        from agent.memory_provider import spawn_context_thread
         def heartbeat():
             while not _OBSERVER_STOP.wait(30):
                 observation_checkpoint()
-        _OBSERVER_HEARTBEAT = threading.Thread(
-            target=lambda: context.run(heartbeat), daemon=True, name="kernel-observation",
+        _OBSERVER_HEARTBEAT = spawn_context_thread(
+            target=heartbeat, daemon=True, name="kernel-observation",
         )
         _OBSERVER_HEARTBEAT.start()
         return writer
@@ -501,6 +301,7 @@ def bind_native_prompt_source(session_id: str, source_event_id: str, text: str) 
                 writer._write(path, document)
         return True
     except Exception:
+        logging.getLogger(__name__).debug('bind_native_prompt_source: optional operation failed', exc_info=True)
         observation_gap(None, "native_source_conflict_or_storage_failed")
         return False
 
@@ -510,6 +311,7 @@ def observation_checkpoint(*, stopped=False):
         try:
             _OBSERVER.checkpoint(stopped=stopped)
         except Exception:
+            logging.getLogger(__name__).debug('observation_checkpoint: optional operation failed', exc_info=True)
             _OBSERVER.broken = True
             logger.error("observation storage unavailable; checkpoint must expire", exc_info=False)
 
@@ -529,6 +331,7 @@ def observation_gap(observation: Optional[dict], reason: str):
                 return  # Preserve the first terminal observation; never rewrite it.
         writer.transition(observation["effect"]["effect_id"], "gap", gap_reason=reason)
     except Exception:
+        logging.getLogger(__name__).debug('observation_gap: optional operation failed', exc_info=True)
         if _OBSERVER is not None:
             _OBSERVER.broken = True
             observation_checkpoint()
@@ -547,6 +350,7 @@ def reserve_observed_effect(destination: str, content: str):
         effect, created = _OBSERVER.reserve(origin, destination, content, include_created=True)
         return {"root": str(_OBSERVER.root), "code_sha": _OBSERVER.code_sha, "effect": effect, "created": created}
     except Exception:
+        logging.getLogger(__name__).debug('reserve_observed_effect: optional operation failed', exc_info=True)
         observation_gap(None, "storage_failed")
         return None
 
@@ -585,7 +389,7 @@ def release_observed_effect(identity: Mapping[str, Any], release_event_id: str) 
         "--jarvis-base-url", base_url, "--secret-ref", secret_ref],
         input=_canonical({"turn_identity": identity, "release_event_id": release_event_id}),
         capture_output=True, text=True, timeout=TIMEOUT_SECONDS, cwd=roots.root_dir,
-        env=_child_env(settings), shell=False)
+        env=_child_env(settings), shell=False, check=False)
     if result.returncode != EXIT_OK:
         raise TurnIdentityError("release_unavailable")
     receipt = json.loads(result.stdout or "")
@@ -718,7 +522,7 @@ EXTERNAL_WORK_DISPATCHER = "hermes-work-control"
 
 
 class _State(threading.local):
-    outcome: Optional["AdmissionOutcome"] = None
+    outcome: Optional[AdmissionOutcome] = None
 
 
 _state = _State()
@@ -737,17 +541,17 @@ _state = _State()
 #
 # The ContextVar below carries only the BOX, so paths that never touch the
 # executor still find it; the one-shot guarantee lives in the box itself.
-_PRE_ADMISSION: contextvars.ContextVar[Optional["PreAdmission"]] = (
+_PRE_ADMISSION: contextvars.ContextVar[Optional[PreAdmission]] = (
     contextvars.ContextVar("hermes_k8_pre_admission", default=None)
 )
 # The admitted execution the current call tree runs inside. A nested/sync
 # delegation inherits it instead of opening a second Work for one execution.
-_EXECUTION: contextvars.ContextVar[Optional["WorkReceipt"]] = contextvars.ContextVar(
+_EXECUTION: contextvars.ContextVar[Optional[WorkReceipt]] = contextvars.ContextVar(
     "hermes_k8_execution", default=None
 )
 # The admitted turn this call tree runs inside. A read-only sync subtask
 # inherits it; it is not a Work, and it authorises nothing detached.
-_ADMITTED_TURN: contextvars.ContextVar[Optional["AdmissionOutcome"]] = (
+_ADMITTED_TURN: contextvars.ContextVar[Optional[AdmissionOutcome]] = (
     contextvars.ContextVar("hermes_k8_admitted_turn", default=None)
 )
 
@@ -776,7 +580,7 @@ class WorkReceipt:
     authority_pin_matched: bool
     seal: str = field(repr=False)
 
-    def sealed_core(self) -> Dict[str, Any]:
+    def sealed_core(self) -> dict[str, Any]:
         return {
             "work_id": self.work_id,
             "idempotency_key": self.idempotency_key,
@@ -787,7 +591,7 @@ class WorkReceipt:
             "authority_pin_matched": self.authority_pin_matched,
         }
 
-    def as_dict(self) -> Dict[str, Any]:
+    def as_dict(self) -> dict[str, Any]:
         """Plain data for logs/persistence. Carries no seal, so it is inert."""
         return dict(self.sealed_core())
 
@@ -839,7 +643,7 @@ class ExecutionHandoff:
     retryable: bool = False
     authority_pin_matched: bool = False
 
-    def payload(self) -> Dict[str, Any]:
+    def payload(self) -> dict[str, Any]:
         """The stable, typed shape a tool returns. Never says 'dispatched'.
 
         ``authority_verification_required`` is always true: K8 compares the
@@ -888,8 +692,8 @@ class AdmissionOutcome:
     retryable: bool = False
     mode_off: bool = False
     admitted_at: int = 0
-    receipt: Optional[Dict[str, Any]] = field(default=None, repr=False)
-    turn_identity: Optional[Dict[str, Any]] = field(default=None, repr=False)
+    receipt: Optional[dict[str, Any]] = field(default=None, repr=False)
+    turn_identity: Optional[dict[str, Any]] = field(default=None, repr=False)
     turn_identity_seal: Optional[str] = field(default=None, repr=False)
 
     @property
@@ -950,15 +754,15 @@ class PreAdmission:
     taker and the invalidator genuinely run on different threads.
     """
 
-    __slots__ = ("_outcome", "_lock", "_taken", "_invalidated")
+    __slots__ = ("_invalidated", "_lock", "_outcome", "_taken")
 
-    def __init__(self, outcome: "AdmissionOutcome") -> None:
+    def __init__(self, outcome: AdmissionOutcome) -> None:
         self._outcome = outcome
         self._lock = threading.Lock()
         self._taken = False
         self._invalidated = False
 
-    def take(self) -> Optional["AdmissionOutcome"]:
+    def take(self) -> Optional[AdmissionOutcome]:
         """Return the outcome exactly once, ever."""
         with self._lock:
             if self._taken or self._invalidated:
@@ -966,7 +770,7 @@ class PreAdmission:
             self._taken = True
             return self._outcome
 
-    def peek(self) -> Optional["AdmissionOutcome"]:
+    def peek(self) -> Optional[AdmissionOutcome]:
         """Read without spending. For lifecycle decisions, never for release."""
         with self._lock:
             return None if (self._taken or self._invalidated) else self._outcome
@@ -1045,7 +849,7 @@ _TURN_IDENTITY_FIELDS = frozenset({
 })
 
 
-def _validate_turn_identity(document: Any) -> Dict[str, Any]:
+def _validate_turn_identity(document: Any) -> dict[str, Any]:
     if not isinstance(document, Mapping) or set(document) != _TURN_IDENTITY_FIELDS:
         raise TurnIdentityError("turn_identity_fields_invalid")
     identity = dict(document)
@@ -1113,9 +917,8 @@ def resolve_mode(environ: Optional[Mapping[str, str]] = None) -> bool:
     if mode in _OFF_MODES or mode == "observe":
         return False
     raise ModeError(
-        "%s=%r is not a recognised mode (expected one of %s, or one of %s to "
+        f"{ENV_MODE}={mode!r} is not a recognised mode (expected one of {sorted(_ARMING_MODES)}, or one of {sorted(m for m in _OFF_MODES if m)} to "
         "disable); refusing rather than guessing which the operator meant"
-        % (ENV_MODE, mode, sorted(_ARMING_MODES), sorted(m for m in _OFF_MODES if m))
     )
 
 
@@ -1153,7 +956,7 @@ def _remember(outcome: AdmissionOutcome) -> AdmissionOutcome:
 # --------------------------------------------------------------------------- #
 
 
-def publish_pre_admission(outcome: AdmissionOutcome) -> "PreAdmission":
+def publish_pre_admission(outcome: AdmissionOutcome) -> PreAdmission:
     """Publish the gateway's verified admission and return its one-shot carrier.
 
     The caller OWNS the returned carrier: it transports it explicitly to the one
@@ -1171,7 +974,7 @@ def publish_pre_admission(outcome: AdmissionOutcome) -> "PreAdmission":
     return carrier
 
 
-def current_pre_admission() -> Optional["PreAdmission"]:
+def current_pre_admission() -> Optional[PreAdmission]:
     """The carrier published on this context, spent or not."""
     return _PRE_ADMISSION.get()
 
@@ -1184,7 +987,7 @@ def clear_pre_admission() -> None:
     _PRE_ADMISSION.set(None)
 
 
-def consume_pre_admission(carrier: Optional["PreAdmission"] = None) -> Optional[AdmissionOutcome]:
+def consume_pre_admission(carrier: Optional[PreAdmission] = None) -> Optional[AdmissionOutcome]:
     """Take the pre-admission exactly once.
 
     ``carrier`` is the explicitly transported one — the only form that survives
@@ -1247,7 +1050,7 @@ def execution_scope(receipt: Optional[WorkReceipt]):
 # --------------------------------------------------------------------------- #
 
 
-def _settings() -> Dict[str, Any]:
+def _settings() -> dict[str, Any]:
     try:
         from hermes_cli.config import load_config_readonly
 
@@ -1287,7 +1090,7 @@ class _TrustRoots:
 
 class _TrustRootError(RuntimeError):
     def __init__(self, reason_code: str, detail: str) -> None:
-        super().__init__("%s: %s" % (reason_code, detail))
+        super().__init__(f"{reason_code}: {detail}")
         self.reason_code = reason_code
         self.detail = detail
 
@@ -1304,12 +1107,12 @@ def _resolve_trust_roots(environ: Optional[Mapping[str, str]] = None) -> _TrustR
     if not raw_bin or not bin_path.is_absolute():
         raise _TrustRootError(
             "admitter_bin_invalid",
-            "%s must be an absolute path, got %r" % (ENV_ADMITTER_BIN, raw_bin),
+            f"{ENV_ADMITTER_BIN} must be an absolute path, got {raw_bin!r}",
         )
     if not bin_path.is_file() or not os.access(bin_path, os.X_OK):
         raise _TrustRootError(
             "admitter_bin_invalid",
-            "%s is not an executable file: %s" % (ENV_ADMITTER_BIN, bin_path),
+            f"{ENV_ADMITTER_BIN} is not an executable file: {bin_path}",
         )
     actual_bin = _sha256_file(bin_path)
     fixture_legacy = (
@@ -1320,22 +1123,20 @@ def _resolve_trust_roots(environ: Optional[Mapping[str, str]] = None) -> _TrustR
         # says. Refuse before executing it, not after reading its answer.
         raise _TrustRootError(
             "admitter_hash_mismatch",
-            "%s hashes to %s; this consumer is pinned to %s"
-            % (bin_path, actual_bin, TURN_IDENTITY_ADMITTER_SHA256),
+            f"{bin_path} hashes to {actual_bin}; this consumer is pinned to {TURN_IDENTITY_ADMITTER_SHA256}",
         )
 
     declared = (env.get(ENV_SCHEMA_SHA256) or "").strip().lower()
     if not _SHA256_RE.match(declared):
         raise _TrustRootError(
-            "schema_pin_invalid", "%s must be 64 hex chars" % ENV_SCHEMA_SHA256
+            "schema_pin_invalid", f"{ENV_SCHEMA_SHA256} must be 64 hex chars"
         )
     if declared != SCHEMA_SHA256:
         # The environment may say WHERE the contract is; it may not say which
         # contract this consumer agreed to.
         raise _TrustRootError(
             "schema_pin_not_frozen",
-            "%s declares %s; this consumer is pinned to %s"
-            % (ENV_SCHEMA_SHA256, declared, SCHEMA_SHA256),
+            f"{ENV_SCHEMA_SHA256} declares {declared}; this consumer is pinned to {SCHEMA_SHA256}",
         )
 
     raw_schema = (env.get(ENV_SCHEMA_PATH) or "").strip()
@@ -1343,13 +1144,13 @@ def _resolve_trust_roots(environ: Optional[Mapping[str, str]] = None) -> _TrustR
     if not raw_schema or not schema_path.is_absolute() or not schema_path.is_file():
         raise _TrustRootError(
             "schema_path_invalid",
-            "%s must point at an existing absolute file" % ENV_SCHEMA_PATH,
+            f"{ENV_SCHEMA_PATH} must point at an existing absolute file",
         )
     actual_schema = _sha256_file(schema_path)
     if actual_schema != SCHEMA_SHA256:
         raise _TrustRootError(
             "schema_hash_mismatch",
-            "%s hashes to %s, pinned %s" % (schema_path, actual_schema, SCHEMA_SHA256),
+            f"{schema_path} hashes to {actual_schema}, pinned {SCHEMA_SHA256}",
         )
 
     root_dir = bin_path.resolve().parents[2]
@@ -1362,7 +1163,7 @@ def _resolve_trust_roots(environ: Optional[Mapping[str, str]] = None) -> _TrustR
             if actual != expected:
                 raise _TrustRootError(
                     "k7_bundle_hash_mismatch",
-                    "%s hashes to %s; pinned %s" % (relative, actual, expected),
+                    f"{relative} hashes to {actual}; pinned {expected}",
                 )
 
     return _TrustRoots(str(bin_path), str(schema_path), str(root_dir))
@@ -1373,7 +1174,7 @@ def _resolve_trust_roots(environ: Optional[Mapping[str, str]] = None) -> _TrustR
 # --------------------------------------------------------------------------- #
 
 
-def _authority_pin(settings: Mapping[str, Any]) -> Optional[Dict[str, str]]:
+def _authority_pin(settings: Mapping[str, Any]) -> Optional[dict[str, str]]:
     """The pinned remote authority, or None when nothing is pinned.
 
     Mirrors K7's ``AuthorityPin``: which authority (``root_id``), which key of
@@ -1467,6 +1268,7 @@ def _active_profile() -> str:
     try:
         home = get_hermes_home()
     except Exception:
+        logging.getLogger(__name__).debug('_active_profile: optional operation failed', exc_info=True)
         return "default"
     if home.parent.name == "profiles":
         candidate = home.name.strip().lower()
@@ -1488,7 +1290,7 @@ def build_envelope(
     event_kind: str,
     declares_execution: bool,
     observed_at: int = OBSERVED_AT_UNKNOWN,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Build one closed envelope, or refuse to build one at all.
 
     An identity that cannot be represented is a refusal, never a rewrite:
@@ -1500,19 +1302,18 @@ def build_envelope(
         raise _EnvelopeError("input.text is empty; there is nothing to admit")
     if len(text) > MAX_INPUT_CHARS:
         raise _EnvelopeError(
-            "input_too_large: %d chars exceeds the frozen envelope cap of %d"
-            % (len(text), MAX_INPUT_CHARS)
+            f"input_too_large: {len(text)} chars exceeds the frozen envelope cap of {MAX_INPUT_CHARS}"
         )
 
     sid = (session_id or "").strip()
     if not _SESSION_ID_RE.match(sid):
-        raise _EnvelopeError("origin.session_id %r is not representable" % sid)
+        raise _EnvelopeError(f"origin.session_id {sid!r} is not representable")
 
     resolved_event = (event_id or "").strip()
     if not _EVENT_ID_RE.match(resolved_event):
         # Armed, with no stable platform identity, the only honest answer is to
         # stop: a minted id would make a replay look like a second input.
-        raise _EnvelopeError("source_event.event_id %r is not a stable identity" % resolved_event)
+        raise _EnvelopeError(f"source_event.event_id {resolved_event!r} is not a stable identity")
 
     machine = _sanitize_machine(str(settings.get("machine") or "") or _platform.node() or "")
     if not machine:
@@ -1520,18 +1321,18 @@ def build_envelope(
 
     tenant = str(settings.get("tenant") or "default").strip().lower()
     if not _TENANT_RE.match(tenant):
-        raise _EnvelopeError("tenant %r is not representable" % tenant)
+        raise _EnvelopeError(f"tenant {tenant!r} is not representable")
 
     if not isinstance(observed_at, int) or isinstance(observed_at, bool) or observed_at < 0:
         raise _EnvelopeError(
-            "source_event.observed_at %r is not a non-negative integer" % (observed_at,)
+            f"source_event.observed_at {observed_at!r} is not a non-negative integer"
         )
 
     profile = _active_profile()
     digest = content_sha256(text)
-    request_key = "k8-%s" % _digest(sid, resolved_event, digest, seam)[:40]
+    request_key = f"k8-{_digest(sid, resolved_event, digest, seam)[:40]}"
     if not _REQUEST_KEY_RE.match(request_key):  # pragma: no cover - hex is in range
-        raise _EnvelopeError("binding.request_key %r is not representable" % request_key)
+        raise _EnvelopeError(f"binding.request_key {request_key!r} is not representable")
 
     return {
         "schema_version": ENVELOPE_SCHEMA_VERSION,
@@ -1565,8 +1366,8 @@ _ENV_PASSTHROUGH = (
 )
 
 
-def _child_env(settings: Mapping[str, Any]) -> Dict[str, str]:
-    env: Dict[str, str] = {}
+def _child_env(settings: Mapping[str, Any]) -> dict[str, str]:
+    env: dict[str, str] = {}
     for name in _ENV_PASSTHROUGH:
         value = os.environ.get(name)
         if value:
@@ -1611,7 +1412,7 @@ def _argv(roots: _TrustRoots, settings: Mapping[str, Any], seam: str, now: int) 
     return argv
 
 
-def _run_turn_identity_revalidation(identity: Mapping[str, Any]) -> Dict[str, Any]:
+def _run_turn_identity_revalidation(identity: Mapping[str, Any]) -> dict[str, Any]:
     """Ask the pinned K7 binary for a fresh exact-current fence."""
     roots = _resolve_trust_roots()
     settings = _settings()
@@ -1627,7 +1428,7 @@ def _run_turn_identity_revalidation(identity: Mapping[str, Any]) -> Dict[str, An
         completed = subprocess.run(
             argv, input=_canonical(dict(identity)), capture_output=True, text=True,
             timeout=TIMEOUT_SECONDS, cwd=roots.root_dir, env=_child_env(settings), shell=False,
-        )
+        check=False)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise TurnIdentityError("turn_identity_revalidation_unavailable") from exc
     if completed.returncode != EXIT_OK:
@@ -1653,7 +1454,7 @@ def _run_turn_identity_revalidation(identity: Mapping[str, Any]) -> Dict[str, An
     return dict(fence)
 
 
-def revalidate_current_turn_identity() -> tuple[Dict[str, Any], Dict[str, Any]]:
+def revalidate_current_turn_identity() -> tuple[dict[str, Any], dict[str, Any]]:
     """Return this turn's verified identity and a fresh remote fence, or stop."""
     outcome = current_admitted_turn()
     if outcome is None or outcome.state != STATE_ADMITTED:
@@ -1827,7 +1628,7 @@ def _run_admission(
     )
 
     try:
-        completed = subprocess.run(  # noqa: S603 - fixed argv list, shell=False
+        completed = subprocess.run(
             _argv(roots, settings, seam, now),
             input=json.dumps(envelope, ensure_ascii=False),
             capture_output=True,
@@ -1836,7 +1637,7 @@ def _run_admission(
             cwd=roots.root_dir,
             env=_child_env(settings),
             shell=False,
-        )
+        check=False)
     except subprocess.TimeoutExpired:
         logger.warning(
             "durable admission expired the %.1fs outer budget (ambiguous, "
@@ -1858,7 +1659,7 @@ def _run_admission(
         return _remember(
             _refuse(
                 "admitter_unreachable",
-                "%s: %s" % (type(exc).__name__, exc),
+                f"{type(exc).__name__}: {exc}",
                 retryable=True,
                 **common,
             )
@@ -2005,7 +1806,7 @@ def admit_execution(
 
 def execution_event_id(session_id: str, request: Mapping[str, Any]) -> str:
     """A stable identity for one execution request within one session."""
-    return "exec.%s" % _digest(session_id or "", _canonical(request))[:48]
+    return "exec.{}".format(_digest(session_id or "", _canonical(request))[:48])
 
 
 def platform_event_id(surface: str, raw_identity: Any) -> Optional[str]:
@@ -2019,7 +1820,7 @@ def platform_event_id(surface: str, raw_identity: Any) -> Optional[str]:
     if not token:
         return None
     reduced = re.sub(r"[^A-Za-z0-9._:-]", "-", token)[:96]
-    candidate = "evt.%s.%s" % (re.sub(r"[^a-z0-9]", "", (surface or "x").lower())[:16] or "x", reduced)
+    candidate = "evt.{}.{}".format(re.sub(r"[^a-z0-9]", "", (surface or "x").lower())[:16] or "x", reduced)
     return candidate if _EVENT_ID_RE.match(candidate) else None
 
 
@@ -2034,25 +1835,11 @@ def handoff_for(outcome: AdmissionOutcome, *, detail: str) -> ExecutionHandoff:
     )
 
 
-def _turn_text(user_message: Any) -> str:
-    """Flatten a provider-shaped message into the text that was actually said."""
-    if isinstance(user_message, str):
-        return user_message
-    if isinstance(user_message, list):
-        parts = [
-            str(block.get("text") or "")
-            for block in user_message
-            if isinstance(block, dict) and block.get("type") == "text"
-        ]
-        return "\n".join(part for part in parts if part)
-    if isinstance(user_message, dict):
-        return str(user_message.get("text") or user_message.get("content") or "")
-    return ""
 
 
 def blocked_turn_result(
     agent: Any, outcome: AdmissionOutcome, conversation_history: Any
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """The terminal turn result for a refused admission.
 
     ``failed`` stays False and ``retryable`` says whether asking again is legal,
@@ -2090,7 +1877,7 @@ def blocked_turn_result(
 
 def admit_turn_or_block(
     agent: Any, user_message: Any, *, conversation_history: Any = None
-) -> Optional[Dict[str, Any]]:
+) -> Optional[dict[str, Any]]:
     """The conversation seam. Returns None to proceed, or a terminal result.
 
     Placed after the MoA decode (so what is admitted is the text the user
@@ -2142,7 +1929,7 @@ def admit_turn_or_block(
     origin = current_effect_origin()
     event_id = (origin.event_id if origin is not None and origin.session_id == session_id
                 and origin.profile == _active_profile() else
-                "turn.%s" % _digest(session_id, content_sha256(text))[:48])
+                f"turn.{_digest(session_id, content_sha256(text))[:48]}")
     outcome = admit_input(
         session_id=session_id,
         request_text=text,
@@ -2158,7 +1945,7 @@ def admit_turn_or_block(
 # --------------------------------------------------------------------------- #
 # What K9 is handed
 # --------------------------------------------------------------------------- #
-EXPORTED_CONTRACT: Dict[str, Any] = {
+EXPORTED_CONTRACT: dict[str, Any] = {
     "package": "K8",
     "kernel_version": KERNEL_VERSION,
     "admission_schema_version": ADMISSION_SCHEMA_VERSION,
@@ -2167,7 +1954,7 @@ EXPORTED_CONTRACT: Dict[str, Any] = {
     "schema_sha256": SCHEMA_SHA256,
     "outer_timeout_seconds": TIMEOUT_SECONDS,
     "execution_admission_timeout_seconds": EXECUTION_ADMISSION_TIMEOUT_SECONDS,
-    "arming": "%s in %s" % (ENV_MODE, sorted(_ARMING_MODES)),
+    "arming": f"{ENV_MODE} in {sorted(_ARMING_MODES)}",
     "seams": {
         "gateway_ingress": "gateway.run.GatewayRunner._handle_message (before "
         "commands, interrupt/STT, compression and vision)",
@@ -2177,8 +1964,8 @@ EXPORTED_CONTRACT: Dict[str, Any] = {
         "before build_turn_context); consumes the gateway pre-admission once",
         "execution": "tools.delegate_tool.delegate_task",
     },
-    "long_execution": "handed off to %s; never dispatched into the session-bound "
-    "async registry" % EXTERNAL_WORK_DISPATCHER,
+    "long_execution": f"handed off to {EXTERNAL_WORK_DISPATCHER}; never dispatched into the session-bound "
+    "async registry",
     "observed_at": "0 is the explicit 'upstream observation time unknown' "
     "sentinel; the wall clock is NEVER used in the envelope. Recording time "
     "rides --now and is stored by K7 as the Signal's recorded_at.",

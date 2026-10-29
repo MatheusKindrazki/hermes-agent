@@ -69,6 +69,19 @@ export function shouldDisableComposerInput(disabled: boolean, gatewayState: Conn
 export const pickPlaceholder = (pool: readonly string[]) => pool[Math.floor(Math.random() * pool.length)]
 
 /**
+ * Width classes for the unstacked vs stacked composer editor.
+ *
+ * The inline (unstacked) editor lives in a CSS-grid `1fr` column — not a flex
+ * row — so `flex-1` never grows it. Pairing that with
+ * `--composer-input-inline-min-width` (8rem) pinned the field to the ~129pt
+ * sliver measured in #99728 while mid-run controls kept their intrinsic width.
+ * `w-full min-w-0` fills the grid track and lets the column shrink cleanly.
+ */
+export function composerInputWidthClass(stacked: boolean): string {
+  return stacked ? 'w-full' : 'w-full min-w-0'
+}
+
+/**
  * The composer has two different safety states: dispatch may be blocked while
  * the user's local draft remains editable. Keep this decision separate from
  * the submit engine's `disabled` flag so enabling focus can never enable a

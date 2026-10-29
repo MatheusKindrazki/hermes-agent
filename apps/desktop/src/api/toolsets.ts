@@ -7,7 +7,7 @@ import type {
   ToolsetModelsResponse
 } from '@/types/hermes'
 
-import { capabilityScoped, hermesApi, type ProfileScope, profileScoped } from './client'
+import { capabilityScoped, hermesApi, type ProfileScope } from './client'
 
 // The optional trailing `profile` on every capability fetcher below is the
 // Capabilities view's profile-scope override: it lets the Skills/Tools/MCP
@@ -109,32 +109,35 @@ export function runToolsetPostSetup(
   })
 }
 
-export function getTerminalBackends(): Promise<TerminalBackendsResponse> {
-  return hermesApi<TerminalBackendsResponse>({
-    ...profileScoped(),
+export function getTerminalBackends(profile?: ProfileScope): Promise<TerminalBackendsResponse> {
+  return window.hermesDesktop.api<TerminalBackendsResponse>({
+    ...capabilityScoped(profile),
     path: '/api/tools/terminal/backends'
   })
 }
 
-export function selectTerminalBackend(backend: string): Promise<{ ok: boolean; backend: string }> {
-  return hermesApi<{ ok: boolean; backend: string }>({
-    ...profileScoped(),
+export function selectTerminalBackend(
+  backend: string,
+  profile?: ProfileScope
+): Promise<{ ok: boolean; backend: string }> {
+  return window.hermesDesktop.api<{ ok: boolean; backend: string }>({
+    ...capabilityScoped(profile),
     path: '/api/tools/terminal/backend',
     method: 'PUT',
     body: { backend }
   })
 }
 
-export function getComputerUseStatus(): Promise<ComputerUseStatus> {
+export function getComputerUseStatus(profile?: ProfileScope): Promise<ComputerUseStatus> {
   return hermesApi<ComputerUseStatus>({
-    ...profileScoped(),
+    ...capabilityScoped(profile),
     path: '/api/tools/computer-use/status'
   })
 }
 
-export function grantComputerUsePermissions(): Promise<ActionResponse> {
+export function grantComputerUsePermissions(profile?: ProfileScope): Promise<ActionResponse> {
   return hermesApi<ActionResponse>({
-    ...profileScoped(),
+    ...capabilityScoped(profile),
     path: '/api/tools/computer-use/permissions/grant',
     method: 'POST'
   })

@@ -18,7 +18,7 @@ import pytest
 
 from gateway import shutdown_flush
 from gateway.session import SessionStore
-from agent.conversation_compression import DurableCompressionTurnSpool
+from agent.conversation_compression_spool import (DurableCompressionTurnSpool)
 
 
 def _make_store(db):
@@ -210,7 +210,7 @@ class TestSpoolPrimitives:
         # A shutdown-format flush file must not be consumed by the drain.
         shutdown_flush.flush_pending_to_file({"key1": "hello"}, reason="shutdown")
         assert len(_spool_files(spool_home)) == 1
-        replayed, remaining = shutdown_flush.drain_transcript_spool(
+        replayed, _remaining = shutdown_flush.drain_transcript_spool(
             "key1", lambda m: None
         )
         assert replayed == 0

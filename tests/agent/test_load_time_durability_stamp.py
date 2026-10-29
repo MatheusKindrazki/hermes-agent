@@ -166,7 +166,7 @@ def test_noop_progress_check_is_marker_insensitive(tmp_path: Path) -> None:
     marker-swept — a raw ``==`` would misclassify the semantically-identical
     no-op as progress and rotate the session for nothing.
     """
-    from agent.conversation_compression import _strip_marker_for_comparison
+    from agent.conversation_compression_state import (_strip_marker_for_comparison)
 
     db = SessionDB(db_path=tmp_path / "state.db")
     _seed_session(db, "NOOP", turns=2)

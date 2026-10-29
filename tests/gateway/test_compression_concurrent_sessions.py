@@ -28,7 +28,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from hermes_state import SessionDB
-from agent.conversation_compression import DurableCompressionTurnSpool
+from agent.conversation_compression_spool import (DurableCompressionTurnSpool)
 
 
 @pytest.mark.parametrize("probe, expected", [(False, "dead_or_reused"), (None, "unknown"), (PermissionError(), "unknown")])
@@ -227,38 +227,26 @@ def _hold_spool_owner(root: str, ready, release) -> None:
 def _run_spool_fence_operation(root: str, start, results, operation: str) -> None:
     spool = DurableCompressionTurnSpool(root)
     start.wait(timeout=10)
-    if operation == "enqueue":
-        result = spool.enqueue(
-            "root", {"role": "user", "content": "multiprocess"},
-            token_count=1, client_turn_id="mp-turn",
-        )["durable"]
-    elif operation == "commit":
-        epoch = spool.begin_attempt("root", "commit-owner")
-        result = bool(
-            epoch
-            and spool.commit_attempt(
-                "root", "commit-owner", epoch, live_tip="child"
-            )
-        )
-    elif operation == "abort":
-        epoch = spool.begin_attempt("abort-session", "abort-owner")
-        result = bool(
-            epoch
-            and spool.abort_attempt("abort-session", "abort-owner", epoch)
-        )
-    elif operation == "reconcile":
-        epoch = spool.begin_attempt("reconcile-session", "reconcile-owner")
-        result = bool(
-            epoch
-            and spool.reconcile_canonical_tip(
-                "reconcile-session",
-                "reconcile-tip",
-                expected_owner="reconcile-owner",
-                expected_epoch=epoch,
-            )
-        )
-    else:  # pragma: no cover - test helper guard
-        raise AssertionError(operation)
+    def enqueue():
+        result = spool.enqueue('root', {'role': 'user', 'content': 'multiprocess'}, token_count=1, client_turn_id='mp-turn')['durable']
+        return result
+
+    def commit():
+        epoch = spool.begin_attempt('root', 'commit-owner')
+        result = bool(epoch and spool.commit_attempt('root', 'commit-owner', epoch, live_tip='child'))
+        return result
+
+    def abort():
+        epoch = spool.begin_attempt('abort-session', 'abort-owner')
+        result = bool(epoch and spool.abort_attempt('abort-session', 'abort-owner', epoch))
+        return result
+
+    def reconcile():
+        epoch = spool.begin_attempt('reconcile-session', 'reconcile-owner')
+        result = bool(epoch and spool.reconcile_canonical_tip('reconcile-session', 'reconcile-tip', expected_owner='reconcile-owner', expected_epoch=epoch))
+        return result
+    handlers = {'enqueue': enqueue, 'commit': commit, 'abort': abort, 'reconcile': reconcile}
+    result = handlers[operation]()
     results.put((operation, result))
 
 
@@ -271,7 +259,7 @@ def _drain_spool_in_process(root: str, results) -> None:
     results.put((drained, seen))
 
 
-def test_live_process_owner_cannot_be_taken_over(tmp_path: Path) -> None:
+def test_live_process_owner_cannot_be_taken_over(tmp_path: Path, monkeypatch) -> None:
     root = str(tmp_path / "compression-spool")
     ctx = multiprocessing.get_context("spawn")
     ready = ctx.Queue()
@@ -279,7 +267,8 @@ def test_live_process_owner_cannot_be_taken_over(tmp_path: Path) -> None:
     process = ctx.Process(target=_hold_spool_owner, args=(root, ready, release))
     process.start()
     assert ready.get(timeout=10) == 1
-    time.sleep(0.2)  # durable lease expired, but owner process is still alive
+    clock = time.monotonic_ns
+    monkeypatch.setattr(time, "monotonic_ns", lambda: clock() + 200_000_000)
     spool = DurableCompressionTurnSpool(root)
     assert spool.begin_attempt(
         "shared", "contender", allow_stale_owner_takeover=True
@@ -337,10 +326,11 @@ def test_multiprocess_lineage_fence_operations_terminate_canonically(
     assert spool.pending("root") == []
 
 
-def test_expired_owner_cannot_publish_live_tip(tmp_path: Path) -> None:
+def test_expired_owner_cannot_publish_live_tip(tmp_path: Path, monkeypatch) -> None:
     spool = DurableCompressionTurnSpool(tmp_path / "compression-spool")
     epoch = spool.begin_attempt("shared", "owner", lease_seconds=0.01)
-    time.sleep(0.02)
+    clock = time.monotonic_ns
+    monkeypatch.setattr(time, "monotonic_ns", lambda: clock() + 20_000_000)
     assert spool.commit_attempt("shared", "owner", epoch, live_tip="bad") is False
     assert spool.resolve_live_tip("shared") == "shared"
 

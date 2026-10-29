@@ -39,12 +39,58 @@ def test_local_acceptance_means_request_is_durably_queued(tmp_path, monkeypatch)
     assert captured[0]['dm_file'] is None
 
 
+_QUEUE_STUB_BOOTSTRAP = (
+    "from tests.tools.test_durable_bot_delivery_queue import _install_queue_transport_stub; "
+    "_install_queue_transport_stub(); "
+    "from tools.bot_delivery_queue import main; main()"
+)
+
+
+def _install_queue_transport_stub(monkeypatch=None):
+    """Replace only the authority RPC seam; retain real queue processes and SQLite.
+
+    The current runtime never invokes a local CLI as a second Bot Chat writer.
+    The fake owner persists the input and returns settlement without a model.
+    """
+    def install(obj, name, value):
+        if monkeypatch is not None:
+            monkeypatch.setattr(obj, name, value)
+        else:
+            setattr(obj, name, value)
+
+    def admit(home, path, author=None):
+        db = SessionDB(db_path=Path(home) / 'state.db')
+        try:
+            db.append_message('recipient', 'user', Path(path).read_text())
+        finally:
+            db.close()
+        return dict(profile_home=str(home), delivery_id=dm._dm_delivery_id(path), status='settled')
+
+    def wait(home, delivery_id, *, dm_file=None, on_result=None):
+        if on_result is not None:
+            on_result('settled')
+        print('reply: ' + Path(dm_file).read_text())
+        return 0
+
+    original_popen = subprocess.Popen
+    def popen(argv, *args, **kwargs):
+        if len(argv) > 3 and argv[1:3] == ['-m', 'tools.bot_delivery_queue']:
+            argv = [argv[0], '-c', _QUEUE_STUB_BOOTSTRAP, *argv[3:]]
+        return original_popen(argv, *args, **kwargs)
+
+    install(dm, '_admit_live_dm', admit)
+    install(dm, '_wait_live_dm', wait)
+    install(subprocess, 'Popen', popen)
+
+
 @pytest.fixture
 def queue_fixture(tmp_path, monkeypatch):
+    _install_queue_transport_stub(monkeypatch)
     root = tmp_path / '.hermes'
     root.mkdir()
     target = root / 'profiles/staff'
     target.mkdir(parents=True)
+    (target / 'config.yaml').write_text('{}\n')
     monkeypatch.setenv('HERMES_HOME', str(root))
     monkeypatch.setattr(dm.tempfile, 'gettempdir', lambda: str(tmp_path))
     db = SessionDB(db_path=target / 'state.db')

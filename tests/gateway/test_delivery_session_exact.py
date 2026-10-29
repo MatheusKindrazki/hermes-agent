@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from agent.durable_observation import ObservationWriter
 import json
 import os
 from contextlib import nullcontext
@@ -37,7 +38,7 @@ def test_observe_effect_four_stores_exact_release_and_ack_replay(tmp_path, monke
     collector = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(collector)
     spool = tmp_path / "spool"
-    writer = da.ObservationWriter(spool, code_sha="a" * 40)
+    writer = ObservationWriter(spool, code_sha="a" * 40)
     monkeypatch.setattr(da, "_OBSERVER", writer)
     monkeypatch.setenv(da.ENV_MODE, "observe")
     monkeypatch.setenv("HERMES_KERNEL_SHADOW_PRODUCER_ENABLED", "1")
@@ -273,7 +274,7 @@ def test_explicit_origin_routes_to_compression_tip_not_duplicate_title(monkeypat
         def get_compression_tip(self, _session_id): return "origin-tip"
         def close(self): pass
 
-    import hermes_cli.profiles as profiles
+    from hermes_cli import profiles
     import hermes_state
     monkeypatch.setattr(profiles, "get_profile_dir", lambda _profile: tmp_path)
     monkeypatch.setattr(hermes_state, "SessionDB", DB)
@@ -320,7 +321,7 @@ def test_global_environment_and_exit_code_cannot_emit_shadow_receipt(monkeypatch
     monkeypatch.setenv("HERMES_KERNEL_ATTEMPT_ID", "01a06c46-68ef-7d98-92cb-7225914a3437")
     monkeypatch.setenv("HERMES_KERNEL_LEASE_EPOCH", "8")
     monkeypatch.setenv("HERMES_KERNEL_FENCE_VALIDATED", "1")
-    receipt = bot_mode_dm._write_delivery_receipt(
+    bot_mode_dm._write_delivery_receipt(
         str(dm_file), origin_session_id="origin-exact", origin_reason="explicit",
         route_reason="origin_exact", label="@researcher",
         idempotency_key=hashlib.sha256(str(tmp_path).encode()).hexdigest(),

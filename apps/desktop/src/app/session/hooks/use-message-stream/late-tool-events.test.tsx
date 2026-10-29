@@ -9,6 +9,7 @@ import { act, cleanup } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { appendMidTurnUserMessage } from '@/app/session/hooks/use-prompt-actions/rewind'
+import { $executingToolsByRuntime } from '@/store/session-executing-tools'
 
 import { type MessageStreamHarness, renderMessageStream } from './test-harness'
 
@@ -43,7 +44,9 @@ describe('tool events for a part that already exists on a sealed message', () =>
     // keeps running (minutes in practice). streamId drops; the tool part is
     // sealed with completedAt and no result.
     event('message.interim', 103, { text: 'Scraping the page.' })
+    expect($executingToolsByRuntime.get()[SID]).toEqual({ 'call-late-1': 'browser' })
     event('tool.complete', 260.5, { name: 'browser', result: 'ok', tool_id: 'call-late-1' })
+    expect(Object.keys($executingToolsByRuntime.get()[SID] || {})).toHaveLength(0)
 
     const state = stream.state(SID)
     const assistants = (state.messages ?? []).filter(message => message.role === 'assistant')

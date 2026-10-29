@@ -47,10 +47,10 @@ _SHADOW_UNKNOWN_TIMESTAMP = "1970-01-01T00:00:00Z"
 _OUTBOX_PRODUCER = "hermes-agent.agent.outbound_webhooks"
 # (home, event, url) triples already wired in this process. Home is part of the key so a
 # multiplexed gateway's secondary profiles (own plugin managers) can register identical targets.
-_registered: Set[Tuple[str, str, str]] = set()
+_registered: set[tuple[str, str, str]] = set()
 _registered_lock = threading.Lock()
 
-_delivery_queue: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue(maxsize=QUEUE_MAX_SIZE)
+_delivery_queue: queue.Queue[Optional[dict[str, Any]]] = queue.Queue(maxsize=QUEUE_MAX_SIZE)
 _worker_lock = threading.Lock()
 _worker: Optional[threading.Thread] = None
 
@@ -60,7 +60,7 @@ class WebhookTarget(_ToolMatcherMixin):
     """Parsed and validated representation of one ``hooks.outbound`` entry."""
     _MATCHER_KIND = "outbound webhook"
     url: str
-    events: List[str]
+    events: list[str]
     name: str = ""
     secret: Optional[str] = None
     matcher: Optional[str] = None
@@ -72,9 +72,13 @@ class WebhookTarget(_ToolMatcherMixin):
         return self.name or self.url
 
 
-def register_from_config(cfg: Optional[Dict[str, Any]]) -> List[WebhookTarget]:
+def register_from_config(cfg: Optional[dict[str, Any]]) -> list[WebhookTarget]:
     """Register every configured outbound webhook on the plugin manager.  Malformed ``hooks.outbound``
     means zero targets — never raises.  Returns the targets that ended up wired (deduplicated)."""
+    from agent.safe_worker_policy import safe_worker_enabled
+
+    if safe_worker_enabled():
+        return []
     if not isinstance(cfg, dict):
         return []
     from utils import env_var_enabled
@@ -90,7 +94,7 @@ def register_from_config(cfg: Optional[Dict[str, Any]]) -> List[WebhookTarget]:
     egress_policy = EgressPolicy.from_config(cfg)
 
     home_key = _home_key()
-    registered: List[WebhookTarget] = []
+    registered: list[WebhookTarget] = []
     with _registered_lock:
         for target in targets:
             wired_any = False
@@ -117,7 +121,7 @@ def register_from_config(cfg: Optional[Dict[str, Any]]) -> List[WebhookTarget]:
     return registered
 
 
-def iter_configured_targets(cfg: Optional[Dict[str, Any]]) -> List[WebhookTarget]:
+def iter_configured_targets(cfg: Optional[dict[str, Any]]) -> list[WebhookTarget]:
     """Parse ``hooks.outbound`` without registering anything (``hermes hooks list``)."""
     if not isinstance(cfg, dict):
         return []
@@ -193,7 +197,7 @@ def _parse_single_target(index: int, raw: Any) -> Optional[WebhookTarget]:
     if not isinstance(events_raw, list) or not events_raw:
         warn(" needs a non-empty 'events' list (valid: %s)", valid_list)
         return None
-    events: List[str] = [ev for ev in events_raw if ev in VALID_HOOKS]
+    events: list[str] = [ev for ev in events_raw if ev in VALID_HOOKS]
     for ev in events_raw:
         if ev not in VALID_HOOKS:
             warn(": unknown event %r ignored (valid: %s)", ev, valid_list)
@@ -247,9 +251,13 @@ def _make_callback(
     """Build the notify-only closure ``invoke_hook()`` calls per firing."""
 
     def _callback(**kwargs: Any) -> None:
+        from agent.safe_worker_policy import safe_worker_enabled
+
+        if safe_worker_enabled():
+            return
         if event in _TOOL_SCOPED_EVENTS:
             if not target.matches_tool(kwargs.get("tool_name")):
-                return None
+                return
         shadow_enabled = (
             reliability_outbox is not None
             and reliability_outbox.mode == "shadow"
@@ -277,7 +285,7 @@ def _make_callback(
                 "outbound webhook payload serialization failed (event=%s "
                 "target=%s)", event, target.label, exc_info=True,
             )
-            return None
+            return
         if egress_policy is not None:
             egress_decision = egress_policy.evaluate_delivery(
                 action="webhook",
@@ -292,7 +300,7 @@ def _make_callback(
                     target.label,
                     ",".join(egress_decision.reasons),
                 )
-                return None
+                return
         if shadow_enabled:
             receipt = reliability_outbox.enqueue(
                 payload=body,
@@ -309,7 +317,7 @@ def _make_callback(
                 target.label,
                 receipt.event_id,
             )
-            return None
+            return
         _enqueue(_build_delivery(event, target, body, delivery_id))
 
     _callback.__name__ = f"outbound_webhook[{event}:{target.label}]"
@@ -320,7 +328,7 @@ def _make_callback(
 def _shadow_version(
     event: str,
     target: WebhookTarget,
-    kwargs: Dict[str, Any],
+    kwargs: dict[str, Any],
 ) -> str:
     explicit = str(kwargs.get("version") or "").strip()
     if explicit:
@@ -347,7 +355,7 @@ def _shadow_version(
 def _shadow_delivery_id(
     event: str,
     target: WebhookTarget,
-    kwargs: Dict[str, Any],
+    kwargs: dict[str, Any],
     version: str,
 ) -> str:
     material = "\0".join(
@@ -363,7 +371,7 @@ def _shadow_delivery_id(
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
 
 
-def _serialize_payload(event: str, kwargs: Dict[str, Any], delivery_id: str, *, timestamp: Optional[str] = None) -> bytes:
+def _serialize_payload(event: str, kwargs: dict[str, Any], delivery_id: str, *, timestamp: Optional[str] = None) -> bytes:
     """Render the POST body: shell-hooks stdin shape plus delivery metadata.  ``delivery_id``
     (also the ``X-Hermes-Delivery`` header) and ``timestamp`` live inside the HMAC-signed
     body, so they double as replay protection."""
@@ -383,7 +391,7 @@ def _serialize_payload(event: str, kwargs: Dict[str, Any], delivery_id: str, *, 
     ).encode("utf-8")
 
 
-def _build_delivery(event: str, target: WebhookTarget, body: bytes, delivery_id: str) -> Dict[str, Any]:
+def _build_delivery(event: str, target: WebhookTarget, body: bytes, delivery_id: str) -> dict[str, Any]:
     headers = {
         "Content-Type": "application/json", "User-Agent": "Hermes-Agent-Outbound-Webhook",
         "X-Hermes-Event": event, "X-Hermes-Delivery": delivery_id,
@@ -394,7 +402,7 @@ def _build_delivery(event: str, target: WebhookTarget, body: bytes, delivery_id:
     return {"url": target.url, "label": target.label, "event": event, "body": body, "headers": headers, "timeout": target.timeout}
 
 
-def _enqueue(delivery: Dict[str, Any]) -> None:
+def _enqueue(delivery: dict[str, Any]) -> None:
     global _worker
     if _worker is None or not _worker.is_alive():
         with _worker_lock:
@@ -430,14 +438,14 @@ class _NoRedirectHandler(urlrequest.HTTPRedirectHandler):
     """Refuse redirects: urllib would turn a redirected POST into a body-less GET,
     silently dropping the signed payload. Any 3xx surfaces as HTTPError instead."""
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
 
 
 _opener = urlrequest.build_opener(_NoRedirectHandler)
 
 
-def _deliver(delivery: Dict[str, Any]) -> None:
+def _deliver(delivery: dict[str, Any]) -> None:
     """POST with bounded retries: retry on connection errors and 5xx; 4xx and 3xx are final."""
     event, label = delivery["event"], delivery["label"]
     last_error = ""
@@ -469,13 +477,3 @@ def _deliver(delivery: Dict[str, Any]) -> None:
         "outbound webhook delivery failed after %d attempt(s) (event=%s target=%s): %s",
         MAX_DELIVERY_ATTEMPTS, event, label, last_error,
     )
-
-
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-from pathlib import Path  # noqa: F401,E402
-from datetime import datetime  # noqa: F401,E402
-from datetime import timezone  # noqa: F401,E402
-# ---- END PLUGIN-COMPAT ----

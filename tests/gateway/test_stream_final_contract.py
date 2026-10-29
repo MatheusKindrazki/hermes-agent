@@ -20,6 +20,7 @@ Three invariants:
 import asyncio
 import sqlite3
 from types import SimpleNamespace
+from tests.waiting import async_wait_until
 
 import pytest
 
@@ -120,7 +121,7 @@ class TestConsumerDeclaredFinal:
 
         task = asyncio.create_task(consumer.run())
         consumer.on_delta("prefix-stable final")
-        await asyncio.sleep(0.04)
+        await async_wait_until(lambda: consumer._accumulated == "prefix-stable final", timeout=2)
         consumer.finish("prefix-stable final")
         await task
 

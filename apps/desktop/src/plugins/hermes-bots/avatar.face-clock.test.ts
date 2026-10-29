@@ -135,6 +135,126 @@ afterEach(() => {
 })
 
 describe('the hand-rolled rAF path (older shells)', () => {
+  it('keeps the curious bot wide-eyed and the chief restrained across conversation states', async () => {
+    const { startFaceClock } = await loadClock()
+    const chief = mountFace()
+    const curious = mountFace()
+
+    for (const [face, name] of [
+      [chief, 'hermes'],
+      [curious, 'ceiastaff']
+    ] as const) {
+      face.setAttribute('data-bot-face', name)
+      face.innerHTML = '<g data-hb-open="1"><ellipse data-hb-el="1"/><ellipse data-hb-er="1"/></g>'
+    }
+
+    startFaceClock()
+    pump()
+    observer!.emit([
+      { isIntersecting: true, target: chief },
+      { isIntersecting: true, target: curious }
+    ])
+
+    for (const mood of ['idle', 'think', 'work']) {
+      chief.setAttribute('data-hb-mood', mood)
+      curious.setAttribute('data-hb-mood', mood)
+      const heights = [0, 0]
+
+      for (let frame = 0; frame < 30; frame++) {
+        pump(200)
+
+        for (const [index, face] of [chief, curious].entries()) {
+          heights[index] = Math.max(heights[index], Number(face.querySelector('ellipse')!.getAttribute('ry')))
+        }
+      }
+
+      expect(heights[1], mood).toBeGreaterThan(heights[0])
+    }
+  })
+
+  it('animates the painted body, pupils and feet through the visibility clock', async () => {
+    const { startFaceClock } = await loadClock()
+    const face = mountFace()
+    face.removeAttribute('data-hb-math')
+    face.setAttribute('data-hb-painted', 'curious')
+    face.setAttribute('data-bot-face', 'ceiastaff')
+    face.innerHTML = '<g data-hb-painted-body="1"><g data-hb-painted-eye="0"><ellipse data-hb-pupil="0" /></g></g><g data-hb-foot="0" /><g data-hb-foot="1" />'
+    startFaceClock()
+    pump()
+    observer!.emit([{ isIntersecting: true, target: face }])
+    pump()
+    const before = face.innerHTML
+    pump(700)
+    expect(face.innerHTML).not.toBe(before)
+    expect(face.querySelector('[data-hb-foot]')!.getAttribute('transform')).toContain('rotate(')
+    const visible = face.innerHTML
+    observer!.emit([{ isIntersecting: false, target: face }])
+    pump(700)
+    expect(face.innerHTML).toBe(visible)
+  })
+
+  it('animates blob faces through the same visible-face clock', async () => {
+    const { startFaceClock } = await loadClock()
+    const face = mountFace()
+    face.removeAttribute('data-hb-math')
+    face.setAttribute('data-hb-blob', '1')
+    face.innerHTML = '<g data-hb-blob-eyes="1"><path /></g>'
+
+    startFaceClock()
+    pump()
+    observer!.emit([{ isIntersecting: true, target: face }])
+    pump()
+    const firstPose = face.style.transform
+    pump(700)
+
+    expect(face.style.transform).not.toBe(firstPose)
+    expect(face.style.transform).not.toMatch(/rotate[XY]|perspective/)
+    expect(face.querySelector<SVGGElement>('g')!.style.transform).toContain('scale(')
+
+    const expressions = new Set<string>()
+
+    for (let i = 0; i < 100; i++) {
+      pump(200)
+      const eyes = face.querySelector<SVGGElement>('g')!
+      expressions.add(eyes.style.transform)
+      expect(eyes.style.opacity).toBe('1')
+      expect(face.style.transform).not.toMatch(/rotate[XY]|perspective/)
+    }
+
+    expect(expressions.size).toBeGreaterThan(1)
+  })
+
+  it('settles and parks when reduced motion is enabled, and wakes when disabled', async () => {
+    let changed: (() => void) | undefined
+
+    const preference = {
+      matches: true,
+      addEventListener: (_event: string, listener: () => void) => {
+        changed = listener
+      },
+      removeEventListener: vi.fn()
+    }
+
+    vi.stubGlobal('matchMedia', () => preference)
+    const { startFaceClock, stopFaceClock } = await loadClock()
+    const face = mountFace()
+    face.setAttribute('data-hb-blob', '1')
+
+    startFaceClock()
+    pump()
+    expect(face.style.transform).toBe('none')
+    expect(frames.size).toBe(0)
+
+    preference.matches = false
+    changed!()
+    expect(frames.size).toBe(1)
+    observer!.emit([{ isIntersecting: true, target: face }])
+    pump()
+    expect(face.style.transform).not.toBe('none')
+    stopFaceClock()
+    expect(preference.removeEventListener).toHaveBeenCalledWith('change', changed)
+  })
+
   it('parks itself when no faces are mounted', async () => {
     const { startFaceClock } = await loadClock()
 

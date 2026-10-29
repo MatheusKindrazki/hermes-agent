@@ -18,7 +18,7 @@ def source_probe(tmp_path):
     root = tmp_path / "source"
     root.mkdir()
     (root / "pyproject.toml").write_text(
-        '[tool.setuptools.packages.find]\ninclude = ["optional_adapter"]\n', encoding="utf-8")
+        '[project.optional-dependencies]\nacp = []\n[tool.setuptools.packages.find]\ninclude = ["optional_adapter"]\n', encoding="utf-8")
     for name in ("optional_adapter/__init__.py", "hermes_cli/__init__.py", "hermes_cli/main.py",
                  "run_agent.py", "hermes_state.py"):
         path = root / name
@@ -39,7 +39,7 @@ def source_probe(tmp_path):
     def run():
         env = {**os.environ, "PYTHONPATH": str(root)}
         return subprocess.run([sys.executable, "-S", "-c", probe, str(root), base],
-                              cwd=root, env=env, capture_output=True, text=True)
+                              cwd=root, env=env, capture_output=True, text=True, check=False)
     return root, added, run
 
 

@@ -53,6 +53,18 @@ test.describe('active-context identity', () => {
     })
   })
 
+  test.afterEach(async ({}, testInfo) => {
+    if (testInfo.status === testInfo.expectedStatus || !sandbox) {return}
+    // Only this fixture's isolated, mock-provider logs; never the installed app's home.
+    for (const name of fs.readdirSync(sandbox.root, { recursive: true })) {
+      if (typeof name !== 'string' || !name.endsWith('.log') || !name.split(path.sep).includes('logs')) {continue}
+      const log = path.join(sandbox.root, name)
+      await testInfo.attach(name.replaceAll(path.sep, '-'), {
+        body: fs.readFileSync(log).subarray(-2 * 1024 * 1024), contentType: 'text/plain'
+      })
+    }
+  })
+
   test.afterAll(async () => {
     await app?.close().catch(() => undefined)
     await mock?.close()

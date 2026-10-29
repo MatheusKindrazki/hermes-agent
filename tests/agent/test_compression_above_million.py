@@ -15,11 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent.conversation_compression import (
-    DurableCompressionTurnSpool,
-    drain_compression_turns_into_agent,
-    ensure_compression_turn_identity,
-)
+from agent.conversation_compression_spool import (DurableCompressionTurnSpool, drain_compression_turns_into_agent, ensure_compression_turn_identity)
 from agent.conversation_loop import _compression_deferred_result
 from hermes_state import SessionDB
 

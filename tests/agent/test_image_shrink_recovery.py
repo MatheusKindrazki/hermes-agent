@@ -231,7 +231,7 @@ class TestImagePatchBudgetShrink:
 
         from PIL import Image
 
-        from agent.conversation_compression import try_shrink_image_parts_in_messages
+        from agent.conversation_image_recovery import (try_shrink_image_parts_in_messages)
 
         err = _FakeApiError(
             status_code=400,
@@ -728,4 +728,3 @@ class TestShrinkCopyOnWriteHistoryIsolation:
         # ...but the stored history still has the original bytes.
         assert history_msg["content"][0] is history_part
         assert history_part["image_url"]["url"] == oversized_url
-

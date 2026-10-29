@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from hermes_cli.operational_settings import operational_setting
+from tools.environments.local import served_profile_child_env
 import logging
 import hashlib
 import json
@@ -43,7 +45,7 @@ class EgressSettings:
 class EgressDecision:
     allowed: bool
     decision: str
-    reasons: Tuple[str, ...]
+    reasons: tuple[str, ...]
     mode: str
     would_block: bool
     envelope: Mapping[str, Any]
@@ -82,10 +84,11 @@ def resolve_egress_settings(
     """Resolve ``gateway.reliability.egress.mode``; missing/invalid means off."""
     if config is None:
         try:
-            from hermes_cli.config import load_config
+            from hermes_cli.config_effective import load_user_config_effective
 
-            config = load_config()
+            config = load_user_config_effective()
         except Exception:
+            logging.getLogger(__name__).debug('resolve_egress_settings: optional operation failed', exc_info=True)
             logger.warning("Could not load egress policy config; using off")
             config = {}
     gateway = _mapping(_mapping(config).get("gateway"))
@@ -116,7 +119,7 @@ class EgressPolicy:
     @classmethod
     def from_config(
         cls, config: Optional[Mapping[str, Any]] = None
-    ) -> "EgressPolicy":
+    ) -> EgressPolicy:
         return cls(resolve_egress_settings(config))
 
     @property
@@ -148,6 +151,7 @@ class EgressPolicy:
             session_profile = get_session_env("HERMES_SESSION_PROFILE", "")
             session_id = get_session_env("HERMES_SESSION_ID", "")
         except Exception:
+            logging.getLogger(__name__).debug('EgressPolicy.build_envelope: optional operation failed', exc_info=True)
             session_profile = ""
             session_id = ""
         try:
@@ -155,6 +159,7 @@ class EgressPolicy:
 
             request_context = current_request_context()
         except Exception:
+            logging.getLogger(__name__).debug('EgressPolicy.build_envelope: optional operation failed', exc_info=True)
             request_context = None
 
         digest = hashlib.sha256(content).hexdigest()
@@ -215,12 +220,14 @@ class EgressPolicy:
 
             session_profile = get_session_env("HERMES_SESSION_PROFILE", "")
         except Exception:
+            logging.getLogger(__name__).debug('EgressPolicy.evaluate_delivery: optional operation failed', exc_info=True)
             session_profile = ""
         try:
             from gateway.turn_context import current_request_context
 
             request_context = current_request_context()
         except Exception:
+            logging.getLogger(__name__).debug('EgressPolicy.evaluate_delivery: optional operation failed', exc_info=True)
             request_context = None
         supplied = _mapping(metadata)
         nested = _mapping(supplied.get("egress"))
@@ -293,8 +300,8 @@ class EgressPolicy:
         if not isinstance(envelope, Mapping):
             return {"allowed": False, "reasons": ["tone_envelope_missing"]}
         raw = json.dumps(dict(envelope), sort_keys=True, separators=(",", ":")).encode()
-        gate = str(os.environ.get("HERMES_TONE_GATE_BIN") or "").strip()
-        pinned_sha = str(os.environ.get("HERMES_TONE_SCHEMA_SHA256") or "").strip()
+        gate = str(operational_setting("tone_gate_bin") or "").strip()
+        pinned_sha = str(operational_setting("tone_schema_sha256") or "").strip()
         if not gate or not os.path.isabs(gate) or not os.access(gate, os.X_OK):
             return {"allowed": False, "reasons": ["tone_gate_unavailable"]}
         if len(pinned_sha) != 64 or any(c not in "0123456789abcdef" for c in pinned_sha):
@@ -303,15 +310,14 @@ class EgressPolicy:
         if not policy.is_file():
             return {"allowed": False, "reasons": ["tone_policy_unavailable"]}
         try:
-            gate_env = dict(os.environ)
+            gate_env = served_profile_child_env()
             # K11 defaults to off for standalone safety.  The already-resolved
             # egress mode is the sole authority that arms this invocation.
             gate_env["HERMES_TONE_CONTRACT_V2"] = self.mode
             result = subprocess.run(
                 [gate, "evaluate", "--stdin", "--policy", str(policy),
                  "--require-schema-sha256", pinned_sha],
-                input=raw, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                timeout=2.0, check=False, env=gate_env,
+                input=raw, capture_output=True, timeout=2.0, check=False, env=gate_env,
             )
         except subprocess.TimeoutExpired:
             return {"allowed": False, "reasons": ["tone_gate_timeout"]}

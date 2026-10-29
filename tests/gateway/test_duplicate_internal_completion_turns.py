@@ -146,7 +146,7 @@ def _completion_event(
     session_key: str = ROUTE_KEY,
     chat_id: str = "123",
     thread_id: str = "42",
-    task_id: "str | None" = TASK_ID,
+    task_id: str | None = TASK_ID,
 ) -> dict:
     """A ``completion`` as the gateway process watcher builds it."""
     event = {

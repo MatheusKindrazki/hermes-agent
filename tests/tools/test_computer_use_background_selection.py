@@ -12,6 +12,7 @@ def test_background_selection_does_not_prompt(monkeypatch, args):
     monkeypatch.setenv("HERMES_COMPUTER_USE_BACKEND", "noop")
     monkeypatch.setenv("HERMES_INTERACTIVE", "1")
     cu.reset_backend_for_tests()
+    monkeypatch.setattr(cu, "_new_backend", lambda mode: cu._NoopBackend())
     prompts = []
     cu.set_approval_callback(lambda action, *_, **_kwargs: prompts.append(action) or "timeout")
     try:
@@ -22,6 +23,7 @@ def test_background_selection_does_not_prompt(monkeypatch, args):
         cu.set_approval_callback(None)
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
     cu.reset_backend_for_tests()
+    monkeypatch.setattr(cu, "_new_backend", lambda mode: cu._NoopBackend())
 
 
 @pytest.mark.parametrize("args", [
@@ -33,6 +35,7 @@ def test_ui_mutations_still_require_approval(monkeypatch, args):
     monkeypatch.setenv("HERMES_COMPUTER_USE_BACKEND", "noop")
     monkeypatch.setenv("HERMES_INTERACTIVE", "1")
     cu.reset_backend_for_tests()
+    monkeypatch.setattr(cu, "_new_backend", lambda mode: cu._NoopBackend())
     prompts = []
     cu.set_approval_callback(lambda action, *_, **_kwargs: prompts.append(action) or "deny")
     try:
@@ -44,3 +47,4 @@ def test_ui_mutations_still_require_approval(monkeypatch, args):
         cu.set_approval_callback(None)
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
     cu.reset_backend_for_tests()
+    monkeypatch.setattr(cu, "_new_backend", lambda mode: cu._NoopBackend())
