@@ -264,7 +264,7 @@ export function ParallelActivity() {
       </SheetTrigger>
       <SheetContent
         className="w-[min(92vw,27rem)] sm:max-w-[27rem]"
-        style={{ backgroundColor: '#171719', color: '#eee' }}
+        style={{ backgroundColor: '#171719', color: '#eee', zIndex: 'var(--z-modal)' }}
       >
         <SheetHeader className="px-6 pt-7 pb-3 pr-12">
           <SheetTitle>Em paralelo</SheetTitle>
