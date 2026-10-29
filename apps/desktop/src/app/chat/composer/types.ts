@@ -40,6 +40,8 @@ export interface ChatBarProps {
   /** Keep only the rich-text draft surface editable while every dispatch,
    * steer, queue, voice, and attachment action remains disabled. */
   allowDraftingWhileDisabled?: boolean
+  /** Exact conversation persona, never the ambient profile or sidebar selection. */
+  recipientName?: string
   busy: boolean
   disabled: boolean
   focusKey?: string | null

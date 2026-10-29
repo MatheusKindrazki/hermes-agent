@@ -144,6 +144,7 @@ export function ChatBar({
   maxRecordingSeconds = 120,
   profile,
   queueSessionKey,
+  recipientName,
   sessionId,
   state,
   onCancel,
@@ -457,7 +458,7 @@ export function ChatBar({
 
   // Resting / reconnecting / starting placeholder text, re-rolled only on a real
   // conversation change.
-  const placeholder = useComposerPlaceholder({ disabled, reconnecting, sessionId })
+  const placeholder = useComposerPlaceholder({ disabled, reconnecting, recipientName, sessionId })
 
   // Trigger / completion engine: @// detection, the adapter-driven item list,
   // popover selection, and chip insertion. The keydown nav block below consumes

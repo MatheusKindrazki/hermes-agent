@@ -6,6 +6,7 @@ import { resetBrowseState } from '@/store/composer-input-history'
 import { pickPlaceholder } from '../composer-utils'
 
 interface UseComposerPlaceholderOptions {
+  recipientName?: string
   disabled: boolean
   reconnecting: boolean
   sessionId: null | string | undefined
@@ -18,7 +19,7 @@ interface UseComposerPlaceholderOptions {
  * keeps its starter so the text doesn't flip mid-stream. While the transport is
  * down, it swaps to a reconnecting / starting message instead.
  */
-export function useComposerPlaceholder({ disabled, reconnecting, sessionId }: UseComposerPlaceholderOptions): string {
+export function useComposerPlaceholder({ disabled, reconnecting, recipientName, sessionId }: UseComposerPlaceholderOptions): string {
   const { t } = useI18n()
   const newSessionPlaceholders = t.composer.newSessionPlaceholders
   const followUpPlaceholders = t.composer.followUpPlaceholders
@@ -53,6 +54,12 @@ export function useComposerPlaceholder({ disabled, reconnecting, sessionId }: Us
   // we're trying to restore. During reconnect, keep the textbox editable so a
   // flaky network doesn't block drafting; only submit/backend actions stay
   // disabled until the gateway is open again.
+  // Persona copy belongs to this conversation, not the skin's global sidebar
+  // observer. Derive it on every render; never cache a previous recipient.
+  if (recipientName) {
+    return `${t.composer.message} ${recipientName}`
+  }
+
   return disabled
     ? reconnecting
       ? t.composer.placeholderReconnecting

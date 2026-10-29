@@ -68,7 +68,7 @@ import { isAuxiliaryWindow, isMainWindow } from '@/store/windows'
 import { primaryRouteSelectedSessionId, routeSessionId } from '../routes'
 import { titlebarHeaderBaseClass, titlebarHeaderShadowClass, titlebarHeaderTitleClass } from '../shell/titlebar'
 
-import { ChatPersonaHeader, useChatPersona } from './bot-persona'
+import { ChatPersonaHeader, useRoutedChatPersona } from './bot-persona'
 import {
   type ActiveContext,
   resolveActiveContext
@@ -731,7 +731,7 @@ const ChatViewContent = memo(function ChatViewContent({
 
   const storedId = useStore(view.$storedId)
   const setupChat = useSetupChatView()
-  const resolvedPersona = useChatPersona(storedId)
+  const resolvedPersona = useRoutedChatPersona(isPrimary, location.pathname, storedId)
   const hudMode = useStore($hudMode)
   const chatPersona = hudMode ? null : resolvedPersona
   // Multi-pane dimming: only the focused surface paints at full strength, so
@@ -827,7 +827,7 @@ const ChatViewContent = memo(function ChatViewContent({
   const routedSessionId = isPrimary ? routeSessionId(location.pathname) : selectedSessionId
   const isRoutedSessionView = Boolean(routedSessionId)
   const { composerDisabled, allowDraftingWhileDisabled, activeContext, contextAllowsSubmit, submitWithContextGuard, steerWithContextGuard, identityV2Enabled, capabilityState } = useContextSubmitGuard({
-    activeSessionId, routedSessionId, selectedSessionId, sessions, activeConnectionId,
+    activeSessionId, routedSessionId, selectedSessionId, runtimeStoredSessionId: transcriptStoredSessionId, sessions, activeConnectionId,
     activeGatewayProfile, gatewayOpen, identityV2Override, onSubmit, onSteer
   })
 
@@ -986,6 +986,7 @@ const ChatViewContent = memo(function ChatViewContent({
             <Suspense fallback={<ChatBarFallback />}>
               <ChatBar
                 allowDraftingWhileDisabled={allowDraftingWhileDisabled}
+                recipientName={resolvedPersona?.title}
                 busy={busy}
                 cwd={currentCwd}
                 disabled={composerDisabled}

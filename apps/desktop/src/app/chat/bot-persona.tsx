@@ -14,6 +14,8 @@ import type { RosterRow } from '@/plugins/hermes-bots/types'
 import { $sessionToolsById, $sessionWorkById } from '@/sdk/session-activity'
 import { $sessionDotStateById } from '@/store/session-dot-state'
 
+import { primaryRouteSelectedSessionId } from '../routes'
+
 import { ParallelActivity } from './parallel-activity'
 
 /** Resolve the exact canonical conversation, never the profile's latest activity. */
@@ -27,6 +29,11 @@ export function conversationBot(roster: RosterRow[], storedId: string | null): R
   )
 
   return matches.length === 1 ? matches[0] : null
+}
+
+/** Route selection wins while the previous conversation is still detaching. */
+export function useRoutedChatPersona(isPrimary: boolean, pathname: string, storedId: string | null) {
+  return useChatPersona(isPrimary ? primaryRouteSelectedSessionId(pathname, storedId) : storedId)
 }
 
 export function useChatPersona(storedId: string | null) {
