@@ -10,15 +10,91 @@ from unittest import mock
 
 import pytest
 
+from cron import scheduler as sched
 from cron import scheduler_delivery as sched_delivery
 from cron.scheduler import _resolve_delivery_targets
 from cron.scheduler_delivery import (
-    BOT_CHAT_PLATFORM,
+    BOT_CHAT_PLATFORM, BOT_CHAT_NOTIFY_PLATFORM,
     _deliver_to_bot_chat,
     _resolve_bot_chat_target,
     parse_bot_chat_deliver_token,
+    parse_bot_chat_notify_deliver_token,
 )
 from cron.scheduler_preflight import _preflight_check_delivery
+
+
+def test_notify_delivery_persists_in_canonical_chat_without_agent_turn(
+    tmp_path, monkeypatch
+):
+    """bot-chat-notify is a durable, passive inbox write, not a model turn."""
+    from hermes_cli import profiles
+    from hermes_state import SessionDB
+
+    root = tmp_path / ".hermes"
+    profile_home = root / "profiles" / "applauseinbox"
+    profile_home.mkdir(parents=True)
+    db = SessionDB(db_path=profile_home / "state.db")
+    db.create_session("canonical", "cli")
+    assert db.set_session_title("canonical", "Bot Chat")
+    db.close()
+
+    monkeypatch.setattr(profiles, "_get_default_hermes_home", lambda: root)
+
+    def model_turn_forbidden(*_args, **_kwargs):
+        raise AssertionError("passive delivery must not spawn a Hermes agent turn")
+
+    monkeypatch.setattr(sched.subprocess, "run", model_turn_forbidden)
+
+    def gateway_config_forbidden():
+        raise AssertionError("machine-local passive delivery needs no gateway")
+
+    monkeypatch.setattr(
+        "gateway.config.load_gateway_config", gateway_config_forbidden
+    )
+    job = {
+        "id": "slack-watch",
+        "name": "Slack Watch — Applause",
+        "deliver": "bot-chat-notify:applauseinbox",
+        "fire_claim": {"at": "2026-08-31T19:15:55-03:00", "by": "mini"},
+    }
+    error = sched._deliver_result(job, "Uma atualização material no Slack.")
+    replay_error = sched._deliver_result(
+        job, "Uma atualização material no Slack."
+    )
+
+    assert error is None
+    assert replay_error is None
+    db = SessionDB(db_path=profile_home / "state.db")
+    messages = db.get_messages_as_conversation("canonical")
+    db.close()
+    assert len(messages) == 1
+    assert messages[0]["role"] == "user"
+    assert messages[0]["display_kind"] == "internal_notification"
+    assert "[Cron delivery: Slack Watch — Applause]" in messages[0]["content"]
+    assert "Uma atualização material no Slack." in messages[0]["content"]
+
+
+def test_notify_target_is_validated_and_needs_no_gateway_credentials():
+    """The passive token is a machine-local target on create and fire."""
+    from tools.cronjob_tools import _validate_bot_chat_deliver
+
+    assert parse_bot_chat_notify_deliver_token("bot-chat-notify") == ""
+    assert (
+        parse_bot_chat_notify_deliver_token("BOT-CHAT-NOTIFY:ApplauseInbox")
+        == "ApplauseInbox"
+    )
+    with mock.patch("hermes_cli.profiles.profile_exists", return_value=True):
+        assert (
+            _validate_bot_chat_deliver("bot-chat-notify:applauseinbox") is None
+        )
+    with mock.patch("hermes_cli.profiles.profile_exists", return_value=False):
+        assert _validate_bot_chat_deliver("bot-chat-notify:ghost") is not None
+    assert (
+        _preflight_check_delivery(
+            {"id": "j1", "deliver": "bot-chat-notify:applauseinbox"}
+        )
+        is None
+    )
 
 
 # ── token parsing ────────────────────────────────────────────────────────────
@@ -195,6 +271,8 @@ def test_delivery_targets_include_local_profiles():
     ids = [t["id"] for t in targets]
     assert f"{BOT_CHAT_PLATFORM}:default" in ids
     assert f"{BOT_CHAT_PLATFORM}:research" in ids
+    assert f"{BOT_CHAT_NOTIFY_PLATFORM}:default" in ids
+    assert f"{BOT_CHAT_NOTIFY_PLATFORM}:research" in ids
     bot_chat_entries = [t for t in targets if t["id"].startswith(BOT_CHAT_PLATFORM)]
     # No gateway home channel needed for bot-chat targets.
     assert all(t["home_target_set"] for t in bot_chat_entries)
@@ -245,3 +323,37 @@ def test_tick_hands_legacy_pending_records_to_the_live_owner_once(tmp_path, monk
     assert 'Cronjob "Digest" output' in admitted[0][1] and "the report" in admitted[0][1]
     assert json.loads((root / f"{queued}.json").read_text())["status"] == "transferred"
     assert json.loads((root / f"{claimed}.json").read_text())["status"] == "claimed"
+
+
+@pytest.mark.parametrize("targets", ["bot-chat-notify:inbox,telegram:123", "telegram:123,bot-chat-notify:inbox"])
+def test_mixed_notify_persists_once_before_external_config_failure(tmp_path, monkeypatch, targets):
+    from hermes_cli import profiles
+    from hermes_state import SessionDB
+
+    root = tmp_path / ".hermes"
+    home = root / "profiles" / "inbox"
+    home.mkdir(parents=True)
+    with SessionDB(db_path=home / "state.db") as db:
+        db.create_session("canonical", "cli")
+        assert db.set_session_title("canonical", "Bot Chat")
+    monkeypatch.setattr(profiles, "_get_default_hermes_home", lambda: root)
+    attempts = []
+
+    def unavailable_config():
+        with SessionDB(db_path=home / "state.db") as db:
+            messages = db.get_messages("canonical")
+            assert len(messages) == 1, "local notice must precede connector config"
+        attempts.append(True)
+        raise RuntimeError("external connector configuration unavailable")
+
+    monkeypatch.setattr("gateway.config.load_gateway_config", unavailable_config)
+    job = {"id": "mixed-watch", "name": "Mixed Watch", "deliver": targets,
+           "fire_claim": {"at": "2026-09-27T22:00:00Z", "by": "mini"}}
+    for _ in range(2):
+        error = sched._deliver_result(job, "one local notification")
+        assert "external connector configuration unavailable" in error
+    assert len(attempts) == 2
+    with SessionDB(db_path=home / "state.db") as db:
+        rows = db.get_messages("canonical")
+    assert len(rows) == 1
+    assert rows[0]["display_kind"] == "internal_notification"

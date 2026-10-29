@@ -471,6 +471,7 @@ export async function pluginSdkMock(host: Record<string, unknown>) {
     createBudgetedLoop: undefined,
     gatewayActivationEpoch: () => 0,
     GlyphSpinner: () => null,
+    createPromptSourceEventId: () => crypto.randomUUID(),
     host,
     CapabilitiesView: undefined,
     MessageTextContent: undefined,

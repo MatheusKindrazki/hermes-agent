@@ -426,6 +426,10 @@ def _respawn_dashboard_processes(commands: list[list[str]]) -> list[list[str]]:
     See #78821.
     """
     from hermes_constants import get_hermes_home
+    from hermes_cli._launchers import installation_command
+    from hermes_cli.dashboard_procs import _normalize_dashboard_cmdline
+    from hermes_cli.main import PROJECT_ROOT
+
     respawned: list[list[str]] = []
     spawned: list[tuple[list[str], list[str], subprocess.Popen]] = []
     failed: list[tuple[list[str], list[str], str]] = []
@@ -434,7 +438,7 @@ def _respawn_dashboard_processes(commands: list[list[str]]) -> list[list[str]]:
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
     for original in commands:
-        command = _respawnable_command_for_current_install(original)
+        command = installation_command(PROJECT_ROOT, _normalize_dashboard_cmdline(original))
         # Keep restarted dashboards headless; reopening a browser after a
         # background update is noisy and fails in SSH/headless sessions.
         if "dashboard" in command and "--no-open" not in command:

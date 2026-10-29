@@ -9,6 +9,8 @@ itself (that's covered by test_run_progress_topics.py et al.).
 """
 
 import asyncio
+import pytest
+import json
 import queue as queue_mod
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -19,6 +21,70 @@ from gateway.session import SessionSource
 from gateway.turn_context import TurnContext
 
 
+def _kernel_shadow_event():
+    return {
+        "schema": "hermes.kernel-shadow-event/v1",
+        "event_id": "evt-agent-1",
+        "work_id": "01a06c45-68ef-7d98-92cb-7225914a3437",
+        "authority_version": 7,
+        "tenant": "personal",
+        "profile": "kindra",
+        "source": "default",
+        "origin_session_id": "session-origin",
+        "source_event_id": "source-1",
+        "attempt_id": "01a06c46-68ef-7d98-92cb-7225914a3437",
+        "lease_epoch": 3,
+        "action": "delivery",
+        "delivery_id": "delivery-1",
+        "question_id": "",
+        "outcome": "delivered",
+        "adapter_receipt_sha256": "a" * 64,
+        "observed_at": 1_800_000_000,
+        "fence_valid": True,
+        "material": False,
+        "waiting_for_human": False,
+        "terminal": True,
+    }
+
+
+def test_kernel_shadow_receipt_is_content_free_atomic_and_private(tmp_path, monkeypatch):
+    from gateway.turn_context import write_kernel_shadow_receipt
+
+    spool = tmp_path / "shadow"
+    monkeypatch.setenv("HERMES_KERNEL_SHADOW_PRODUCER_ENABLED", "1")
+    monkeypatch.setenv("HERMES_KERNEL_SHADOW_RECEIPT_DIR", str(spool))
+    event = _kernel_shadow_event()
+    path = write_kernel_shadow_receipt(event)
+    assert path is not None
+    assert path.parent.stat().st_mode & 0o777 == 0o700
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert json.loads(path.read_text()) == event
+    assert not list(spool.glob("*.tmp.*"))
+
+
+def test_kernel_shadow_receipt_requires_source(tmp_path, monkeypatch):
+    from gateway.turn_context import write_kernel_shadow_receipt
+
+    monkeypatch.setenv("HERMES_KERNEL_SHADOW_PRODUCER_ENABLED", "1")
+    monkeypatch.setenv("HERMES_KERNEL_SHADOW_RECEIPT_DIR", str(tmp_path / "shadow"))
+    event = _kernel_shadow_event()
+    event.pop("source")
+
+    with pytest.raises(ValueError, match="kernel_shadow_event_fields_invalid"):
+        write_kernel_shadow_receipt(event)
+
+
+def test_kernel_shadow_receipt_is_double_default_off_and_rejects_content(tmp_path, monkeypatch):
+    from gateway.turn_context import write_kernel_shadow_receipt
+
+    monkeypatch.setenv("HERMES_KERNEL_SHADOW_RECEIPT_DIR", str(tmp_path / "shadow"))
+    assert write_kernel_shadow_receipt({}) is None
+    assert not (tmp_path / "shadow").exists()
+    monkeypatch.setenv("HERMES_KERNEL_SHADOW_PRODUCER_ENABLED", "1")
+    with pytest.raises(ValueError, match="kernel_shadow_event_fields_invalid"):
+        write_kernel_shadow_receipt({"message": "must never be persisted"})
+
+
 def _make_runner(ctx):
     from gateway.run_turn_runner import TurnRunner
 
@@ -27,6 +93,60 @@ def _make_runner(ctx):
             return None
 
     return TurnRunner(_StubGatewayRunner(), ctx)
+
+
+def test_effect_origin_explicit_executor_scope_resets_on_failure(monkeypatch):
+    from agent import durable_admission as da
+    from gateway.run import GatewayRunner
+
+    monkeypatch.setenv(da.ENV_MODE, "observe")
+    monkeypatch.setattr(da, "_settings", lambda: {"mode": "observe", "tenant": "personal", "machine": "mini", "profile": "default"})
+    monkeypatch.setattr(da, "_active_profile", lambda: "default")
+    origin = da.capture_effect_origin("origin-session", "telegram:456")
+    assert origin is not None and origin.profile == "default"
+    runner = _make_runner(TurnContext(effect_origin=origin, user_config={}))
+    def body():
+        assert da.current_effect_origin() is origin
+        raise RuntimeError("turn failed")
+    monkeypatch.setattr(runner, "_run_sync_with_policy", body)
+    async def exercise():
+        gateway = GatewayRunner.__new__(GatewayRunner)
+        with pytest.raises(RuntimeError, match="turn failed"):
+            await gateway._run_in_executor_with_context(runner.run_sync)
+        assert da.current_effect_origin() is None
+        assert await gateway._run_in_executor_with_context(da.current_effect_origin) is None
+    asyncio.run(exercise())
+
+
+def test_observation_heartbeat_is_idle_local_and_stops(monkeypatch, tmp_path):
+    from agent import durable_admission as da
+    from gateway.run import GatewayRunner
+    import hermes_cli.version_info
+    monkeypatch.setenv(da.ENV_MODE, "observe")
+    monkeypatch.setenv("HERMES_KERNEL_SHADOW_RECEIPT_DIR", str(tmp_path / "receipts"))
+    monkeypatch.setattr(da, "_settings", lambda: {"mode": "observe", "tenant": "personal", "machine": "mini", "profile": "default", "observation": {"code_sha": "a" * 40}})
+    monkeypatch.setattr(da, "_active_profile", lambda: "default")
+    monkeypatch.setattr(hermes_cli.version_info, "get_code_identity", lambda: {"sha": "a" * 40})
+    monkeypatch.setattr(da, "_OBSERVER", None)
+    monkeypatch.setattr(da.subprocess, "run", lambda *a, **k: pytest.fail("heartbeat authority call"))
+    gateway = GatewayRunner.__new__(GatewayRunner)
+    gateway._running = True
+    gateway._background_tasks = set()
+    intervals = []
+    async def sleep(interval):
+        intervals.append(interval)
+        gateway._running = False
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    async def exercise():
+        gateway._start_observation_task()
+        await gateway._observation_task
+    asyncio.run(exercise())
+    record = json.loads((tmp_path / "receipts/observation-channel.json").read_text())
+    assert record["profile"] == "default"
+    assert intervals == [30]
+    assert record["state"] == "stopped" and record["sequence"] == 3
+    assert record["last_effect_sequence"] == 0
+    assert record["valid_until"] - record["checked_at"] == 120
 
 
 class TestTurnContext:

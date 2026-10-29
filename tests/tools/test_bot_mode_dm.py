@@ -71,6 +71,33 @@ class _FakeAgent:
         self.valid_tool_names: set = set()
 
 
+def test_observe_admission_failure_delivers_once_with_durable_gap(tmp_path, monkeypatch):
+    from agent import durable_admission as da
+
+    home = _managed_home(tmp_path)
+    agent = _FakeAgent(home)
+    monkeypatch.setattr(bot_mode_dm.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setenv(da.ENV_MODE, "observe")
+    monkeypatch.setattr(da, "_settings", lambda: {"tenant": "personal", "machine": "mini", "profile": "default"})
+    monkeypatch.setattr(da, "_active_profile", lambda: "default")
+    writer = da.ObservationWriter(tmp_path / "receipts", code_sha="a" * 40)
+    monkeypatch.setattr(da, "_OBSERVER", writer)
+    writer.checkpoint()
+    calls = []
+    monkeypatch.setattr(da, "admit_observed_effect", lambda obs: (_ for _ in ()).throw(RuntimeError("observer failed")))
+    monkeypatch.setattr(bot_mode_dm, "_spawn_delivery", lambda *a, **kw: calls.append(kw["receipt"]) or json.dumps({"status": "accepted"}))
+    origin = da.capture_effect_origin("chat-original", "telegram:123")
+    with da.effect_origin_scope(origin):
+        first = json.loads(bot_mode_dm._start_delivery(["hermes"], "body", "target", stdin_file=False, task_id=None, agent=agent))
+        replay = json.loads(bot_mode_dm._start_delivery(["hermes"], "body", "target", stdin_file=False, task_id=None, agent=agent))
+    assert first["status"] == replay["status"] == "accepted"
+    assert len(calls) == 1
+    assert calls[0]["origin_session_id"] == "chat-original"
+    assert da._UUID7_RE.fullmatch(calls[0]["release_event_id"])
+    effect = json.loads(next((writer.root / "observation-effects").glob("*.json")).read_text())
+    assert effect["state"] == "gap" and effect["gap_reason"] == "admission_failed"
+
+
 # ── injection gate (leak containment) ────────────────────────────────────────
 
 
@@ -186,6 +213,25 @@ def test_unknown_target_lists_roster(tmp_path):
     )
     assert "error" in result
     assert set(result["teammates"]) == {"researcher", "coder"}
+
+
+def test_desktop_relay_is_fail_closed_under_enforce(monkeypatch, tmp_path):
+    home = _managed_home(tmp_path, teammates=("researcher",))
+    agent = _FakeAgent(home, title="Bot Chat")
+    monkeypatch.setattr(bot_mode_dm, "_resolve_local_name", lambda *_: None)
+    monkeypatch.setattr("agent.durable_admission.admission_enabled", lambda: True)
+    revalidated = []
+    monkeypatch.setattr(
+        "agent.durable_admission.revalidate_current_turn_identity",
+        lambda: revalidated.append(True) or ({"request_key": "request-key"}, {"fence_valid": True}),
+    )
+    monkeypatch.setattr(
+        bot_mode_dm, "_try_relay_delivery",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("relay enqueued")),
+    )
+    result = json.loads(bot_mode_dm.message_agent_tool(target="remote@desktop", message="hi", agent=agent))
+    assert "error" in result and "ack" in result["error"].lower()
+    assert revalidated == [True]
 
 
 def test_cannot_message_self(tmp_path):
@@ -312,16 +358,100 @@ def _runner_author(command):
     return json.loads(parts[marker + 2])
 
 
+def _control_sender_cli(tmp_path, monkeypatch, scenario):
+    from tools import bot_relay
+
+    runtime = tmp_path / "controlled runtime with spaces"
+    python = runtime / "python3.12"
+    monkeypatch.setattr(sys, "executable", str(python))
+    monkeypatch.setattr(bot_relay, "__file__", str(tmp_path / "tools" / "bot_relay.py"))
+    monkeypatch.setattr(bot_relay.shutil, "which", lambda _name: None)
+    if scenario == "sibling":
+        runtime.mkdir()
+        python.write_text("", encoding="utf-8")
+        sibling = runtime / "hermes"
+        sibling.write_text("", encoding="utf-8")
+        sibling.chmod(0o700)
+        return str(sibling)
+    return "hermes"
+
+
+@pytest.mark.parametrize(
+    ("target_profile", "sender_profile"),
+    [("default", "sender"), ("researcher", None), ("openai", None)],
+)
+def test_public_local_delivery_resolves_sibling_cli_with_empty_path(
+    tmp_path, monkeypatch, target_profile, sender_profile
+):
+    calls = _capture_spawn(monkeypatch)
+    teammates = tuple(
+        name for name in (target_profile, sender_profile) if name != "default" and name
+    )
+    home = _managed_home(tmp_path, teammates=teammates)
+    _canonical_target(monkeypatch, home if target_profile == "default" else home / "profiles" / target_profile)
+    agent_home = home / "profiles" / sender_profile if sender_profile else home
+    agent = _FakeAgent(agent_home, title="Bot Chat")
+    runtime = tmp_path / "runtime with spaces"
+    runtime.mkdir()
+    python = runtime / "python3.12"
+    python.write_text("", encoding="utf-8")
+    sibling = runtime / "hermes"
+    sibling.write_text("#!/bin/sh\n", encoding="utf-8")
+    sibling.chmod(0o700)
+    monkeypatch.setattr(sys, "executable", str(python))
+    monkeypatch.setattr(bot_relay, "__file__", str(tmp_path / "tools" / "bot_relay.py"))
+    monkeypatch.setenv("PATH", "")
+
+    target = "hermes" if target_profile == "default" else target_profile
+    result = json.loads(
+        bot_mode_dm.message_agent_tool(target=target, message="ping", agent=agent)
+    )
+
+    assert result["status"] == "queued"
+    _mode, _dm_file, transport_argv, _profile_home = _runner_parts(calls[0]["command"])
+    assert transport_argv[0] == str(sibling)
+    assert transport_argv[1:] == [
+        "-p",
+        target_profile,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("which_result", "expected"),
+    [("/resolved path/hermes", "/resolved path/hermes"), (None, "hermes")],
+)
+def test_public_peer_delivery_uses_which_then_bare_fallback(
+    tmp_path, monkeypatch, which_result, expected
+):
+    from tools import bot_relay
+
+    calls = _capture_spawn(monkeypatch)
+    home = _managed_home(tmp_path, peers=("spark",))
+    agent = _FakeAgent(home, title="Bot Chat")
+    monkeypatch.setattr(sys, "executable", str(tmp_path / "missing runtime" / "python"))
+    monkeypatch.setattr(bot_relay, "__file__", str(tmp_path / "tools" / "bot_relay.py"))
+    monkeypatch.setattr(bot_relay.shutil, "which", lambda name: which_result)
+
+    result = json.loads(
+        bot_mode_dm.message_agent_tool(
+            target="spark/researcher", message="ping", agent=agent
+        )
+    )
+
+    assert result["status"] == "queued"
+    mode, _dm_file, transport_argv, _profile_home = _runner_parts(calls[0]["command"])
+    assert mode == "stdin"
+    assert transport_argv == [expected, "-p", "default", "peer", "dm", "spark/researcher"]
+
+
 def test_local_delivery_admits_canonically_and_acks(tmp_path, monkeypatch):
     calls = _capture_spawn(monkeypatch)
-    # These assertions target the -p/turn-args shape; pin the entrypoint resolution
-    # so the test stays hermetic across venvs that do/don't expose a sibling script.
-    monkeypatch.setattr(bot_relay, "_hermes_cli", lambda: "hermes")
     home = _managed_home(tmp_path, teammates=("researcher",))
     target = home / "profiles" / "researcher"
     authority = _canonical_target(monkeypatch, target)
     monkeypatch.setattr(bot_mode_dm, "_dm_dir", lambda: tmp_path)
     agent = _FakeAgent(home, title="Bot Chat")
+    monkeypatch.setattr(bot_relay, "_hermes_cli", lambda: "hermes")
 
     result = json.loads(
         bot_mode_dm.message_agent_tool(
@@ -516,12 +646,13 @@ def test_peer_delivery_command_pins_registry_profile_for_secondary_bots(
     assert transport_argv == ["hermes", "-p", "default", "peer", "dm", "spark"]
 
 
-def test_peer_delivery_command(tmp_path, monkeypatch):
+@pytest.mark.parametrize("cli_scenario", ["bare", "sibling"])
+def test_peer_delivery_command(tmp_path, monkeypatch, cli_scenario):
     calls = _capture_spawn(monkeypatch)
-    monkeypatch.setattr(bot_relay, "_hermes_cli", lambda: "hermes")
     monkeypatch.setattr("socket.gethostname", lambda: "eri-mac.local")
     home = _managed_home(tmp_path, peers=("spark",))
     agent = _FakeAgent(home, title="Bot Chat")
+    expected_cli = _control_sender_cli(tmp_path, monkeypatch, cli_scenario)
 
     result = json.loads(
         bot_mode_dm.message_agent_tool(target="spark/researcher", message="ping", agent=agent)
@@ -530,7 +661,7 @@ def test_peer_delivery_command(tmp_path, monkeypatch):
     assert "spark" in result["to"]
     mode, _dm_file, transport_argv, _home = _runner_parts(calls[0]["command"])
     assert mode == "stdin"
-    assert transport_argv == ["hermes", "-p", "default", "peer", "dm", "spark/researcher"]
+    assert transport_argv == [expected_cli, "-p", "default", "peer", "dm", "spark/researcher"]
     # the peer child reads the author from its env and forwards it in the request body
     assert _runner_author(calls[0]["command"]) == {"id": "bot:eri-mac.local/default", "name": "hermes", "is_bot": True}
 
@@ -541,7 +672,7 @@ def test_peer_delivery_command(tmp_path, monkeypatch):
     assert result2["status"] == "queued"
     mode, _dm_file, transport_argv, _home = _runner_parts(calls[1]["command"])
     assert mode == "stdin"
-    assert transport_argv == ["hermes", "-p", "default", "peer", "dm", "spark"]
+    assert transport_argv == [expected_cli, "-p", "default", "peer", "dm", "spark"]
 
 
 def test_delivery_pins_the_hermes_entrypoint_beside_this_interpreter(tmp_path, monkeypatch):
@@ -851,6 +982,95 @@ def test_peer_delivery_runner_preserves_child_failure_and_unlinks(tmp_path):
     assert not dm_file.exists()
 
 
+@pytest.mark.parametrize("enforced", [False, True])
+def test_unknown_toolset_warning_does_not_break_structured_delivery_ack(
+    tmp_path, monkeypatch, capsys, enforced
+):
+    import cli
+
+    dm_file = tmp_path / "message.txt"
+    dm_file.write_text("private", encoding="utf-8")
+    identity = {"request_key": "request-quiet-1", "source": "default"}
+    identity_sha = bot_mode_dm._canonical_sha256(identity)
+    monkeypatch.setattr(
+        bot_mode_dm, "_delivery_ledger_path", lambda _key: tmp_path / "ledger.json"
+    )
+    receipt = bot_mode_dm._write_delivery_receipt(
+        str(dm_file),
+        origin_session_id="origin-exact",
+        origin_reason="explicit",
+        route_reason="origin_exact",
+        label="@researcher",
+        idempotency_key="a" * 64,
+        turn_identity=identity,
+        fence={"fence_valid": True},
+        enforced_effect=enforced,
+    )
+    ack = {
+        "schema": bot_mode_dm.DELIVERY_ACK_SCHEMA,
+        "delivery_id": receipt["delivery_id"],
+        "request_key": identity["request_key"],
+        "turn_identity_sha256": identity_sha,
+        "target_session_id": "target-session",
+        "target_message_id": 42,
+        "adapter": "cli",
+        "state": "persisted",
+        "accepted_at": receipt["accepted_at"],
+        "persisted_at": receipt["accepted_at"] + 1,
+    }
+    payload = {"reply": "ok", "session_id": "target-session", "delivery_ack": ack}
+
+    # Use a guaranteed invalid name: installed plugins may legitimately register a2a.
+    invalid_toolset = "unknown_delivery_ack_regression_toolset"
+    assert cli.validate_toolset(invalid_toolset) is False
+    cli_instance = cli.HermesCLI(toolsets=[invalid_toolset])
+    print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+    startup = capsys.readouterr()
+    assert json.loads(startup.out) == payload
+    assert "Warning: Unknown toolsets:" not in startup.out
+    session_db = getattr(cli_instance, "_session_db", None)
+    if session_db is not None:
+        session_db.close()
+
+    monkeypatch.setattr(
+        bot_mode_dm,
+        "_revalidate_delivery_identity",
+        lambda _record: {"fence_valid": True, "identity_sha256": identity_sha},
+    )
+    monkeypatch.setattr(
+        bot_mode_dm, "_validate_local_ack_against_destination", lambda *_args: None
+    )
+    monkeypatch.setattr(
+        bot_mode_dm.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=startup.out, stderr=startup.err
+        ),
+    )
+
+    settled = []
+    def settle(record, path, ack, *, ack_row_validated):
+        settled.append(ack_row_validated)
+    monkeypatch.setattr(bot_mode_dm, "_settle_enforced_delivery", settle)
+    assert (
+        bot_mode_dm._run_delivery(
+            ["hermes", "-p", "researcher", "chat"],
+            str(dm_file),
+            stdin_file=False,
+        )
+        == 0
+    )
+    assert settled == ([True] if enforced else [])
+    delivered = capsys.readouterr()
+    assert delivered.out == "ok"
+    assert delivered.err == startup.err
+
+
+@pytest.mark.parametrize("args", [[], ["--run-delivery"], ["--run-delivery", "bad", "x"]])
+def test_delivery_main_rejects_invalid_cli(args):
+    assert bot_mode_dm._delivery_main(args) == 2
+
+
 def test_local_delivery_runner_surfaces_refusal_and_retains_payload(tmp_path, monkeypatch, capsys):
     """A local delivery with no canonical authority is a FAILURE the sender can
     read — typed reason, payload retained — never a CLI turn of its own."""
@@ -995,6 +1215,37 @@ def test_real_peer_delivery_command_round_trip(tmp_path):
 
     assert result.returncode == 0
     assert observed.read_text(encoding="utf-8") == "secret λ\nsecond line"
+    assert not dm_file.exists()
+
+
+@pytest.mark.parametrize("stdin_file", [True])
+def test_delivery_child_imports_the_runner_release(tmp_path, monkeypatch, stdin_file):
+    """A borrowed venv must not send the envelope to its old editable install."""
+    stale = tmp_path / "stale"
+    (stale / "hermes_cli").mkdir(parents=True)
+    (stale / "hermes_cli" / "__init__.py").write_text("")
+    (stale / "user_extension.py").write_text("VALUE = 42")
+    child = tmp_path / "transport.py"
+    observed = tmp_path / "observed.json"
+    child.write_text(
+        "import importlib.util, json, pathlib, user_extension\n"
+        "pathlib.Path(" + repr(str(observed)) + ").write_text(json.dumps({"
+        "'origin': importlib.util.find_spec('hermes_cli').origin, "
+        "'extension': user_extension.VALUE}))\n"
+    )
+    dm_file = tmp_path / "message.txt"
+    dm_file.write_text("runtime canary")
+    monkeypatch.setenv("PYTHONPATH", str(stale))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    command = bot_mode_dm._delivery_command(
+        [sys.executable, str(child)], str(dm_file), stdin_file=stdin_file
+    )
+    result = subprocess.run(shlex.split(command), cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+    body = json.loads(observed.read_text())
+    expected = Path(bot_mode_dm.__file__).resolve().parents[1] / "hermes_cli" / "__init__.py"
+    assert Path(body["origin"]).resolve() == expected
+    assert body["extension"] == 42
     assert not dm_file.exists()
 
 
@@ -1152,6 +1403,15 @@ def test_dm_dir_rejects_precreated_symlink(tmp_path, monkeypatch):
 
     with pytest.raises(PermissionError, match="not a directory"):
         bot_mode_dm._dm_dir()
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-8-sig"])
+def test_delivery_receipt_reads_unicode_and_rewrites_without_bom(tmp_path, encoding):
+    dm_file = tmp_path / "message.txt"
+    receipt = Path(str(dm_file) + ".receipt.json")
+    receipt.write_text(json.dumps({"note": "ação 日本語"}, ensure_ascii=False), encoding=encoding)
+    bot_mode_dm._update_delivery_receipt(str(dm_file), "accepted")
+    document = json.loads(receipt.read_text(encoding="utf-8"))
+    assert document == {"note": "ação 日本語", "state": "accepted", "updated_at": document["updated_at"]}
+    assert not receipt.read_bytes().startswith(b"\xef\xbb\xbf")
 
 
 def test_cleanup_sweeps_stale_live_intents_and_keeps_fresh_ones(tmp_path, monkeypatch):
@@ -1311,3 +1571,146 @@ def test_poll_reply_is_persisted_as_a_delivery_row_when_the_runner_exits(tmp_pat
     assert kw["display_kind"] == "process_complete"
     assert "PAYLOAD_SENTINEL_42" in kw["content"]
     assert procs[0].id in kw["content"]
+
+
+def test_local_turn_survives_undecodable_transport_output(tmp_path, capsys):
+    """A transport that exits 0 while printing a non-UTF-8 byte must still deliver.
+
+    A strict decode raised UnicodeDecodeError inside subprocess.run — a ValueError, so no
+    handler caught it and the delivery crashed instead of re-emitting the transport's
+    streams (stdout is the reply text the completion notification carries back).
+    """
+    dm_file = tmp_path / "dm.txt"
+    dm_file.write_text("hello", encoding="utf-8")
+    argv = [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'reply \\377')"]
+
+    assert bot_mode_dm._run_local_turn(argv, str(dm_file)) == 0
+    assert "reply" in capsys.readouterr().out
+
+
+def test_local_turn_relays_utf8_reply_under_a_gbk_default_codec(tmp_path, monkeypatch, capsys):
+    """#83851: the transport is a Hermes CLI child, which always writes UTF-8 stdio. Decoding it with
+    the host's default codec (cp936 on zh-CN Windows) crashed or garbled the reply; it must round-trip."""
+    dm_file = tmp_path / "dm.txt"
+    dm_file.write_text("hello", encoding="utf-8")
+    reply = "✅ 已完成…"
+    argv = [sys.executable, "-c", f"import sys; sys.stdout.buffer.write({reply.encode('utf-8')!r})"]
+    # subprocess resolves an unspecified text-mode codec through _text_encoding() → locale.getencoding();
+    # patch that seam since run_tests.sh's PYTHONUTF8=1 short-circuits the locale lookup.
+    monkeypatch.setattr(subprocess, "_text_encoding", lambda: "gbk")
+
+    assert bot_mode_dm._run_local_turn(argv, str(dm_file)) == 0
+    assert reply in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("boundary", ["origin", "queue", "observation"])
+def test_live_owner_cannot_bypass_fork_delivery_contract(tmp_path, monkeypatch, boundary):
+    """A live Desktop consumer must not swallow an exact route or the fork's ACK ledger."""
+    from tools import bot_delivery_queue as queue
+
+    home = _managed_home(tmp_path)
+    agent = _FakeAgent(home)
+    monkeypatch.setattr(bot_mode_dm, "_dm_dir", lambda: tmp_path)
+    monkeypatch.setattr(queue, "enabled", lambda _: boundary == "queue")
+    monkeypatch.setattr(bot_mode_dm, "_admit_live_dm", lambda *a: pytest.fail("live admission bypass"))
+    monkeypatch.setattr(bot_mode_dm, "_spawn_delivery", lambda *a, **kw: json.dumps(kw["receipt"]))
+    # A non-CLI argv keeps this assertion focused on the routing guard; queue
+    # enqueue/worker behavior is separately exercised by the real queue tests.
+    result = json.loads(bot_mode_dm._start_delivery_inner(
+        ["transport"], "hi", "@researcher", stdin_file=False, task_id=None, agent=agent,
+        origin_session_id="explicit" if boundary == "origin" else None,
+        profile_home=home / "profiles" / "researcher",
+        _observation={"effect": {"effect_id": "test"}} if boundary == "observation" else None,
+    ))
+    assert result["state"] == "accepted"
+    assert result["origin_session_id"] == ("explicit" if boundary == "origin" else "sess-1")
+
+
+def test_queue_receipt_preserves_recipient_home_and_turn_author(tmp_path, monkeypatch):
+    """The durable worker calls the runner with a receipt, without author CLI flags."""
+    from agent.turn_author import TURN_AUTHOR_ENV
+
+    monkeypatch.setattr(bot_mode_dm, "_dm_dir", lambda: tmp_path)
+    dm_file = tmp_path / "dm.txt"
+    dm_file.write_text("hello", encoding="utf-8")
+    author = {"id": "bot:chief", "name": "chief", "is_bot": True}
+    target = tmp_path / "profiles" / "staff"
+    target.mkdir(parents=True)
+    receipt = bot_mode_dm._write_delivery_receipt(
+        str(dm_file), origin_session_id="origin", origin_reason="explicit",
+        route_reason="canonical_title_fallback", label="@staff", idempotency_key="e" * 64,
+        author=author, profile_home=target,
+    )
+    assert receipt["turn_author"] == author
+    seen = []
+    monkeypatch.setattr(bot_mode_dm, "_admit_live_dm", lambda home, path, author: seen.append((home, author)) or {"profile_home": str(home), "delivery_id": "native-id"})
+    monkeypatch.setattr(bot_mode_dm, "_wait_live_dm", lambda *args, **kwargs: 0)
+    assert bot_mode_dm._run_delivery(["transport"], str(dm_file), stdin_file=False, lock_held=True) == 0
+    assert seen[0][1] == author
+    assert Path(seen[0][0]) == target
+
+
+def test_ambiguous_live_admission_retains_payload_for_same_delivery_id(tmp_path, monkeypatch, capsys):
+    dm_file = tmp_path / "dm.txt"
+    dm_file.write_text("hello", encoding="utf-8")
+    intent = Path(str(dm_file) + ".live.json")
+    intent.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(bot_mode_dm, "_admit_live_dm", lambda *a: (_ for _ in ()).throw(OSError("lost ack")))
+    assert bot_mode_dm._run_delivery(["transport"], str(dm_file), stdin_file=False) == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "ambiguous"
+    assert dm_file.exists() and intent.exists()
+
+
+def test_dispatch_rechecks_disabled_protocol_even_inside_bot_chat(tmp_path, monkeypatch):
+    agent = _FakeAgent(_managed_home(tmp_path))
+    agent._bot_mode_protocol = False
+    monkeypatch.setattr(bot_mode_dm, "_start_delivery", lambda *a, **kw: pytest.fail("disabled dispatch"))
+    result = json.loads(bot_mode_dm.message_agent_tool("researcher", "hello", agent=agent))
+    assert "disabled" in result["error"]
+
+
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-8-sig"])
+def test_structured_peer_delivery_consumes_bom_before_stdin(tmp_path, monkeypatch, capsys, encoding):
+    monkeypatch.setattr(bot_mode_dm, "_dm_dir", lambda: tmp_path)
+    dm_file = tmp_path / "dm.txt"
+    dm_file.write_text("ação 日本語", encoding=encoding)
+    identity = {"request_key": "request-bom-1", "source": "default"}
+    record = bot_mode_dm._write_delivery_receipt(
+        str(dm_file), origin_session_id="origin", origin_reason="explicit",
+        route_reason="peer", label="@peer", idempotency_key="b" * 64,
+        turn_identity=identity, fence={"fence_valid": True},
+    )
+    sidecar = Path(str(dm_file) + ".receipt.json")
+    sidecar.write_text(sidecar.read_text(encoding="utf-8"), encoding=encoding)
+    monkeypatch.setattr(bot_mode_dm, "_revalidate_delivery_identity", lambda _: {
+        "fence_valid": True, "identity_sha256": bot_mode_dm._canonical_sha256(identity)})
+    ack = {"schema": bot_mode_dm.DELIVERY_ACK_SCHEMA, "delivery_id": record["delivery_id"],
+           "request_key": identity["request_key"], "turn_identity_sha256": bot_mode_dm._canonical_sha256(identity),
+           "target_session_id": "peer-session", "target_message_id": 1, "adapter": "api_server",
+           "state": "persisted", "accepted_at": record["accepted_at"], "persisted_at": record["accepted_at"] + 1}
+    def transport(argv, **kwargs):
+        assert "--delivery-envelope-file" in argv
+        assert kwargs.get("input") == "ação 日本語"
+        assert "stdin" not in kwargs  # passing a descriptor bypasses the BOM decoder
+        return subprocess.CompletedProcess(argv, 0, json.dumps({"reply": "ok", "session_id": "peer-session", "delivery_ack": ack}), "")
+    monkeypatch.setattr(bot_mode_dm.subprocess, "run", transport)
+    assert bot_mode_dm._run_delivery(["hermes", "peer", "dm", "peer"], str(dm_file), stdin_file=True) == 0
+    assert capsys.readouterr().out == "ok"
+
+
+@pytest.mark.parametrize("status, expected", [("settled", "delivered"), ("queued", "unknown"), ("claimed", "unknown"), ("ambiguous", "unknown"), ("failed", "failed")])
+def test_live_delivery_receipt_requires_settlement(tmp_path, monkeypatch, status, expected):
+    path = tmp_path / 'input.txt'
+    path.write_text('original input')
+    receipt = {"profile_home": str(tmp_path), "delivery_id": "a" * 32, "origin_session_id": "sender"}
+    Path(str(path) + '.receipt.json').write_text(json.dumps(receipt))
+    monkeypatch.setattr(bot_mode_dm, '_admit_live_dm', lambda *args: {"profile_home": str(tmp_path), "delivery_id": "a" * 32})
+    def wait(*args, on_result, **kwargs):
+        on_result(status)
+        return 0 if status in ('settled', 'queued', 'claimed') else 1
+    monkeypatch.setattr(bot_mode_dm, '_wait_live_dm', wait)
+    states = []
+    monkeypatch.setattr(bot_mode_dm, '_update_delivery_receipt', lambda path, state, **kwargs: states.append(state))
+    bot_mode_dm._run_delivery(['hermes', '-p', 'default'], str(path), stdin_file=False)
+    assert states == [expected]

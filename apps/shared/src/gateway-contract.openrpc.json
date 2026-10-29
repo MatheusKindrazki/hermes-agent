@@ -32232,6 +32232,18 @@
             "default": "",
             "title": "Text"
           },
+          "source_event_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Source Event Id"
+          },
           "display_kind": {
             "anyOf": [
               {

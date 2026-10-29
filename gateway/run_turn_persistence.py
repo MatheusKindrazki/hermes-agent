@@ -324,7 +324,7 @@ class GatewayTurnPersistenceMixin:
         return agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure
 
     async def _hmwa_compression_exhaustion_reset(
-        self, agent_result, response, session_entry, session_key, source,
+        self, agent_result, response, session_entry, session_key, source, *, event=None, handoff_content=None,
     ):
         """Auto-reset a permanently oversized session so the next message starts fresh instead of
         replaying the oversized context forever. Never on a lock-contended defer — that is the
@@ -347,12 +347,12 @@ class GatewayTurnPersistenceMixin:
             logger.info("Keeping API session %s after compression exhaustion.",
                         session_entry.session_id if session_entry else "?")
         elif agent_result.get("compression_exhausted") and session_entry and session_key:
-            if not self._hmwa_defer_exhaustion_reset(session_entry, session_key, source):
-                session_entry = await self._hmwa_rotate_exhausted_session(session_entry, session_key, source)
+            if not self._hmwa_defer_exhaustion_reset(session_entry, session_key, source, event=event, handoff_content=handoff_content):
+                session_entry = await self._hmwa_rotate_exhausted_session(session_entry, session_key, source, event=event, handoff_content=handoff_content)
             response = (response or "") + t("gateway.session.auto_reset_context_exhausted")
         return response, session_entry
 
-    def _hmwa_defer_exhaustion_reset(self, session_entry, session_key, source):
+    def _hmwa_defer_exhaustion_reset(self, session_entry, session_key, source, *, event=None, handoff_content=None):
         """True when the reset was handed to the authority drain. A LOCAL session (the Bot Chat a
         ``hermes peer dm`` lands in) resets its target in the store, which refuses while an admission
         on it is started (``session_busy``): this turn's own. The drain runs the reset right after it
@@ -365,10 +365,10 @@ class GatewayTurnPersistenceMixin:
         if authority is None:
             return False
         authority.deferred_resets[session_key] = lambda: self._hmwa_rotate_exhausted_session(
-            session_entry, session_key, source)
+            session_entry, session_key, source, event=event, handoff_content=handoff_content)
         return True
 
-    async def _hmwa_rotate_exhausted_session(self, session_entry, session_key, source):
+    async def _hmwa_rotate_exhausted_session(self, session_entry, session_key, source, *, event=None, handoff_content=None):
         """The compression-exhaustion auto-reset itself; returns the route's (fresh) entry."""
         logger.info("Auto-resetting session %s after compression exhaustion.", session_entry.session_id)
         from gateway.session_automation import move_route_wakes, reset_and_rehome_messages
@@ -385,6 +385,12 @@ class GatewayTurnPersistenceMixin:
             if queued:
                 self._session_state(session_key).conversation.queued_events.extend(queued)
             if new_entry is not None:
+                if event is not None:
+                    await self._persist_compression_handoff(
+                        new_entry, event=event,
+                        content=handoff_content if handoff_content is not None else event.text,
+                        source_session_id=session_entry.session_id,
+                    )
                 # Re-point the Telegram topic binding at the fresh session, or the binding-heal walk
                 # switches the next message back onto the bloated child and re-triggers exhaustion
                 # forever. No-op on non-topic lanes.

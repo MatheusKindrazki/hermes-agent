@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import inspect
 import ipaddress
+import json
 import logging
 import math
 import os
@@ -4197,6 +4198,24 @@ class BasePlatformAdapter(ABC):
             and event.message_type == MessageType.VOICE and text_content and not media_files
             and not self._streaming_tts_turn_completed(session_key, generation, event=event))
 
+    async def _deliver_final_native(self, adapter, method_name: str, *, action: str,
+                                    event_type: str, **kwargs):
+        """Apply the fork's final-delivery policy before the native transport."""
+        from gateway.external_egress import deliver_external_action
+        metadata = kwargs.pop("metadata", None)
+        payload = {"action": method_name, **kwargs}
+
+        async def deliver(prepared_metadata):
+            return await getattr(adapter, method_name)(**kwargs, metadata=prepared_metadata)
+
+        return await deliver_external_action(
+            owner=self, adapter=adapter, chat_id=kwargs["chat_id"], action=action,
+            content=json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(),
+            payload=payload, metadata=metadata, event_type=event_type,
+            milestone="turn-complete" if action == "send" else "media-delivery",
+            deliver=deliver,
+        )
+
     async def _play_tts_file(
         self, event: MessageEvent, text_content: str, tts_path: str, first: bool,
         metadata: dict[str, Any], record_delivery: Callable) -> bool:
@@ -4205,7 +4224,7 @@ class BasePlatformAdapter(ABC):
         caption = None
         if first and self.platform == Platform.TELEGRAM and text_content and text_content[:1024] == text_content:
             caption = text_content
-        tts_result = await self.play_tts(
+        tts_result = await self._deliver_final_native(self, "play_tts", action="send_media", event_type="gateway_adapter_auto_tts",
             chat_id=event.source.chat_id, audio_path=tts_path, caption=caption, metadata=metadata)
         record_delivery(tts_result)
         return bool(caption and getattr(tts_result, "success", False))
@@ -4300,14 +4319,14 @@ class BasePlatformAdapter(ABC):
             do."""
             ext = Path(path).suffix.lower()
             if media_tag and should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
-                result = await self.send_voice(chat_id=chat_id, audio_path=path, metadata=metadata, is_voice=is_voice)
+                result = await self._deliver_final_native(self, "send_voice", action="send_media", event_type="gateway_adapter_media", chat_id=chat_id, audio_path=path, metadata=metadata, is_voice=is_voice)
             elif ext in _VIDEO_EXTS:
                 if media_tag:
                     logger.info("[%s] Sending video attachment (%s) to %s", self.name, ext, chat_id)
-                result = await self.send_video(chat_id=chat_id, video_path=path, metadata=metadata)
+                result = await self._deliver_final_native(self, "send_video", action="send_media", event_type="gateway_adapter_media", chat_id=chat_id, video_path=path, metadata=metadata)
             else:
-                result = await self.send_document(chat_id=chat_id, file_path=path, metadata=metadata)
-            if not result.success:
+                result = await self._deliver_final_native(self, "send_document", action="send_media", event_type="gateway_adapter_media", chat_id=chat_id, file_path=path, metadata=metadata)
+            if not result.success and getattr(result, "error_kind", None) != "egress_policy_rejected":
                 logger.warning("[%s] Failed to send %s (%s): %s", self.name,
                                "media" if media_tag else "local file", ext, result.error)
                 await self._notify_media_delivery_failure(chat_id, path, is_voice=is_voice, metadata=metadata)
@@ -4335,7 +4354,7 @@ class BasePlatformAdapter(ABC):
         The batch result feeds ``record_delivery`` so media-only turns report their real
         outcome instead of FAILURE."""
         try:
-            result = await self.send_multiple_images(
+            result = await self._deliver_final_native(self, "send_multiple_images", action="send_media", event_type="gateway_adapter_media",
                 chat_id=event.source.chat_id, images=images, metadata=metadata, human_delay=human_delay)
         except Exception as batch_err:
             logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
@@ -4361,7 +4380,7 @@ class BasePlatformAdapter(ABC):
             event, session_key, text_content, delivery_adapter, is_ephemeral_response)
         if obligation_id is not None:
             await self._release_turn_marker(event)  # the ledger now owns the crash recovery
-        result = await delivery_adapter._send_with_retry(
+        result = await self._deliver_final_native(delivery_adapter, "_send_with_retry", action="send", event_type="gateway_adapter_final",
             chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
         stop_reply_clock(delivery_adapter, event.source.chat_id, result)
         if obligation_id is not None:

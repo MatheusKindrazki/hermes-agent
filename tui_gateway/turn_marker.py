@@ -14,6 +14,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 from utils import atomic_json_write
@@ -122,7 +123,7 @@ def _update(home: Path | str, session_key: str, mutate, what: str) -> None:
 
 
 def record_turn_start(home: Path | str, session_key: str, prompt: str, *, attempts: int = 0,
-                      auto_continue: bool = True, notification_category: str | None = None) -> None:
+                      auto_continue: bool = True, notification_category: str | None = None, source_event_id: str | None = None) -> None:
     """Persist the marker for a turn that is about to run. ``attempts`` = how many auto-continues led to
     this run (0 for a user-initiated turn); the crash-loop breaker reads it back on the next resume."""
     if not session_key or not prompt:
@@ -130,6 +131,8 @@ def record_turn_start(home: Path | str, session_key: str, prompt: str, *, attemp
     now = time.time()
     entry = {"attempts": max(0, int(attempts)), "prompt": prompt[:_MAX_PROMPT_CHARS], "started_at": now,
              "auto_continue": bool(auto_continue), **_writer_identity()}
+    if _valid_source_event_id(source_event_id):
+        entry["source_event_id"] = source_event_id
     if notification_category == "diagnostic":
         entry["notification_category"] = notification_category
     # Identity only — never the prompt: this log is read on crash triage and must not carry turn content.
@@ -141,6 +144,14 @@ def clear_turn_marker(home: Path | str, session_key: str) -> None:
     """Remove the marker once its turn concluded (any outcome the client saw)."""
     if session_key:
         _update(home, session_key, lambda e: {k: v for k, v in e.items() if k != session_key} if session_key in e else None, "clear")
+
+
+def _valid_source_event_id(value):
+    try:
+        parsed = uuid.UUID(value) if isinstance(value, str) else None
+        return parsed is not None and parsed.version == 4 and str(parsed) == value
+    except ValueError:
+        return False
 
 
 def read_turn_marker(home: Path | str, session_key: str) -> dict[str, Any] | None:
@@ -155,6 +166,7 @@ def read_turn_marker(home: Path | str, session_key: str) -> dict[str, Any] | Non
             return None
         return {"attempts": max(0, int(entry.get("attempts") or 0)), "prompt": prompt, "started_at": _started_at(entry),
                 "auto_continue": bool(entry.get("auto_continue", True)),
+                **({"source_event_id": entry["source_event_id"]} if _valid_source_event_id(entry.get("source_event_id")) else {}),
                 # Writer identity when present: extra keys only, so a marker written by an older build still reads.
                 **{k: entry[k] for k in ("writer_pid", "writer_start_time") if entry.get(k) is not None},
                 **({"notification_category": "diagnostic"}

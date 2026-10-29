@@ -87,6 +87,10 @@ export function appIconCandidates(opts: {
   ]
 }
 
+export function windowIconOptions(icon: string | undefined): { icon?: string } {
+  return icon ? { icon } : {}
+}
+
 /**
  * Whether to replace the macOS Dock icon at runtime with `app.dock.setIcon()`.
  *

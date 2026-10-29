@@ -2770,6 +2770,7 @@ export interface PromptSubmitParams {
   session_id: string
   profile?: string | null
   text?: unknown
+  source_event_id?: string | null
   display_kind?: string | null
   interrupted?: boolean | null
   queued?: boolean | null

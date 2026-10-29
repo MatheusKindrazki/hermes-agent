@@ -223,6 +223,18 @@ describe('useComposerQueue park integration', () => {
     }
   })
 
+  it('keeps an invalid legacy identity queued instead of generating an identity during drain', async () => {
+    const entry = { id: 'queued-legacy', text: 'retained', attachments: [], queuedAt: 10 }
+    $queuedPromptsBySession.set({ [SESSION_KEY]: [entry] })
+    parkQueuedPrompts(SESSION_KEY)
+    const { hook, onSubmit } = renderQueueHook()
+    await act(async () => {
+      expect(await hook.result.current.drainNextQueued()).toBe(false)
+    })
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(getQueuedPrompts(SESSION_KEY)).toEqual([entry])
+  })
+
   it('auto-drains an unparked queue once idle', async () => {
     enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'flows' })
 
@@ -250,7 +262,7 @@ describe('useComposerQueue park integration', () => {
   })
 
   it('drainNextQueued sends a parked entry and lifts the park (manual resume)', async () => {
-    enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'resumed' })
+    const entry = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'resumed' })!
     parkQueuedPrompts(SESSION_KEY)
 
     const { hook, onSubmit } = renderQueueHook()
@@ -260,6 +272,7 @@ describe('useComposerQueue park integration', () => {
     })
 
     expect(onSubmit).toHaveBeenCalledTimes(1)
+    expect(onSubmit.mock.calls[0]?.[1]?.submission_id).toBe(entry.id)
     expect(isQueueParked(SESSION_KEY)).toBe(false)
   })
 

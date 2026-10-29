@@ -2,7 +2,60 @@
 
 from __future__ import annotations
 
+import hashlib
+import os
+
 import pytest
+
+
+_K5_WORKER_PATH_SHA256 = (
+    "38810823dfed4a0571498dc26486beff1c8fd4a3d06f7bf9dd0ef224603d8c53"
+)
+
+
+@pytest.fixture(autouse=True)
+def _signed_worker_path_env(monkeypatch, tmp_path):
+    """Provide a hermetic signed launcher without masking explicit inputs.
+
+    Production always requires HERMES_WORKER_PATH_LIB + its K5 hash. Most
+    direct-spawn unit tests predate that boundary, so pytest supplies a tiny
+    signed source file only when neither variable was provided by the caller.
+    Explicit path/hash values are never rewritten, which keeps negative hash
+    and source tests meaningful.
+
+    When the caller selects the real K5 image, provide the prerequisites that
+    image validates: an owner-only executable shim and disabled Work-Control
+    lookup. This is environment setup only; ``_default_spawn`` remains real.
+    """
+    explicit_path = os.environ.get("HERMES_WORKER_PATH_LIB")
+    explicit_hash = os.environ.get("K5_WORKER_PATH_SHA256")
+
+    if explicit_path is None and explicit_hash is None:
+        fallback = tmp_path / "pytest-worker_path.sh"
+        fallback.write_text(
+            "export HERMES_PYTEST_WORKER_PATH=1\n",
+            encoding="utf-8",
+        )
+        fallback.chmod(0o700)
+        digest = hashlib.sha256(fallback.read_bytes()).hexdigest()
+        monkeypatch.setenv("HERMES_WORKER_PATH_LIB", str(fallback))
+        monkeypatch.setenv("K5_WORKER_PATH_SHA256", digest)
+
+    selected_hash = os.environ.get("K5_WORKER_PATH_SHA256")
+    if selected_hash == _K5_WORKER_PATH_SHA256:
+        shim_dir = tmp_path / "pytest-claude-shim"
+        shim_dir.mkdir(mode=0o700)
+        shim = shim_dir / "claude"
+        shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        shim.chmod(0o700)
+        monkeypatch.setenv("HERMES_CLAUDE_SHIM_DIR", str(shim_dir))
+        monkeypatch.setenv("HERMES_CLAUDE_SHIM_BIN", str(shim))
+        monkeypatch.setenv("HERMES_WORK_CONTROL_RESOLVE", "0")
+
+    return {
+        "explicit_path": explicit_path,
+        "explicit_hash": explicit_hash,
+    }
 
 
 @pytest.fixture

@@ -172,6 +172,8 @@ def _mode_guidance_notes(job: dict[str, Any], user_deliver: Optional[str]) -> li
                 "automatically.")
         if _deliver.startswith("bot-chat:"):
             notes.append("Targeting another profile's Bot Chat costs that bot an agent turn per run.")
+        if _deliver.startswith("bot-chat-notify:"):
+            notes.append("bot-chat-notify appends a passive, durable Bot Chat notice; it does not run the target bot.")
         # platform:chat_id with no thread segment loses topic targeting.
         for target in _deliver.split(","):
             parts = target.strip().split(":")
@@ -261,12 +263,14 @@ def _validate_bot_chat_deliver(deliver: Optional[str]) -> Optional[str]:
     if not deliver:
         return None
     try:
-        from cron.scheduler_delivery import parse_bot_chat_deliver_token
+        from cron.scheduler_delivery import parse_bot_chat_deliver_token, parse_bot_chat_notify_deliver_token
         from hermes_cli.profiles import normalize_profile_name, profile_exists
     except Exception:
         return None  # best-effort; resolution re-checks at fire time
     for part in str(deliver).split(","):
         profile_arg = parse_bot_chat_deliver_token(part.strip())
+        if profile_arg is None:
+            profile_arg = parse_bot_chat_notify_deliver_token(part.strip())
         if not profile_arg:
             continue  # not a bot-chat token, or bare token (own profile)
         try:

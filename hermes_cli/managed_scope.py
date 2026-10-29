@@ -104,9 +104,28 @@ def _load_managed_file(name: str, cache: dict[str, tuple], parse) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def load_managed_config() -> dict:
-    """Parsed managed config.yaml, or {} when absent/malformed (fail-open)."""
-    return _load_managed_file("config.yaml", _CONFIG_CACHE, lambda p: fast_safe_load(p.read_text(encoding="utf-8-sig")) or {})
+def load_managed_config(*, strict: bool = False) -> dict:
+    """Read managed config; strict delivery reads raise instead of dropping policy."""
+    managed_dir = get_managed_dir()
+    if managed_dir is None:
+        return {}
+    if strict:
+        try:
+            with open(managed_dir / "config.yaml", encoding="utf-8-sig") as stream:
+                parsed = fast_safe_load(stream.read())
+        except FileNotFoundError:
+            return {}
+        if parsed is None:
+            return {}
+        if not isinstance(parsed, dict):
+            raise ValueError("Managed delivery configuration must be a mapping")
+        return parsed
+    parsed = _cached_read(
+        managed_dir / "config.yaml",
+        _CONFIG_CACHE,
+        lambda p: fast_safe_load(p.read_text(encoding="utf-8-sig")) or {},
+    )
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def load_managed_env() -> dict[str, str]:

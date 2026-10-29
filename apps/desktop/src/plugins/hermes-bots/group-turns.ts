@@ -6,7 +6,7 @@
  * Room-level sequencing lives in group-rounds.ts, which drives these.
  */
 
-import { APPROVAL_RESPOND_TIMEOUT_MS, host } from '@hermes/plugin-sdk'
+import { APPROVAL_RESPOND_TIMEOUT_MS, createPromptSourceEventId, host } from '@hermes/plugin-sdk'
 
 import { noteBotAttention } from './data'
 import { groupFailureReason, recordGroupActivity } from './group-activity'
@@ -579,8 +579,10 @@ async function submitGroupTurnPrompt(
   stored: null | string | true | undefined,
   text: string
 ): Promise<string> {
+  const sourceEventId = createPromptSourceEventId()
   try {
     await requestForBot(member, 'prompt.submit', {
+      source_event_id: sourceEventId,
       session_id: runtime,
       text
     })
@@ -604,6 +606,7 @@ async function submitGroupTurnPrompt(
     }
 
     await requestForBot(member, 'prompt.submit', {
+      source_event_id: sourceEventId,
       session_id: fresh,
       text
     })

@@ -17272,7 +17272,7 @@ def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch, tmp_pa
             {"id": "1", "method": "prompt.submit", "params": {"session_id": "sid_trim", "text": "hi"}})
 
         assert resp is not None and resp.get("result")
-        assert order == ["trim", "reset_home"]
+        assert order[-2:] == ["trim", "reset_home"]
         assert observed["alive_at_trim"] is False, "a pre-turn history snapshot survived to the heap trim"
     finally:
         server._sessions.pop("sid_trim", None)

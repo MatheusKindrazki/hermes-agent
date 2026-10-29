@@ -20,6 +20,7 @@ from collections import OrderedDict
 from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 from gateway.config import Platform, PlatformConfig
+from gateway.egress_policy import EgressPolicy
 from gateway.platforms.base import (
     BasePlatformAdapter, ExecApprovalPrompt, SendResult,
 )
@@ -122,6 +123,7 @@ class RelayAdapter(RelayDiscordInteractionMixin, BasePlatformAdapter):
         # Fronts many platforms but presents to the runner as Platform.RELAY.
         super().__init__(config, Platform.RELAY)
         self._transport = transport
+        self._egress_policy = EgressPolicy.from_config()
         self._apply_descriptor(descriptor)
         # Per-chat egress routing caches learned from inbound events (send() only
         # receives a chat_id). The connector's egress guard resolves the owning tenant
@@ -1208,6 +1210,40 @@ class RelayAdapter(RelayDiscordInteractionMixin, BasePlatformAdapter):
             logger.debug("relay go_dormant failed", exc_info=True)
             return False
 
+    def _prepare_egress(
+        self,
+        *,
+        action: str,
+        destination: str,
+        content: str,
+        metadata: Optional[dict[str, Any]],
+    ) -> tuple[dict[str, Any], Optional[SendResult]]:
+        prepared = dict(metadata or {})
+        checked_mode = prepared.pop("_egress_policy_checked", None)
+        if (
+            self._egress_policy.mode != "off"
+            and checked_mode == self._egress_policy.mode
+        ):
+            return prepared, None
+        prepared, decision = self._egress_policy.prepare_metadata(
+            action=action,
+            destination=destination,
+            content=content.encode("utf-8"),
+            metadata=prepared,
+        )
+        if decision.allowed:
+            return prepared, None
+        logger.warning(
+            "Egress policy rejected relay %s to %s: %s",
+            action,
+            destination,
+            ",".join(decision.reasons),
+        )
+        return prepared, SendResult(
+            success=False,
+            error="egress_policy_rejected",
+            error_kind="egress_policy_rejected",
+        )
     def hold_redial(self) -> bool:
         """Park the transport's reconnect supervisor. False if it did not take.
 
@@ -1251,6 +1287,14 @@ class RelayAdapter(RelayDiscordInteractionMixin, BasePlatformAdapter):
         _sfp_metadata = dict(metadata or {})
         # Gateway-internal interim marker (see send()): strip before the wire.
         _interim = bool(_sfp_metadata.pop("_interim_send", False))
+        _sfp_metadata, _egress_block = self._prepare_egress(
+            action="send",
+            destination=f"{platform_value}:{chat_id}",
+            content=content,
+            metadata=_sfp_metadata,
+        )
+        if _egress_block is not None:
+            return _egress_block
         # The delivery resolver calls THIS method directly, bypassing send() — an
         # open native stream must absorb the turn-final here too.
         seal = await self._absorb_into_open_draft(chat_id, content, _sfp_metadata, _interim)
@@ -1344,12 +1388,25 @@ class RelayAdapter(RelayDiscordInteractionMixin, BasePlatformAdapter):
         # interim text orphans the true final into a plain duplicate).
         # Gateway-internal marker; strip before the wire.
         _interim = bool(send_metadata.pop("_interim_send", False))
+        destination_platform = explicit_platform or self._platform_by_chat.get(
+            str(chat_id)
+        ) or self.descriptor.platform
+        send_metadata, _egress_block = self._prepare_egress(
+            action="send",
+            destination=f"{destination_platform}:{chat_id}",
+            content=content,
+            metadata=send_metadata,
+        )
+        if _egress_block is not None:
+            return _egress_block
         # Seal-interception is checked BEFORE the explicit-platform branch: an open
         # stream absorbs the turn-final whichever door it arrives through.
         seal = await self._absorb_into_open_draft(chat_id, content, send_metadata, _interim)
         if seal is not None:
             return seal
         if explicit_platform:
+            if self._egress_policy.mode != "off":
+                send_metadata["_egress_policy_checked"] = self._egress_policy.mode
             return await self.send_for_platform(
                 explicit_platform, chat_id, content, reply_to=reply_to, metadata=send_metadata or None
             )
@@ -1511,6 +1568,14 @@ class RelayAdapter(RelayDiscordInteractionMixin, BasePlatformAdapter):
         metadata: Optional[dict[str, Any]] = None,
     ) -> SendResult:
         """Edit a relayed message through the connector-owned platform API."""
+        edit_metadata, _egress_block = self._prepare_egress(
+            action="edit",
+            destination=f"{self._platform_by_chat.get(str(chat_id)) or self.descriptor.platform}:{chat_id}",
+            content=content,
+            metadata=metadata,
+        )
+        if _egress_block is not None:
+            return _egress_block
         if self._transport is None:
             return SendResult(success=False, error="no transport")
         result = await self._outbound(
@@ -1520,7 +1585,7 @@ class RelayAdapter(RelayDiscordInteractionMixin, BasePlatformAdapter):
                 "chat_id": chat_id,
                 "message_id": message_id,
                 "content": content,
-                "metadata": self._text_metadata(chat_id, metadata),
+                "metadata": self._text_metadata(chat_id, edit_metadata),
             },
         )
         # P5(b): carry the structured body. THREE separate callers read a bare

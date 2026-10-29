@@ -74,6 +74,18 @@ export const arOverrides = {
     results: (count: number) => `النتائج: ${count.toLocaleString('ar')}`,
     back: 'العودة إلى النتائج'
   },
+  activeContext: {
+    unknownProfile: 'ملف شخصي غير معروف',
+    unknownTenant: 'مستأجر غير معروف',
+    unknownDevice: 'جهاز غير معروف',
+    newChat: 'محادثة جديدة',
+    chat: 'محادثة',
+    thisChat: 'هذه المحادثة',
+    ownerUnknown: (profile, device) => `المالك غير معروف — ${profile} على ${device}`,
+    ownerKnown: (profile, device) => `${profile} على ${device}`,
+    detail: (what, owner, tenant) => `${what}: ${owner}؛ المستأجر ${tenant}`,
+    text: (what, profile, tenant, device) => `${what} · ${profile} · ${tenant} · ${device}`
+  },
   connectors: {
     directory: {
       suggested: 'مقترحة',

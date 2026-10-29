@@ -110,7 +110,15 @@ class HomeIOGuard:
             # probing there is command lookup, not reading Hermes state. CI has no such entries.
             if metadata:
                 path = os.environ.get("PATH", "")
-                cwd = os.getcwd() if self._relative_path_entries(path) else None
+                cwd = None
+                if self._relative_path_entries(path):
+                    try:
+                        cwd = os.getcwd()
+                    except OSError:
+                        # A deleted cwd makes relative PATH entries unresolvable.
+                        # Ignore only their executable-lookup exemption; absolute
+                        # paths must still reach the protected-root checks below.
+                        pass
                 entries = self._path_entries(path, cwd)
                 if os.path.dirname(absolute) in entries or any(_contains(absolute, entry) for entry in entries):
                     return
@@ -173,7 +181,8 @@ class HomeIOGuard:
         # Relative PATH entries change meaning after chdir; absolute ones need no cwd.
         return frozenset(
             _normcase(os.path.normpath(os.path.join(cwd or "", entry)))
-            for entry in path.split(os.pathsep) if entry
+            for entry in path.split(os.pathsep)
+            if entry and (cwd is not None or os.path.isabs(entry))
         )
 
     def install(self, monkeypatch):

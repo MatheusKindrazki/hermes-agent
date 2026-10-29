@@ -163,7 +163,7 @@ def tool_pin_version() -> str:
     """The code identity a tools[] pin was built by (checkout/build sha, else the release version).
     Cached per process: an updated checkout only reaches a process through a restart."""
     from hermes_cli import __version__
-    from hermes_cli.build_info import get_code_identity
+    from hermes_cli.version_info import get_code_identity
     identity = get_code_identity()
     return identity.get("sha") or identity.get("version") or __version__
 
@@ -349,4 +349,12 @@ def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
             staged_engine_names.update(s["name"] for s in get_schemas() if _add(s))
     except Exception:
         logger.debug("Context-engine tool re-injection skipped", exc_info=True)
+    # Preserve the fork's per-turn messaging capability across compaction.
+    try:
+        from tools.bot_mode_dm import message_agent_tool_enabled, message_agent_tool_schema
+        if message_agent_tool_enabled(agent):
+            _add(message_agent_tool_schema()["function"])
+    except Exception:
+        logger.debug("Bot Chat tool re-injection skipped", exc_info=True)
+
     return staged_engine_names

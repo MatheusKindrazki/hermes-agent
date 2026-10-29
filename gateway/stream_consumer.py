@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import hashlib
 import contextlib
 import inspect
 import logging
@@ -18,7 +19,7 @@ import secrets
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Optional
 
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
@@ -118,11 +119,32 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         on_new_message: Optional[callable] = None,
         on_before_finalize: Optional[Callable[[], Any]] = None,
         initial_reply_to_id: Optional[str] = None,
-        run_still_current: Optional[Callable[[], bool]] = None):
+        run_still_current: Optional[Callable[[], bool]] = None,
+        egress_policy: Any = None,
+        reliability_outbox: Any = None,
+    ):
+        from gateway.egress_policy import EgressPolicy
+        from gateway.reliability_outbox import ReliabilityOutbox
+
         self.adapter = adapter
         self.chat_id = chat_id
         self.cfg = config or StreamConsumerConfig()
+        self._egress_policy = egress_policy or EgressPolicy.from_config()
+        self._reliability_outbox = (
+            reliability_outbox or ReliabilityOutbox.from_config()
+        )
+        # An enforcing gate cannot allow an identity-less prefix to escape
+        # before the completed envelope is evaluated.  Shadow outbox likewise
+        # owns the final delivery and must not leave progressive previews on
+        # the native adapter.  ``replace`` avoids mutating a shared config.
+        if (
+            self._egress_policy.mode == "enforce"
+            or self._reliability_outbox.mode == "shadow"
+        ) and not self.cfg.buffer_only:
+            self.cfg = replace(self.cfg, buffer_only=True)
         self.metadata = metadata
+        self._outbox_final_receipt = None
+        self._egress_final_decision = None
         # Hooks (exceptions swallowed): on_new_message per fresh content bubble (next
         # tool-progress bubble goes BELOW it); on_before_finalize once (pause typing).
         self._on_new_message = on_new_message
@@ -265,6 +287,59 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         if final:
             meta["notify"] = True
         return meta or None
+
+    def _gate_or_shadow_final(self, text: str) -> Optional[bool]:
+        """Return ``None`` to use the adapter, otherwise the owned outcome.
+
+        This is the one completed-text seam shared by native draft finals and
+        edit-based finals.  Enforce evaluates before any adapter call; shadow
+        outbox then takes delivery ownership and returns an ACK compatible with
+        the consumer's existing final reconciliation state machine.
+        """
+        destination = f"{type(self.adapter).__name__}:{self.chat_id}"
+        metadata, decision = self._egress_policy.prepare_metadata(
+            action="send",
+            destination=destination,
+            content=text.encode("utf-8"),
+            metadata=self._metadata_for_send(final=True),
+        )
+        self._egress_final_decision = decision
+        if not decision.allowed:
+            logger.warning(
+                "Egress policy rejected stream final to %s: %s",
+                destination,
+                ",".join(decision.reasons),
+            )
+            return False
+        if self._reliability_outbox.mode != "shadow":
+            # Preserve the checked marker for RelayAdapter's inner gate.
+            if self._egress_policy.mode != "off":
+                metadata["_egress_policy_checked"] = decision.mode
+            self.metadata = metadata
+            return None
+
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        receipt = self._reliability_outbox.enqueue_json(
+            {
+                "schema": "kindra.outbox-payload/v1",
+                "content": text,
+                "destination": destination,
+                "metadata": metadata,
+            },
+            producer="hermes-agent.gateway.stream_consumer",
+            work_id=str(metadata.get("work_id") or ""),
+            event_type="gateway_stream_final",
+            milestone=str(metadata.get("milestone") or "turn-complete"),
+            version=str(
+                metadata.get("version")
+                or metadata.get("client_turn_id")
+                or metadata.get("session_id")
+                or digest
+            ),
+            destination=destination,
+        )
+        self._outbox_final_receipt = receipt
+        return True
 
     # Read-only views for the gateway (flag semantics: see _clear_turn_final_flags).
     already_sent = property(lambda self: self._already_sent)

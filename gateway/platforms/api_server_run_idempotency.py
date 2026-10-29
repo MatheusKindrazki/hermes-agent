@@ -16,7 +16,7 @@ from hermes_cli.sqlite_util import add_column_if_missing
 # Keep the extracted store's log records on the API server logger.
 logger = logging.getLogger("gateway.platforms.api_server")
 
-TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "interrupted"})
+TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "interrupted", "recovery_required"})
 
 _SELECT_BY_KEY = (
     "SELECT fingerprint, run_id, status_json, owner_pid, owner_started, updated_at "
@@ -32,7 +32,8 @@ _MIGRATIONS = {
     "owner_pid": "INTEGER NOT NULL DEFAULT 0",
     "owner_started": "INTEGER NOT NULL DEFAULT 0",
     "retention_until": "REAL NOT NULL DEFAULT 0",
-    "acknowledged_at": "REAL"}
+    "acknowledged_at": "REAL",
+    "retain_forever": "INTEGER NOT NULL DEFAULT 0"}
 
 
 def _encode_status(status: dict[str, Any]) -> str:
@@ -154,6 +155,11 @@ class RunIdempotencyStore:
             self._conn.commit()
             return "created", _record(run_id, encoded, owner_pid, owner_started, now) | {"status": status}
 
+    def retain_permanently(self, run_id: str) -> None:
+        """Fork delivery keys have no expiry: a replay must never execute work twice."""
+        with self._lock, self._conn:
+            self._conn.execute("UPDATE run_idempotency SET retain_forever=1 WHERE run_id=?", (run_id,))
+
     def lookup(self, scope: str, key: str, fingerprint: str, *, retention_until: float = 0):
         """Return ``missing``, ``reused`` or ``conflict`` without reserving."""
         now = time.time()
@@ -172,9 +178,9 @@ class RunIdempotencyStore:
         stale = self._conn.execute(
             """SELECT scope, idempotency_key, status_json
                  FROM run_idempotency
-                WHERE acknowledged_at <= ?
+                WHERE retain_forever = 0 AND (acknowledged_at <= ?
                    OR (retention_until > 0 AND retention_until <= ?)
-                   OR (retention_until <= 0 AND updated_at < ?)""",
+                   OR (retention_until <= 0 AND updated_at < ?))""",
             (now - self.ACKNOWLEDGED_RETENTION_SECONDS, now, now - self.RETENTION_SECONDS),
         ).fetchall()
         for stale_scope, stale_key, stale_status in stale:

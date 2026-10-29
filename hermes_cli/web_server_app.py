@@ -34,6 +34,8 @@ async def standalone_lifespan(app: "FastAPI"):
     )
     from hermes_cli.web_server_chat import PTY_REGISTRY
 
+    from agent.durable_admission import start_observation_heartbeat, stop_observation_heartbeat
+    start_observation_heartbeat()
     app.state.event_channels = {}  # dict[str, set]
     app.state.event_lock = asyncio.Lock()
     app.state.pty_active_session_files = {}  # dict[str, Path]
@@ -171,6 +173,7 @@ async def standalone_lifespan(app: "FastAPI"):
         hosted_room_start_thread.join(timeout=1.0)
         if cron_stop is not None:
             cron_stop.set()
+        stop_observation_heartbeat()
         pty_reaper_task.cancel()
         selftest_task.cancel()
         auto_archive_task.cancel()
@@ -201,6 +204,8 @@ async def http_lifespan(app: FastAPI):
     from hermes_cli.web_server import _dashboard_selftest_loop
     from hermes_cli.web_server_chat import PTY_REGISTRY
 
+    from agent.durable_admission import start_observation_heartbeat, stop_observation_heartbeat
+    start_observation_heartbeat()
     app.state.event_channels = {}
     app.state.event_lock = asyncio.Lock()
     app.state.pty_active_session_files = {}

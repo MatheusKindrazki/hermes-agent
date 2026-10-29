@@ -453,3 +453,28 @@ async def test_relay_fronted_telegram_target_receives_payload_above_its_own_limi
     saved_files = list(tmp_path.glob("cron/output/cron-2_*.txt"))
     assert len(saved_files) == 1
     assert saved_files[0].read_text(encoding="utf-8") == content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["enforce", "shadow"])
+async def test_named_topic_has_no_native_side_effect_before_delivery_ownership(tmp_path, monkeypatch, mode):
+    from gateway.egress_policy import EgressPolicy
+    from gateway.reliability_outbox import ReliabilityOutbox
+
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    adapter = RecordingAdapter()
+    config = {"gateway": {"reliability": {
+        "egress": {"mode": "enforce" if mode == "enforce" else "off"},
+        "outbox": {"mode": "shadow" if mode == "shadow" else "off",
+                   "db_path": str(tmp_path / "outbox.db"), "payload_dir": str(tmp_path / "payloads")},
+    }}}
+    router = DeliveryRouter(
+        GatewayConfig(), adapters={Platform.TELEGRAM: adapter},
+        egress_policy=EgressPolicy.from_config(config),
+        reliability_outbox=ReliabilityOutbox.from_config(config, hermes_home=tmp_path),
+    )
+    result = await router._deliver_to_platform(
+        DeliveryTarget.parse("telegram:722341991:Named topic"), "hello", metadata=None)
+    assert adapter.ensure_dm_topic_calls == []
+    assert adapter.calls == []
+    assert result.get("shadow_enqueued") if mode == "shadow" else result["error"] == "egress_policy_rejected"

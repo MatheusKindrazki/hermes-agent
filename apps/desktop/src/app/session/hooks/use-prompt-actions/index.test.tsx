@@ -1642,8 +1642,8 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
       session_id: RUNTIME_SESSION_ID
     })
     expect(calls[1]?.params).toEqual({
+      submission_id: expect.stringMatching(/^[0-9a-f-]{36}$/),
       session_id: RUNTIME_SESSION_ID,
-      submission_id: expect.any(String),
       text: 'write the implementation plan'
     })
 
@@ -2020,6 +2020,7 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
 
     expect(submitted).toEqual([
       expect.objectContaining({
+        submission_id: expect.stringMatching(/^[0-9a-f-]{36}$/),
         session_id: tabRuntimeId,
         text: 'Load the work skill, then: fix the tab bug'
       })
@@ -2373,8 +2374,8 @@ describe('usePromptActions submit / queue drain semantics', () => {
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
       {
+        submission_id: expect.stringMatching(/^[0-9a-f-]{36}$/),
         session_id: RUNTIME_SESSION_ID,
-        submission_id: expect.any(String),
         text: 'hello after a stop'
       },
       1_800_000
@@ -2450,8 +2451,8 @@ describe('usePromptActions submit / queue drain semantics', () => {
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
       {
+        submission_id: expect.stringMatching(/^[0-9a-f-]{36}$/),
         session_id: RUNTIME_SESSION_ID,
-        submission_id: expect.any(String),
         text: 'stop! rude interruption',
         interrupted: true
       },
@@ -2462,8 +2463,8 @@ describe('usePromptActions submit / queue drain semantics', () => {
     expect(requestGateway).toHaveBeenLastCalledWith(
       'prompt.submit',
       {
+        submission_id: expect.stringMatching(/^[0-9a-f-]{36}$/),
         session_id: RUNTIME_SESSION_ID,
-        submission_id: expect.any(String),
         text: 'follow-up without a barge'
       },
       1_800_000
@@ -2492,9 +2493,9 @@ describe('usePromptActions submit / queue drain semantics', () => {
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
       {
+        submission_id: expect.stringMatching(/^[0-9a-f-]{36}$/),
         queued: true,
         session_id: RUNTIME_SESSION_ID,
-        submission_id: expect.any(String),
         text: 'queued message'
       },
       1_800_000
@@ -2530,9 +2531,9 @@ describe('usePromptActions submit / queue drain semantics', () => {
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
       {
+        submission_id: expect.stringMatching(/^[0-9a-f-]{36}$/),
         queued: true,
         session_id: 'rt-session-a',
-        submission_id: expect.any(String),
         text: 'queued for background session'
       },
       1_800_000
@@ -2586,9 +2587,9 @@ describe('usePromptActions submit / queue drain semantics', () => {
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
       {
+        submission_id: expect.stringMatching(/^[0-9a-f-]{36}$/),
         queued: true,
         session_id: 'rt-session-b',
-        submission_id: expect.any(String),
         text: 'queued for B mid-switch'
       },
       1_800_000
@@ -2722,9 +2723,9 @@ describe('usePromptActions submit / queue drain semantics', () => {
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
       {
+        submission_id: expect.stringMatching(/^[0-9a-f-]{36}$/),
         queued: true,
         session_id: 'rt-session-b-live',
-        submission_id: expect.any(String),
         text: 'queued for B, B already re-bound'
       },
       1_800_000
@@ -2818,9 +2819,9 @@ describe('usePromptActions submit / queue drain semantics', () => {
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
       {
+        submission_id: expect.stringMatching(/^[0-9a-f-]{36}$/),
         queued: true,
         session_id: 'rt-session-a-rebound',
-        submission_id: expect.any(String),
         text: 'queued for background session'
       },
       1_800_000
@@ -2840,7 +2841,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
     // null so the session.resume recovery path is skipped and the error surfaces.
     let attempt = 0
 
-    const requestGateway = vi.fn(async (method: string) => {
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>, timeoutMs?: number) => {
       if (method === 'prompt.submit') {
         attempt += 1
 
@@ -2862,17 +2863,21 @@ describe('usePromptActions submit / queue drain semantics', () => {
       />
     )
 
-    const first = await handle!.submitText('please send me', { fromQueue: true })
+    const sourceEventId = '22222222-2222-4222-8222-222222222222'
+    const first = await handle!.submitText('please send me', { fromQueue: true, sourceEventId })
     expect(first).toBe(false)
 
-    const second = await handle!.submitText('please send me', { fromQueue: true })
+    const second = await handle!.submitText('please send me', { fromQueue: true, sourceEventId })
     expect(second).toBe(true)
+    expect(
+      requestGateway.mock.calls.filter(call => call[0] === 'prompt.submit').map(call => call[1]?.submission_id)
+    ).toEqual([sourceEventId, sourceEventId])
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
       {
+        submission_id: expect.stringMatching(/^[0-9a-f-]{36}$/),
         queued: true,
         session_id: RUNTIME_SESSION_ID,
-        submission_id: expect.any(String),
         text: 'please send me'
       },
       1_800_000
@@ -3502,8 +3507,8 @@ describe('usePromptActions file attachment sync', () => {
       data_url: 'data:text/plain;base64,aGVsbG8='
     })
     expect(calls[1]?.params).toEqual({
+      submission_id: expect.stringMatching(/^[0-9a-f-]{36}$/),
       session_id: RUNTIME_SESSION_ID,
-      submission_id: expect.any(String),
       text: '@file:.hermes/desktop-attachments/report.txt\n\nconvert this to epub'
     })
   })

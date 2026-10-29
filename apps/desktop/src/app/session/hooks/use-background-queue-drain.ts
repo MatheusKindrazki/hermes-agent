@@ -7,6 +7,7 @@ import { resetBrowseState } from '@/store/composer-input-history'
 import {
   $parkedQueueSessions,
   $queuedPromptsBySession,
+  canDispatchQueuedPrompt,
   MAX_AUTO_DRAIN_ATTEMPTS,
   noteQueuedPromptDrainFailure,
   type QueuedPromptEntry,
@@ -172,6 +173,10 @@ export function useBackgroundQueueDrain({
         // Server-owned rows are already admitted to the gateway FIFO.
         if (!liveEntry || liveEntry.serverStatus) {
           return true
+        }
+
+        if (!canDispatchQueuedPrompt(liveEntry)) {
+          return false
         }
 
         const resolved = resolveQueuedPromptTransport(liveEntry)

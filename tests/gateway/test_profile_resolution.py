@@ -21,6 +21,7 @@ def mock_runner():
     runner.config = MagicMock(profile_routes=[], _runtime_profile_homes=None)
     # Bind the actual methods to the mock
     runner._profile_name_for_source = GatewayRunner._profile_name_for_source.__get__(runner)
+    runner._handle_message_with_effect_scope = GatewayRunner._handle_message_with_effect_scope.__get__(runner)
     runner._resolve_profile_home_for_source = GatewayRunner._resolve_profile_home_for_source.__get__(runner)
     # _handle_message's ingress gates (profile route rejection) live in this helper.
     runner._hm_admit_event = GatewayRunner._hm_admit_event.__get__(runner)
@@ -461,5 +462,4 @@ class TestMultiplexGate:
         discord_source.profile = None
 
         assert mock_runner._profile_name_for_source(discord_source) is None
-
 

@@ -54,7 +54,7 @@ import {
   readStatusCode,
   withRetry
 } from './api-transport'
-import { appIconCandidates, resolveAppIcon, shouldOverrideDockIcon } from './app-icon'
+import { appIconCandidates, resolveAppIcon, shouldOverrideDockIcon, windowIconOptions } from './app-icon'
 import { stageAppInstallerFile } from './app-installer-file'
 import {
   appVersionInfo,
@@ -87,6 +87,7 @@ import { recycleOwnedBackend } from './backend-recycle'
 import { isPidAliveWindows, waitForBackendRelease } from './backend-release-gate'
 import { createInstalledRuntimeGate } from './backend-resolution'
 import { desktopBackendSpawnEnv } from './backend-spawn-env'
+import { resolveLocalUpdateRoot, resolvePinnedLocalBackend } from './backend-runtime-pin'
 import {
   isHostKeyChangedBootFailure,
   isRetryableRemoteBootFailure,
@@ -1447,12 +1448,15 @@ const WINDOW_BUTTON_POSITION = {
 // The ladder is BUILT once here but each window factory RE-RESOLVES through
 // resolveAppIcon (decoding probe): existence alone is not proof the bytes
 // decode, and an undecodable icon must never take the main process down.
-const APP_ICON_PATHS = appIconCandidates({
-  isWindows: IS_WINDOWS,
-  appRoot: APP_ROOT,
-  resourcesPath: process.resourcesPath,
-  unpackedPathFor
-})
+const APP_ICON_PATHS = [
+  ...(IS_MAC ? [path.join(process.resourcesPath ?? '', 'icon.icns')] : []),
+  ...appIconCandidates({
+    isWindows: IS_WINDOWS,
+    appRoot: APP_ROOT,
+    resourcesPath: process.resourcesPath,
+    unpackedPathFor
+  })
+]
 
 let rendererTitleBarTheme = null
 
@@ -3453,13 +3457,19 @@ function writeZoomState(zoomLevel) {
 // Dev → SOURCE_REPO_ROOT. Packaged/CLI install → ACTIVE_HERMES_ROOT.
 // HERMES_DESKTOP_HERMES_ROOT always wins so devs can pin a worktree.
 function resolveUpdateRoot() {
-  const candidates = [
-    process.env.HERMES_DESKTOP_HERMES_ROOT && path.resolve(process.env.HERMES_DESKTOP_HERMES_ROOT),
-    !IS_PACKAGED && isHermesSourceRoot(SOURCE_REPO_ROOT) ? SOURCE_REPO_ROOT : null,
-    isHermesSourceRoot(ACTIVE_HERMES_ROOT) ? ACTIVE_HERMES_ROOT : null
-  ].filter(Boolean)
+  return resolveLocalUpdateRoot({
+    userData: app.getPath('userData'),
+    bundled: Boolean(bundledPayload(process.resourcesPath)),
+    fallback: () => {
+      const candidates = [
+        process.env.HERMES_DESKTOP_HERMES_ROOT && path.resolve(process.env.HERMES_DESKTOP_HERMES_ROOT),
+        !IS_PACKAGED && isHermesSourceRoot(SOURCE_REPO_ROOT) ? SOURCE_REPO_ROOT : null,
+        isHermesSourceRoot(ACTIVE_HERMES_ROOT) ? ACTIVE_HERMES_ROOT : null
+      ].filter(Boolean)
 
-  return candidates.find(isGitCheckout) || candidates[0] || ACTIVE_HERMES_ROOT
+      return candidates.find(isGitCheckout) || candidates[0] || ACTIVE_HERMES_ROOT
+    }
+  })
 }
 
 function emitUpdateProgress(payload) {
@@ -4901,11 +4911,15 @@ const installedRuntimeGate = createInstalledRuntimeGate(process.env, rememberLog
 async function resolveHermesBackend(backendArgs: string[]): Promise<ResolvedHermesBackend> {
   const payload = bundledPayload(process.resourcesPath)
 
-  if (payload) {
-    if (!IS_WINDOWS) {
-      provisionCliLinks(payload.commands, path.join(os.homedir(), '.local', 'bin'), rememberLog)
-    }
+  const pinned = resolvePinnedLocalBackend({
+    userData: app.getPath('userData'), args: backendArgs, bundled: Boolean(payload)
+  })
 
+  if (pinned) {
+    return pinned
+  }
+
+  if (payload) {
     return {
       kind: 'python',
       label: `bundled payload at ${payload.root}`,
@@ -5001,9 +5015,45 @@ async function resolveHermesBackend(backendArgs: string[]): Promise<ResolvedHerm
         }
 
         rememberLog(
-          `Ignoring existing Hermes CLI at ${hermesCommand}: --version probe failed; falling through to bootstrap.`
+          `Ignoring existing Hermes CLI at ${hermesCommand}: --version probe failed; refusing the explicit override.`
         )
       }
+    }
+
+    throw new Error('The explicit HERMES_DESKTOP_HERMES command is unavailable. Correct or remove that override; no automatic installation was started.')
+  }
+
+  if (payload) {
+    if (!IS_WINDOWS) {
+      provisionCliLinks(payload.commands, path.join(os.homedir(), '.local', 'bin'), rememberLog)
+    }
+
+    return {
+      kind: 'python',
+      label: `bundled payload at ${payload.root}`,
+      command: payload.shim,
+      args: [...backendArgs],
+      env: { ...buildDesktopBackendEnv(), HERMES_RUNTIME_DIR: payload.toolsDir },
+      root: payload.repoDir,
+      bootstrap: false,
+      shell: false,
+      local: 'bundled'
+    }
+  }
+
+  // Development source -- when running `npm run dev` from a checkout, the
+  //    cloned repo at SOURCE_REPO_ROOT takes precedence over ACTIVE and any
+  //    installed `hermes` on PATH so local Python edits are actually exercised.
+  //    (In dev with no checkout, SOURCE_REPO_ROOT won't pass isHermesSourceRoot.)
+  if (!IS_PACKAGED && isHermesSourceRoot(SOURCE_REPO_ROOT)) {
+    const backend: SourceBackend | null = createSourcePythonBackend(
+      SOURCE_REPO_ROOT,
+      await findPythonForRoot(SOURCE_REPO_ROOT),
+      backendArgs
+    )
+
+    if (backend) {
+      return backend
     }
   }
 
@@ -12369,7 +12419,7 @@ function spawnSecondaryWindow({
     titleBarOverlay: getTitleBarOverlayOptions(),
     trafficLightPosition: IS_MAC ? WINDOW_BUTTON_POSITION : undefined,
     ...chatWindowSurfaceOptions(),
-    icon,
+    ...windowIconOptions(icon),
     // Don't show until the renderer's first themed paint is ready. macOS
     // `vibrancy` ignores `backgroundColor` and paints a translucent OS
     // material (which follows the OS appearance, not the app theme), so a
@@ -12474,7 +12524,7 @@ function spawnBrowserWindow(tabId) {
     titleBarOverlay: getTitleBarOverlayOptions(),
     trafficLightPosition: IS_MAC ? WINDOW_BUTTON_POSITION : undefined,
     ...chatWindowSurfaceOptions(),
-    icon,
+    ...windowIconOptions(icon),
     show: false,
     webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
   })
@@ -12586,7 +12636,7 @@ function createInstanceWindow(
     titleBarOverlay: getTitleBarOverlayOptions(),
     trafficLightPosition: IS_MAC ? WINDOW_BUTTON_POSITION : undefined,
     ...chatWindowSurfaceOptions(),
-    icon,
+    ...windowIconOptions(icon),
     show: false,
     webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
   })
@@ -13677,7 +13727,7 @@ function createWindow() {
     titleBarOverlay: getTitleBarOverlayOptions(),
     trafficLightPosition: IS_MAC ? WINDOW_BUTTON_POSITION : undefined,
     ...chatWindowSurfaceOptions(),
-    icon,
+    ...windowIconOptions(icon),
     // Hidden until the first themed paint so macOS `vibrancy` (which ignores
     // `backgroundColor` and follows the OS appearance) can't flash a light
     // material before the renderer paints the app theme. See createSessionWindow.

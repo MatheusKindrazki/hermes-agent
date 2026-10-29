@@ -722,6 +722,10 @@ class GatewayStartupMixin:
     def _stop_loop_liveness_guards(self) -> None:
         """Disarm lifetime liveness guards before shutdown can load the loop — including the
         heartbeat writer, which would otherwise make a draining gateway look healthy to probes."""
+        observation_task = getattr(self, "_observation_task", None)
+        if observation_task is not None:
+            observation_task.cancel()
+            self._observation_task = None
         for attr, method, what in (
             ("_loop_liveness_watchdog", "stop", "stop gateway loop liveness watchdog"),
             ("_loop_floor_timer_handle", "cancel", "cancel gateway loop floor timer"),
@@ -1506,6 +1510,7 @@ class GatewayStartupMixin:
             )
         self._spawn_supervised(self._hosted_room_worker_watcher, "hosted_room_worker")
         self._start_loop_heartbeat_task()
+        self._start_observation_task()
         from gateway.run_heartbeat_restore import restore_heartbeat_watches
         self._start_heartbeat_poller()  # Keep retrying even when the first scan is empty.
         await restore_heartbeat_watches(self)
@@ -1897,3 +1902,23 @@ class GatewayStartupMixin:
             raise RuntimeError(f"adapter.send failed: {exc}") from exc
         if not getattr(result, "success", True):
             raise RuntimeError(f"adapter.send failed: {_send_error(result)}")
+
+
+    def _start_observation_task(self):
+        from agent.durable_admission import start_observation, observation_checkpoint
+
+        if start_observation() is None:
+            return
+
+        async def _observation_heartbeat():
+            try:
+                while self._running:
+                    await asyncio.sleep(30)
+                    observation_checkpoint()
+            finally:
+                observation_checkpoint(stopped=True)
+
+        self._observation_task = asyncio.create_task(_observation_heartbeat())
+        self._observation_task._hermes_supervised_watcher = True
+        self._background_tasks.add(self._observation_task)
+        self._observation_task.add_done_callback(self._background_tasks.discard)

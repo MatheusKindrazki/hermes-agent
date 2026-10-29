@@ -502,7 +502,7 @@ def _accepted_response(run_id: str, status: str, gateway_session_key, *, replaye
     if gateway_session_key:
         headers["X-Hermes-Session-Key"] = gateway_session_key
     return web.json_response(
-        {"run_id": run_id, "status": status, "replayed": replayed}, status=202, headers=headers)
+        {"run_id": run_id, "status": status, "replayed": replayed, "deduplicated": replayed}, status=202, headers=headers)
 
 
 def _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error) -> web.Response:
@@ -513,7 +513,36 @@ def _replay_or_conflict(self, request, outcome, record, gateway_session_key, _op
             code="idempotency_key_conflict", status=409)
     original_id = str(record["run_id"])
     status = self._durable_run_status(request, original_id) or record["status"]
+    if status.get("status") == "recovery_required":
+        return web.json_response(status, status=409)
     return _accepted_response(original_id, status.get("status", "queued"), gateway_session_key, replayed=True)
+
+
+def _legacy_run_ledger(self):
+    from gateway.run_idempotency import RunIdempotencyLedger
+    return getattr(self, "_run_idempotency", None) or RunIdempotencyLedger()
+
+
+def _legacy_run_status(record):
+    status = dict(record.receipt)
+    status.update(object="hermes.run", run_id=record.run_id, status=record.state, deduplicated=True)
+    if record.state not in TERMINAL_STATUSES:
+        status.update(status="recovery_required", reattach={
+            "required": True, "method": "POST", "reason": "durable_receipt_has_no_live_worker"})
+    return status
+
+
+def _legacy_run_record(self, body, key):
+    ledger = _legacy_run_ledger(self)
+    if not ledger.db_path.is_file():
+        return None
+    metadata = body.get("metadata")
+    digest = str((metadata.get("request_sha256") if isinstance(metadata, dict) else None)
+                 or body.get("request_sha256") or "").strip().lower()
+    payload = hashlib.sha256(json.dumps(body, ensure_ascii=False, sort_keys=True,
+                                       separators=(",", ":")).encode()).hexdigest()
+    return ledger.lookup_record(idempotency_key=key, request_sha256=digest,
+                                payload_sha256=payload)
 
 
 @dataclass(slots=True)
@@ -740,9 +769,13 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
         return _json_error(
             _openai_error, "Idempotency-Key must be 1-255 visible ASCII characters",
             code="invalid_idempotency_key", status=400)
+    if idempotency_key and not self._run_idempotency_store.durable:
+        return _json_error(_openai_error, "Durable idempotency storage unavailable",
+                           code="idempotency_storage_unavailable", status=503)
     idempotency_scope, idempotency_fingerprint = _run_idempotency_identity(
         self, request, body, gateway_session_key, idempotency_key)
-    raw_input = body.get("input")
+    # Retain the fork dashboard message field while honoring explicit native input.
+    raw_input = body.get("input", body.get("message"))
     user_message, input_err = _run_user_message(raw_input, _openai_error)
     if input_err is not None:
         return input_err
@@ -772,12 +805,29 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
             retention_until=_room_retention_until(request))
         if outcome == "conflict" or (outcome == "reused" and record is not None):
             return _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error)
+    legacy = None
+    if idempotency_key and room_dispatch is None and not self._room_grant_token(request):
+        from gateway.run_idempotency import RunIdempotencyConflict
+        try:
+            legacy = _legacy_run_record(self, body, idempotency_key)
+        except RunIdempotencyConflict:
+            return _json_error(_openai_error, "Idempotency-Key was reused for a different payload",
+                               code="idempotency_payload_mismatch", status=409)
+        if legacy is not None and legacy.state != "claimed":
+            status = _legacy_run_status(legacy)
+            outcome, record = self._run_idempotency_store.reserve(
+                idempotency_scope, idempotency_key, idempotency_fingerprint, legacy.run_id,
+                status, owner_pid=0, owner_started=0,
+                retention_until=_room_retention_until(request))
+            if outcome == "created":
+                self._run_idempotency_store.retain_permanently(legacy.run_id)
+            return _replay_or_conflict(self, request, outcome, record,
+                                      gateway_session_key, _openai_error)
     # Enforce concurrency only for a genuinely new run.
     limited = self._concurrency_limited_response()
     if limited is not None:
         return limited
-    run_id = f"run_{uuid.uuid4().hex}"
-    self._run_owners[run_id] = self._run_idempotency_scope(request)
+    run_id = legacy.run_id if legacy is not None else f"run_{uuid.uuid4().hex}"
     # Same precedence as /v1/responses: body session_id > response chain > X-Hermes-Session-Key
     # conversation > run_id (which would otherwise re-key every affinity surface per run).
     # An explicit or chained session owns its routing key and is never rebound to the header.
@@ -802,22 +852,30 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
     session_history_delivery = not previous_response_id and not conversation_history
     if not conversation_history and selected_session_id and not previous_response_id:
         conversation_history = await self._conversation_history_for_session(str(selected_session_id))
-    q = self._run_streams[run_id] = _RunStream()
-    created_at = self._run_streams_created[run_id] = time.time()
-    self._run_approval_sessions[run_id] = run_id  # approval session key (see _RunLaunch)
-    initial_status = self._set_run_status(
-        run_id, "queued", created_at=created_at, session_id=session_id, model=body.get("model", self._model_name))
+    created_at = time.time()
+    initial_status = dict(run_id=run_id, status="queued", created_at=created_at,
+                          session_id=session_id, model=body.get("model", self._model_name))
     if idempotency_key:
         outcome, record = self._run_idempotency_store.reserve(
             idempotency_scope, idempotency_key, idempotency_fingerprint, run_id, initial_status,
             owner_pid=self._run_owner_pid, owner_started=self._run_owner_started,
             retention_until=_room_retention_until(request))
         if outcome != "created":
-            _forget_run(
-                self, run_id, self._run_streams, self._run_streams_created, self._run_approval_sessions,
-                self._run_statuses, self._run_owners)
             return _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error)
+        if legacy is not None:
+            # Leave a durable tombstone before a worker can perform effects. Even a store
+            # replacement or rollback may not resurrect the old unattached claim.
+            _legacy_run_ledger(self).update_state(run_id, "migrated", initial_status)
+        metadata = body.get("metadata")
+        if legacy is not None or body.get("request_sha256") or (isinstance(metadata, dict) and metadata.get("request_sha256")):
+            self._run_idempotency_store.retain_permanently(run_id)
         self._run_idempotency_ids.add(run_id)
+    self._run_owners[run_id] = self._run_idempotency_scope(request)
+    q = self._run_streams[run_id] = _RunStream()
+    self._run_streams_created[run_id] = created_at
+    self._run_approval_sessions[run_id] = run_id
+    self._set_run_status(run_id, "queued", created_at=created_at,
+                         session_id=session_id, model=body.get("model", self._model_name))
     launch = _RunLaunch(
         self, run_id, q, session_id, gateway_session_key, _declared_selected, user_message,
         conversation_history, session_history_delivery,
@@ -852,6 +910,10 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
         self._background_tasks.add(task)  # tracked for shutdown drain
     if hasattr(task, "add_done_callback"):
         task.add_done_callback(self._background_tasks.discard)
+    if legacy is not None:
+        headers = {"X-Hermes-Session-Key": gateway_session_key} if gateway_session_key else {}
+        return web.json_response({"run_id": run_id, "status": "started", "reattached": True},
+                                 status=202, headers=headers)
     return _accepted_response(run_id, "started", gateway_session_key, replayed=False)
 
 
@@ -1206,6 +1268,14 @@ async def _handle_get_run(self, request: web.Request, *, _api_server) -> web.Res
     """GET /v1/runs/{run_id} — return pollable run status for external UIs."""
     _, status, _, _, err = _load_owned_run(
         self, request, _api_server=_api_server, permission="status", active_fallback=True)
+    if err is not None and err.status == 404 and not self._room_grant_token(request):
+        # Old receipts live under the authenticated request's profile home. Room grants
+        # cannot read this pre-tenant ledger; only the owner's existing API-key lane can.
+        ledger = _legacy_run_ledger(self)
+        if ledger.db_path.is_file():
+            record = ledger.lookup_run(request.match_info["run_id"])
+            if record is not None:
+                return web.json_response(_legacy_run_status(record))
     return err or web.json_response(status)
 
 

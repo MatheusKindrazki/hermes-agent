@@ -34,7 +34,8 @@ def main() -> None:
     assert uv, "real uv must be prepared on PATH"
     sites = [p for p in sys.path if p.endswith("site-packages")]
     assert sites, "run with the prepared Hermes Python dependency environment"
-    wheels = temp / "wheels"
+    # Keep the offline wheel inside the project copied into PM build workspaces.
+    wheels = root / "wheels"
     wheels.mkdir()
     dist = "desktop_backend_deps-1.dist-info"
     entries = {
@@ -52,7 +53,7 @@ def main() -> None:
         'dependencies=["desktop-backend-deps==1"]\n'
         '[project.optional-dependencies]\nall=[]\n'
         '[tool.uv]\npackage=false\nno-index=true\n'
-        f'find-links=[{json.dumps(wheels.as_posix())}]\n', encoding="utf-8")
+        f'find-links=[{json.dumps("wheels")}]\n', encoding="utf-8")
     subprocess.run([uv, "lock", "--project", str(root), "--python", sys.executable],
                    check=True, stdout=sys.stderr, timeout=30)
     import pm

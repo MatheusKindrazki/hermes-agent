@@ -35,6 +35,10 @@ from hermes_cli.profiles import ProfileIdentitySettlementPending
 from hermes_cli.web_server_config import (
     _apply_main_model_assignment, _normalize_main_model_assignment, _validated_main_model_selection,
 )
+from gateway.active_context_receipt import (
+    build_active_context_receipt,
+    load_profile_config,
+)
 from hermes_cli.web_server_gateway import _strip_session_list_rows
 from hermes_cli.web_routers._common import _CONFIG_MUTATION_LOCK
 from hermes_cli.web_server_profiles import (
@@ -498,7 +502,7 @@ def get_profiles_sessions(
                 # Same SQL-level blob skip as /api/sessions.
                 compact_rows=not full, include_pinned=True, **scoped)
             totals[name] = db.session_count(exclude_children=True, **scoped)
-            merged.extend(_tag_rows(rows, name, now))
+            merged.extend(_tag_rows_with_receipt(rows, name, home, now))
         _read_profile_db(name, home, errors, _read)
 
     sort_key = "last_active" if order == "recent" else "started_at"
@@ -599,7 +603,7 @@ def get_profiles_sessions_sidebar(
         recents_truncated[name] = len(slices["recents"]) >= cap["recents"]
         profile_totals[name] = slices["usage"]
         for key in slice_scope:
-            rows[key].extend(_tag_rows(slices[key], name, now))
+            rows[key].extend(_tag_rows_with_receipt(slices[key], name, home, now))
 
     def _window(key: str) -> list[dict[str, Any]]:
         rows[key].sort(key=_recency, reverse=True)
@@ -1157,3 +1161,13 @@ async def get_profile_desktop_overlay(name: str):
     if overlay is _MISSING:
         return {"exists": False, "desktop": None}
     return {"exists": True, "desktop": overlay}
+
+
+def _tag_rows_with_receipt(rows, name, home, now):
+    tagged = _tag_rows(rows, name, now)
+    config = load_profile_config(home)
+    for row in tagged:
+        receipt = build_active_context_receipt(config=config, profile=name, session=row)
+        if receipt is not None:
+            row["active_context"] = receipt
+    return tagged

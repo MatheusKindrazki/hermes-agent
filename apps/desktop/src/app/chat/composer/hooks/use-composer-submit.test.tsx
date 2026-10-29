@@ -35,6 +35,8 @@ interface SubmitHarnessOptions {
   attachments?: ComposerAttachment[]
   busy?: boolean
   busyInputMode?: 'interrupt' | 'queue' | 'steer' | null
+  compacting?: boolean
+  disabled?: boolean
   inputDisabled?: boolean
   scopeTarget?: ComposerTarget
   sessionKey?: string | null
@@ -50,6 +52,8 @@ function renderSubmitHook({
   attachments = [],
   busy = false,
   busyInputMode = 'interrupt',
+  compacting = false,
+  disabled = false,
   inputDisabled = false,
   scopeTarget = 'main',
   sessionKey = 'stored-session',
@@ -115,7 +119,7 @@ function renderSubmitHook({
         busy,
         busyInputMode,
         clearDraft,
-        disabled: false,
+        disabled,
         draftScopeRef,
         draftRef,
         drainNextQueued: vi.fn(async () => false),
@@ -375,6 +379,15 @@ describe('useComposerSubmit external request routing', () => {
 
     expect(disabled.onSubmit).not.toHaveBeenCalled()
   })
+
+  it('does not accept an external submit while draft-only editing is enabled', () => {
+    const draftOnly = renderSubmitHook({ disabled: true, inputDisabled: false })
+
+    // The bus accepted and addressed the event; the disabled composer must
+    // still decline the actual dispatch.
+    expect(requestComposerSubmit('keep this as a draft', { target: 'main' })).toBe(true)
+    expect(draftOnly.onSubmit).not.toHaveBeenCalled()
+  })
 })
 
 describe('useComposerSubmit busy-turn routing', () => {
@@ -405,6 +418,24 @@ describe('useComposerSubmit busy-turn routing', () => {
         explicit.hook.unmount()
       }
     }
+  })
+
+  it('keeps a draft-only busy composer from steering, queuing, submitting, or cancelling', () => {
+    const { hook, onCancel, onSteer, onSubmit, queueCurrentDraft } = renderSubmitHook({
+      busy: true,
+      disabled: true,
+      inputDisabled: false,
+      text: 'preserve this local draft'
+    })
+
+    act(() => {
+      hook.result.current.submitDraft()
+    })
+
+    expect(onSteer).not.toHaveBeenCalled()
+    expect(queueCurrentDraft).not.toHaveBeenCalled()
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(onCancel).not.toHaveBeenCalled()
   })
 
   afterEach(() => {

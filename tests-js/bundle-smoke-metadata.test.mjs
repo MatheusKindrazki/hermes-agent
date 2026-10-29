@@ -4,7 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { bundleIdentity, verifyBundleStamp, verifyMacMetadata } from '../tests/install/e2e-assets/bundle-smoke-metadata.mjs'
-import { stampAssertions } from '../tests/install/e2e-assets/mac-bundled-manifest.cjs'
+import { channelStampAssertions, stampAssertions } from '../tests/install/e2e-assets/mac-bundled-manifest.cjs'
 import { randomBytes } from 'node:crypto'
 import { buildStampPayload } from '../apps/desktop/scripts/write-build-stamp.mjs'
 
@@ -78,12 +78,18 @@ test('channel smoke binds the complete admitted request, not a commit-build iden
       const options = { commit, platform, channelRequest: request }
       for (const key of Object.keys(request)) {
         const changed = { ...stamp, channelBuild: { ...request, [key]: null } }
-        expect(() => verifyBundleStamp(changed, options), key).toThrow('channelBuild')
+        expect(channelStampAssertions(changed, request).join(';'), key).toContain('channelBuild')
       }
+      // The field matrix exercises the exact comparator used by verifyBundleStamp.
+      // Re-admitting the same valid request spawns Python for every mutation;
+      // keep that real bridge at the integration boundary below and in the CLI cases.
       for (const [key, value] of [['source', 'commit-build'], ['tag', 'v1.2.3'], ['branch', 'main'],
-        ['dirty', true], ['updateMechanism', 'external'], ['displayVersion', request.version], ['baseVersion', request.version]]) {
-        expect(() => verifyBundleStamp({ ...stamp, [key]: value }, options), key).toThrow(key)
+        ['dirty', true], ['displayVersion', request.version], ['baseVersion', request.version]]) {
+        expect(channelStampAssertions({ ...stamp, [key]: value }, request).join(';'), key).toContain(key)
       }
+      expect(() => verifyBundleStamp({ ...stamp, channelBuild: { ...request, bundleEnv: { HERMES_MODEL: 'other' } } },
+        options)).toThrow('channelBuild')
+      expect(() => verifyBundleStamp({ ...stamp, updateMechanism: 'external' }, options)).toThrow('updateMechanism')
       expect(() => verifyBundleStamp(stamp, { commit, platform })).toThrow()
       if (platform === 'darwin') {
         const plist = { CFBundleIdentifier: request.identity.appId, CFBundleShortVersionString: request.version,

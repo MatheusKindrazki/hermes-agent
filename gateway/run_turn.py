@@ -9,6 +9,7 @@ from pm import install_hint
 import logging
 from typing import TYPE_CHECKING
 import asyncio
+import hashlib
 import dataclasses
 import inspect
 import json
@@ -321,7 +322,8 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             if agent_failed_early and not is_context_overflow_failure:
                 response = self._hmwa_add_failed_turn_notice(response, self._hmwa_failed_turn_notice(agent_result))
             response, session_entry = await self._hmwa_compression_exhaustion_reset(
-                agent_result, response, session_entry, session_key, source,
+                agent_result, response, session_entry, session_key, source, event=event,
+                handoff_content=prepared.persist_user_message if prepared.persist_user_message is not None else prepared.message_text,
             )
             await self._hmwa_persist_turn_transcript(
                 event=event, source=source, session_entry=session_entry, session_key=session_key,
@@ -490,6 +492,57 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             _platform_config_key,
         )
         from run_agent import AIAgent
+        # ── Durable admission (K8) for the A2A background lane ──
+        # This lane reaches run_conversation without passing the ingress seam,
+        # and it enriches the prompt with image descriptions on the way. The
+        # Signal is recorded here, against the task's own id, so it precedes
+        # that preprocessing exactly as it does on the interactive path.
+        try:
+            from agent.durable_admission import ModeError as _K8ModeError
+            from agent.durable_admission import resolve_mode as _k8_resolve_mode
+
+            _k8_on = _k8_resolve_mode()
+        except _K8ModeError as _k8_mode_exc:
+            # Same rule on the background lane: an unrecognised mode stops the
+            # task rather than running it unadmitted.
+            logger.error(
+                "durable admission mode refused for background task %s: %s",
+                task_id,
+                _k8_mode_exc,
+            )
+            return
+        except Exception:
+            logger.debug("durable admission probe failed", exc_info=True)
+            _k8_on = False
+        if _k8_on:
+            from agent.durable_admission import (
+                admit_input,
+                platform_event_id,
+                publish_pre_admission,
+            )
+
+            _k8_event = platform_event_id("task", task_id)
+            if not _k8_event:
+                logger.error(
+                    "K8 armed but background task %s has no stable identity; "
+                    "refusing to run it",
+                    task_id,
+                )
+                return
+            _k8_outcome = admit_input(
+                session_id=self._session_key_for_source(source),
+                request_text=prompt or "",
+                event_id=_k8_event,
+            )
+            publish_pre_admission(_k8_outcome)
+            if not (_k8_outcome.mode_off or _k8_outcome.model_may_run):
+                logger.warning(
+                    "K8 refused background task %s (%s); it will not run",
+                    task_id,
+                    _k8_outcome.reason_code,
+                )
+                return
+
         media_urls = media_urls or []
         media_types = media_types or []
         adapter = self._delivery_adapter_for(source)
@@ -577,14 +630,14 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                 media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
                 images, text_content = adapter.extract_images(response)
             if text_content:
-                await adapter.send(chat_id=source.chat_id, content=header + text_content, metadata=_thread_metadata)
+                await self._deliver_native_final(adapter, "send", action="send", event_type="gateway_background_result", chat_id=source.chat_id, content=header + text_content, metadata=_thread_metadata)
             elif not images and not media_files:
-                await adapter.send(
+                await self._deliver_native_final(adapter, "send", action="send", event_type="gateway_background_result",
                     chat_id=source.chat_id, content=header + t("gateway.background.no_response"), metadata=_thread_metadata,
                 )
             for image_url, alt_text in (images or []):
                 with suppress(Exception):
-                    await adapter.send_image(
+                    await self._deliver_native_final(adapter, "send_image", action="send_media", event_type="gateway_background_result",
                         chat_id=source.chat_id, image_url=image_url, caption=alt_text, metadata=_thread_metadata,
                     )
             # Route each media file by type (voice bubble / video / image / document), as the
@@ -595,17 +648,18 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                 _ext = os.path.splitext(media_path)[1].lower()
                 with suppress(Exception):
                     if _should_send_media_as_audio(source.platform, _ext, _is_voice):
-                        await adapter.send_voice(
+                        await self._deliver_native_final(adapter, "send_voice", action="send_media", event_type="gateway_background_result",
                             chat_id=source.chat_id, audio_path=media_path, metadata=_thread_metadata,
                             is_voice=_is_voice,
                         )
                     else:
                         sender, key = (
-                            (adapter.send_video, "video_path") if _ext in _VIDEO_EXTS
-                            else (adapter.send_image_file, "image_path") if _ext in _IMAGE_EXTS
-                            else (adapter.send_document, "file_path")
+                            ("send_video", "video_path") if _ext in _VIDEO_EXTS
+                            else ("send_image_file", "image_path") if _ext in _IMAGE_EXTS
+                            else ("send_document", "file_path")
                         )
-                        await sender(chat_id=source.chat_id, metadata=_thread_metadata, **{key: media_path})
+                        await self._deliver_native_final(adapter, sender, event_type="gateway_background_result",
+                            chat_id=source.chat_id, metadata=_thread_metadata, **{key: media_path})
 
         except Exception:
             logger.exception("Background task %s failed", task_id)
@@ -1154,7 +1208,10 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             _cleanup_adapter = None
 
         # The one-slot progress/holder containers shared with the callbacks are TurnContext defaults.
+        from agent.durable_admission import current_pre_admission, canonical_effect_origin
         turn_ctx = TurnContext(
+            k8_pre_admission=current_pre_admission(),
+            effect_origin=canonical_effect_origin(turn_params.get("session_id") or session_key),
             source=source, message=message, AIAgent=AIAgent, session_key=session_key,
             run_generation=run_generation, _cleanup_progress=_cleanup_progress,
             _run_still_current=self._run_still_current_fn(session_key, run_generation),
@@ -1868,12 +1925,19 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                 adapter.queue_message(session_key, pending)
             return turn_ctx.result_holder[0] or {"final_response": response, "messages": history}
 
+        deferred_entry = None
+        if result.get("compression_deferred") is True and result.get("failed") is False:
+            await self._wait_for_deferred_compression(session_key)
+            deferred_source = getattr(pending_event, "source", None) or source
+            deferred_entry = await self.async_session_store.get_or_create_session(deferred_source)
+
         # Interrupted: discard the response ("Operation interrupted." is noise).
-        if not result.get("interrupted"):
+        if not result.get("interrupted") and not result.get("compression_deferred"):
             await self._run_agent_deliver_first_response(turn_ctx, adapter, response, result, stream_task)
 
         updated_history = result.get("messages", history)
         next_source, next_message, next_session_key = source, pending, session_key
+        next_session_id = deferred_entry.session_id if deferred_entry else session_id
         # message_type is carried into the recursive call so queued voice turns can stream TTS.
         next_message_id = next_channel_prompt = next_message_type = None
         # The raw inbound id keys the delivery-ledger obligation for the follow-up's own final send,
@@ -1902,6 +1966,8 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                     "Queued follow-up session-key resolution failed; reusing %s",
                     session_key or "?", exc_info=True,
                 )
+            if deferred_entry is not None:
+                next_session_key = deferred_entry.session_key
             next_message = await self._prepare_profile_scoped_inbound_message_text(
                 event=pending_event, source=next_source, history=updated_history, session_key=next_session_key,
             )
@@ -1960,11 +2026,11 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         # The re-baseline sits inside the try: a /stop landing on its DB await must still close the marker
         # (the helper's own ``except Exception`` does not catch cancellation).
         try:
-            await self._refresh_agent_cache_message_count(session_key, session_id)
+            await self._refresh_agent_cache_message_count(next_session_key, next_session_id)
 
             followup_result = await self._run_agent(
                 message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
-                source=next_source, session_id=session_id, session_key=next_session_key,
+                source=next_source, session_id=next_session_id, session_key=next_session_key,
                 run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
                 event_message_id=next_message_id, inbound_message_id=next_inbound_id,
                 channel_prompt=next_channel_prompt, message_type=next_message_type,
@@ -2057,9 +2123,9 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         ``(session, error)`` and an exception logs ``fail_exc`` as ``(session, exc)``; either way
         ``already_sent`` stays unset so the normal final send delivers the content."""
         try:
-            _res = await _sc.adapter.edit_message(
+            _res = await self._deliver_native_final(_sc.adapter, "edit_message", action="edit", event_type="gateway_runner_final",
                 chat_id=source.chat_id, message_id=_sc.message_id, content=content, finalize=True,
-            )
+             metadata=self._thread_metadata_for_source(source),)
         except Exception as _edit_err:
             logger.warning(fail_exc, _sk, _edit_err)
             return
@@ -2401,3 +2467,53 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         await self._run_agent_mark_streamed_delivery(response, turn_ctx)
         self._run_agent_schedule_bubble_cleanup(response, _cleanup_adapter, turn_ctx)
         return response
+
+
+    async def _wait_for_deferred_compression(self, session_key: str) -> None:
+        """Wait until a soft-deferred compression turn can be retried safely.
+
+        A compression-deferred result promises that a queued user turn will
+        run after the concurrent compressor releases or rotates the session.
+        Keep the pending drain serialized behind that lock instead of starting
+        a second agent against the old parent.
+        """
+        while await self._session_has_compression_in_flight(session_key):
+            await asyncio.sleep(0.1)
+
+
+    async def _persist_compression_handoff(
+        self,
+        session_entry,
+        *,
+        event,
+        content,
+        source_session_id: str,
+    ) -> bool:
+        """Carry one failed oversized user turn into the fresh reset session."""
+        platform_message_id = str(getattr(event, "message_id", "") or "").strip()
+        if platform_message_id:
+            handoff_id = platform_message_id
+        else:
+            payload = json.dumps(content, ensure_ascii=False, sort_keys=True, default=str)
+            digest = hashlib.sha256(
+                f"{source_session_id}\0{payload}".encode("utf-8", "replace")
+            ).hexdigest()[:24]
+            handoff_id = f"compression-handoff:{digest}"
+        if await self.async_session_store.has_platform_message_id(
+            session_entry.session_id, handoff_id
+        ):
+            return False
+        await self.async_session_store.append_to_transcript(
+            session_entry.session_id,
+            {
+                "role": "user",
+                "content": content,
+                "timestamp": getattr(event, "timestamp", None) or time.time(),
+                "message_id": handoff_id,
+                "_compression_handoff": {
+                    "source_session_id": source_session_id,
+                    "reason": "compression_exhausted",
+                },
+            },
+        )
+        return True

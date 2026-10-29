@@ -669,7 +669,7 @@ def _persist_session_row_for_submit(rid, session, text=None, display_kind=None):
 
 
 def _run_after_agent_ready(
-    rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author=None
+    rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author=None, source_event_id=None
 ):
     """Turn thread body: patient wait for a deferred build (a slow build must not eat the
     accepted in-flight message), then run."""
@@ -700,7 +700,7 @@ def _run_after_agent_ready(
             return
     _run_prompt_submit(
         rid, sid, session, text, display_kind=display_kind, display_metadata=display_metadata,
-        terminal_callback=hosted_terminal_callback, turn_author=turn_author)
+        terminal_callback=hosted_terminal_callback, turn_author=turn_author, source_event_id=source_event_id)
 
 
 _TRUNCATION_PARAMS = (
@@ -872,6 +872,29 @@ def _(rid, params: dict) -> dict:
     turn_isolation = _session_uses_compute_host(session, _load_dashboard_process_isolation_config())
     if internal_hosted_submit and turn_isolation:
         return _err(rid, 4121, "hosted room turns do not support isolated compute workers yet")
+    # Only the server-authenticated WS upgrade can promote this carrier.
+    # Neither params.source/profile nor a stdio/internal transport is proof.
+    from tui_gateway.ws import WSTransport
+    import uuid
+    source_event_id = None
+    request_transport = current_transport()
+    candidate = params.get("source_event_id")
+    if isinstance(request_transport, WSTransport) and request_transport.native_prompt_authenticated:
+        try:
+            parsed = uuid.UUID(candidate) if isinstance(candidate, str) else None
+            if parsed and parsed.version == 4 and str(parsed) == candidate:
+                source_event_id = candidate
+        except ValueError:
+            pass
+    from agent.durable_admission import native_input_enabled, bind_native_prompt_source
+    native_home_token = set_hermes_home_override(session.get("profile_home")) if session.get("profile_home") else None
+    try:
+        observe_input = native_input_enabled() and not turn_isolation
+        if not observe_input or source_event_id and not bind_native_prompt_source(session["session_key"], source_event_id, text):
+            source_event_id = None
+    finally:
+        if native_home_token is not None:
+            reset_hermes_home_override(native_home_token)
     # Re-bind to the current transport: streaming must stay on the active websocket even
     # if a disconnect/fallback moved the session to stdio. Through _rebind_live_transport so a
     # socket that already closed cannot cancel the orphan reap without coming back (#116464).
@@ -901,7 +924,8 @@ def _(rid, params: dict) -> dict:
             # for `running` to clear and resubmits with the truncation intact.
             return _err(rid, 4009, "session busy")
         busy_response = _handle_busy_submit(
-            rid, sid, session, text, busy_transport, queued=bool(params.get("queued")), turn_author=turn_author,
+            rid, sid, session, text, busy_transport, queued=bool(params.get("queued")),
+            source_event_id=source_event_id, observe_input=observe_input, turn_author=turn_author,
             display_kind=display_kind)
         if busy_response is not None:
             return busy_response
@@ -958,7 +982,7 @@ def _(rid, params: dict) -> dict:
         _start_agent_build(sid, session)
     run_thread = threading.Thread(
         target=lambda: _run_after_agent_ready(
-            rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author),
+            rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author, source_event_id if not turn_isolation else None),
         daemon=True)
     # Handle lets session.interrupt tell a live turn from a stuck `running` flag.
     session["_run_thread"] = run_thread

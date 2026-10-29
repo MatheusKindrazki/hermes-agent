@@ -30,6 +30,8 @@ class PromptSubmitParams(SessionParams):
     ``truncate_before_message_id``, or the legacy ``truncate_before_user_ordinal``)."""
 
     text: JsonValue = ""
+    # A UUID carrier, promoted only by authenticated native WS ingress; never identity authority by itself.
+    source_event_id: str | None = None
     display_kind: str | None = None  # only "hidden" is honoured; anything else renders as a user row
     interrupted: bool | None = None  # client-side barge-in: the turn's model message carries the note
     queued: bool | None = None  # client queue drain — the busy path must hold it, never redirect/steer

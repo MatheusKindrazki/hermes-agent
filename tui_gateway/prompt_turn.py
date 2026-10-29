@@ -176,7 +176,7 @@ def _admit_prompt_turn(
 
 
 def _record_turn_marker(session: dict, text: Any, *, auto_continue: bool = True,
-                        notification_category: str | None = None) -> str:
+                        notification_category: str | None = None, source_event_id: str | None = None) -> str:
     """Write the durable crash marker; returns the session key it was written under (compression
     can rotate session_key mid-turn).  A surviving marker means the process died mid-turn.
     The key is published before the disk write so an interrupt racing startup can retire
@@ -190,6 +190,7 @@ def _record_turn_marker(session: dict, text: Any, *, auto_continue: bool = True,
             session["_active_turn_marker_key"] = marker_key
         record_turn_start(marker_home, marker_key, marker_text, attempts=marker_attempt,
                           auto_continue=auto_continue,
+                          **({"source_event_id": source_event_id} if source_event_id else {}),
                           **({"notification_category": "diagnostic"}
                              if notification_category == "diagnostic" else {}))
         with session["history_lock"]:
@@ -1090,12 +1091,12 @@ def _reopen_routed_session_row(db, sid: str, session: dict) -> None:
         logger.debug("routing-provenance reopen failed for %s", session_id, exc_info=True)
 
 
-def _run_prompt_submit(
+def _run_prompt_submit_inner(
     rid, sid: str, session: dict, text: Any, *, display_kind: str | None = None,
     display_metadata: dict | None = None, image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
-    turn_author: dict | None = None, report_ownership_refusal: bool = True) -> bool:
+    turn_author: dict | None = None, report_ownership_refusal: bool = True, source_event_id: str | None = None) -> bool:
     # Every dispatch binds the session's own row (session_key, real source) before the turn writes:
     # the synthesized turns that enter here directly (crash auto-continue, queued-prompt drain,
     # wake-ups) bypass prompt.submit's persist, and a row-less turn is otherwise materialized by
@@ -1142,7 +1143,7 @@ def _run_prompt_submit(
         st = _TurnRun(
             session["agent"], session.pop("one_turn_model_restore", None), terminal_callback,
             receipt_committed=terminal_callback is None)
-        st.marker_key = _record_turn_marker(session, text, auto_continue=terminal_callback is None,
+        st.marker_key = _record_turn_marker(session, text, auto_continue=terminal_callback is None, source_event_id=source_event_id,
             notification_category=(display_metadata or {}).get("notification_category"))
         goal_followup = None
         try:
@@ -1242,3 +1243,30 @@ def _run_prompt_submit(
 def register(server) -> None:
     """Publish this module's helpers onto ``server``, rebound to its globals."""
     bind_module(globals(), server, skip=("_",))
+
+
+def _run_prompt_submit(
+    rid, sid: str, session: dict, text: Any, *, display_kind: str | None = None,
+    display_metadata: dict | None = None, image_paths: list[str] | None = None,
+    queued_prompt_generation: int | None = None,
+    terminal_callback: Callable[[dict[str, Any]], None] | None = None,
+    turn_author: dict | None = None, source_event_id: str | None = None,
+    report_ownership_refusal: bool = True,
+) -> bool:
+    from agent.durable_admission import (
+        start_observation_heartbeat, capture_effect_origin, effect_origin_scope,
+        execution_event_id, bind_native_prompt_source,
+    )
+    with _session_profile_runtime_scope(session):
+        start_observation_heartbeat()
+        key = session["session_key"]
+        # Crash continuation wraps the prompt for the model but must bind the
+        # original authenticated input, not reinterpret the wrapper as a new input.
+        source_text = session.get("_auto_continue_prompt") or text
+        origin = capture_effect_origin(key, execution_event_id(key, {"source_event_id": source_event_id, "surface": "desktop"})) if source_event_id and bind_native_prompt_source(key, source_event_id, source_text) else None
+        with effect_origin_scope(origin):
+            return _run_prompt_submit_inner(rid, sid, session, text, display_kind=display_kind,
+                display_metadata=display_metadata, image_paths=image_paths,
+                queued_prompt_generation=queued_prompt_generation, terminal_callback=terminal_callback,
+                turn_author=turn_author, source_event_id=source_event_id,
+                report_ownership_refusal=report_ownership_refusal)

@@ -8,6 +8,7 @@ helpers are reached via the late-binding seam so monkeypatching keeps working.
 
 import asyncio
 import json
+import logging
 import re
 import sqlite3
 import time
@@ -25,8 +26,15 @@ from hermes_cli.web_server_sessions import _session_latest_descendant
 from hermes_cli.web_models import (
     BulkDeleteSessions, SessionImport, SessionOwnerBackfill, SessionPrune, SessionRename)
 from hermes_cli.web_routers._common import (
-    CORRUPT_STORE_DETAIL, corrupt_store_as_status, log as _log, destructive_profile, http_failure,
+    CORRUPT_STORE_DETAIL, corrupt_store_as_status, destructive_profile, http_failure,
 )
+from gateway.active_context_receipt import (
+    build_active_context_receipt,
+    load_profile_config,
+)
+
+# Same logger the handlers used before extraction (identical logger object).
+_log = logging.getLogger("hermes_cli.web_server")
 from hermes_state import is_malformed_db_error
 from hermes_state_errors import SessionActiveWriteGuardError, StateDbReplacedError, is_transient_sqlite_error
 from hermes_state_health import STORAGE_CORRUPT, note_storage_error, storage_state
@@ -226,6 +234,8 @@ def get_sessions(
             total = db.session_count(exclude_children=True, **scope)
             now = time.time()
             row_profile = profile_name or _cron_default_profile()
+            profile_home = _cron_profile_home(row_profile)[1]
+            receipt_config = load_profile_config(profile_home)
             for s in sessions:
                 s["is_active"] = _is_active(s, now)
                 s["profile"] = row_profile
@@ -233,6 +243,13 @@ def get_sessions(
                 # SQLite stores the flags as 0/1; expose real JSON booleans.
                 s["archived"] = bool(s.get("archived"))
                 s["pinned"] = bool(s.get("pinned"))
+                receipt = build_active_context_receipt(
+                    config=receipt_config,
+                    profile=row_profile,
+                    session=s,
+                )
+                if receipt is not None:
+                    s["active_context"] = receipt
             if not full:
                 _strip_session_list_rows(sessions)
             # ``storage`` tells an empty page apart from an unreadable store (#72046); same
@@ -578,6 +595,13 @@ async def get_session_detail(session_id: str, profile: Optional[str] = None):
         owned = cron_run_scheduler_owned(session, profile)
         if owned is not None:
             session["scheduler_owned"] = owned
+        receipt = build_active_context_receipt(
+            config=load_profile_config(_cron_profile_home(session["profile"])[1]),
+            profile=session["profile"],
+            session=session,
+        )
+        if receipt is not None:
+            session["active_context"] = receipt
         return session
 
     return await asyncio.to_thread(_with_db, profile, _detail, read_only=True)

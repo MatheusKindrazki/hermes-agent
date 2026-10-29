@@ -550,6 +550,11 @@ def test_failed_agent_build_leaves_marker_for_retry(
 
 # ── End to end: continuation runs a real turn and clears the marker ────
 
+def test_native_source_identity_survives_marker_without_text_inference(tmp_path):
+    from tui_gateway.turn_marker import record_turn_start, read_turn_marker
+    source = "11111111-1111-4111-8111-111111111111"
+    record_turn_start(tmp_path, "native-session", "input", source_event_id=source)
+    assert read_turn_marker(tmp_path, "native-session")["source_event_id"] == source
 
 # ── Marker writer identity: a live writer is an owner, not a corpse ────
 #
@@ -654,3 +659,26 @@ def test_second_backend_defers_to_a_live_marker_writer(emits, schedule_env, mark
         if child.poll() is None:
             child.kill()
         child.wait(timeout=10)
+
+
+def test_native_queue_keeps_identical_text_as_distinct_authenticated_inputs():
+    session = _session(inflight_turn={"user": "same input"})
+    first_id = "11111111-1111-4111-8111-111111111111"
+    second_id = "22222222-2222-4222-8222-222222222222"
+    first = server._enqueue_prompt(session, "same input", None, source_event_id=first_id, observe_input=True)
+    second = server._enqueue_prompt(session, "same input", None, source_event_id=second_id, observe_input=True)
+    assert server._enqueue_prompt(session, "same input", None, source_event_id=first_id, observe_input=True) is None
+    server._drop_queued_duplicates_of_inflight_user(session)
+    assert session["queued_prompt"] is first
+    assert session["queued_prompts"] == [second]
+    assert first["source_event_id"] != second["source_event_id"]
+
+
+def test_non_observed_followup_does_not_merge_into_authenticated_queue_entry():
+    session = _session()
+    entry = server._enqueue_prompt(session, "authenticated", None,
+        source_event_id="11111111-1111-4111-8111-111111111111", observe_input=True)
+    server._enqueue_prompt(session, "later without native identity", None)
+    assert session["queued_prompt"] is entry
+    assert entry["text"] == "authenticated"
+    assert session["queued_prompts"][0]["text"] == "later without native identity"

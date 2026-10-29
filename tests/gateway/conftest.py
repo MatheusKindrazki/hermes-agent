@@ -31,6 +31,7 @@ first wins; the other fails with ``ImportError``, and the polluted
 incident.
 """
 
+
 import ast
 import os
 import sys
@@ -59,6 +60,48 @@ def private_db_probe_cleanup(tmp_path):
                 fd, _dev, _ino = dbfile._HEADER_PROBE_FDS.pop(key)
                 os.close(fd)
 
+
+@pytest.fixture
+def unit_tone_gate(monkeypatch):
+    """Opt-in external tone receipt double; identity/outbox remain real.
+
+    Only explicitly registered, unchanged closed envelopes are accepted.
+    This is not K11 integration and must never be used by its real tests.
+    """
+    import copy
+    from gateway.egress_policy import EgressPolicy
+
+    approved = []
+
+    def envelope(*, profile="luguistaff", tenant="lugui"):
+        value = {
+            "schema_version": "tone-envelope.v1", "mode": "enforce",
+            "profile": profile, "tenant": tenant, "channel": "hermes",
+            "template": "completion",
+            "facts": {
+                "work_id": "01a04a0f-455a-7bea-a064-4aa68b009d39",
+                "status": "completed", "numbers": "", "links": "",
+                "evidence": "unit fixture", "risk": "normal", "decision_request": "",
+            },
+            "voice": {"register": "direct", "locale": "pt-BR"},
+        }
+        approved.append(copy.deepcopy(value))
+        return value
+
+    def evaluate(_policy, metadata):
+        supplied = metadata.get("tone_envelope")
+        valid = isinstance(supplied, dict) and any(supplied == item for item in approved)
+        if valid:
+            valid = all(
+                key not in metadata or metadata[key] == supplied[key]
+                for key in ("profile", "tenant")
+            )
+        if not valid:
+            return {"allowed": False, "reasons": ["unit_tone_envelope_invalid"]}
+        return {"allowed": True, "reasons": [], "receipt": {"facts_match": True}}
+
+    monkeypatch.setattr(EgressPolicy, "_evaluate_tone_envelope", evaluate)
+    return envelope
 
 @pytest.fixture(scope="session", autouse=True)
 def _bind_lark_sdk_globals_when_installed():

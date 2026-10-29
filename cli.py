@@ -9,6 +9,7 @@ except ModuleNotFoundError as exc:
         raise  # the bootstrap exists but cannot load: skipping it would skip PM activation
 
 import logging
+import json
 import os
 import functools
 # Tests patch shutil/time/datetime through the cli facade; siblings also resolve datetime
@@ -24,10 +25,138 @@ from dataclasses import dataclass
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Mapping
 
 logger = logging.getLogger(__name__)
 
+_DELIVERY_ENVELOPE_FIELDS = frozenset({
+    "schema", "delivery_id", "request_key", "turn_identity_sha256", "accepted_at",
+})
+_DELIVERY_QUERY_PREFIX = "HERMES_DELIVERY_V1\n"
+
+
+class DeliveryRebindError(ValueError):
+    pass
+
+
+def _load_delivery_envelope(path_value: Optional[str]) -> Optional[dict[str, Any]]:
+    if not path_value:
+        return None
+    path = Path(path_value)
+    if not path.is_absolute() or path.is_symlink() or not path.is_file():
+        raise ValueError("delivery_envelope_path_invalid")
+    info = path.stat()
+    if info.st_uid != getattr(os, "getuid", lambda: info.st_uid)() or (info.st_mode & 0o077):
+        raise ValueError("delivery_envelope_permissions_invalid")
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(document, dict) or set(document) != _DELIVERY_ENVELOPE_FIELDS:
+        raise ValueError("delivery_envelope_fields_invalid")
+    if document.get("schema") != "hermes.delivery-envelope.v1":
+        raise ValueError("delivery_envelope_schema_invalid")
+    for name in ("delivery_id", "request_key"):
+        if not isinstance(document.get(name), str) or not document[name]:
+            raise ValueError("delivery_envelope_identity_invalid")
+    if re.fullmatch(r"[0-9a-f]{64}", str(document.get("turn_identity_sha256") or "")) is None:
+        raise ValueError("delivery_envelope_identity_invalid")
+    accepted_at = document.get("accepted_at")
+    if isinstance(accepted_at, bool) or not isinstance(accepted_at, int) or accepted_at < 1:
+        raise ValueError("delivery_envelope_timestamp_invalid")
+    return document
+
+
+def _decode_delivery_query(query: Any) -> tuple[Any, Optional[dict[str, Any]]]:
+    if not isinstance(query, str) or not query.startswith(_DELIVERY_QUERY_PREFIX):
+        return query, None
+    wrapper = json.loads(query[len(_DELIVERY_QUERY_PREFIX):])
+    if not isinstance(wrapper, dict) or set(wrapper) != {"delivery", "message"}:
+        raise ValueError("delivery_query_fields_invalid")
+    message = wrapper.get("message")
+    if not isinstance(message, str) or not message.strip():
+        raise ValueError("delivery_query_message_invalid")
+    # Reuse the exact envelope validator without trusting a caller-controlled
+    # path: validate the closed fields inline.
+    document = wrapper.get("delivery")
+    if not isinstance(document, dict) or set(document) != _DELIVERY_ENVELOPE_FIELDS:
+        raise ValueError("delivery_envelope_fields_invalid")
+    if document.get("schema") != "hermes.delivery-envelope.v1":
+        raise ValueError("delivery_envelope_schema_invalid")
+    if not all(isinstance(document.get(k), str) and document[k] for k in ("delivery_id", "request_key")):
+        raise ValueError("delivery_envelope_identity_invalid")
+    if re.fullmatch(r"[0-9a-f]{64}", str(document.get("turn_identity_sha256") or "")) is None:
+        raise ValueError("delivery_envelope_identity_invalid")
+    accepted_at = document.get("accepted_at")
+    if isinstance(accepted_at, bool) or not isinstance(accepted_at, int) or accepted_at < 1:
+        raise ValueError("delivery_envelope_timestamp_invalid")
+    return message, dict(document)
+
+
+def _delivery_display_metadata(envelope: Mapping[str, Any]) -> dict[str, Any]:
+    return {"hermes_delivery": dict(envelope)}
+
+
+def _find_persisted_delivery(session_db: Any, session_id: str, envelope: Mapping[str, Any]):
+    candidates = [session_id]
+    try:
+        tip = session_db.get_compression_tip(session_id)
+        if tip and tip not in candidates:
+            candidates.append(tip)
+    except Exception:
+        pass
+    offset = 0
+    while True:
+        try:
+            rows = session_db.list_sessions_rich(
+                limit=200, offset=offset, include_children=True,
+                project_compression_tips=False, include_hidden=True, include_archived=True,
+            )
+        except Exception:
+            rows = []
+        for session in rows:
+            candidate = str(session.get("id") or "") if isinstance(session, dict) else ""
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+        if len(rows) < 200:
+            break
+        offset += len(rows)
+    for candidate in candidates:
+        for row in session_db.get_messages(candidate, include_inactive=True):
+            metadata = row.get("display_metadata")
+            carried = metadata.get("hermes_delivery") if isinstance(metadata, dict) else None
+            if not isinstance(carried, dict) or carried.get("delivery_id") != envelope["delivery_id"]:
+                continue
+            if carried != dict(envelope) or row.get("role") != "user":
+                raise DeliveryRebindError("delivery_id_rebind")
+            return candidate, row
+    return None
+
+
+def _delivery_ack(session_db: Any, session_id: str, envelope: Mapping[str, Any], *, adapter: str) -> Optional[dict[str, Any]]:
+    found = _find_persisted_delivery(session_db, session_id, envelope)
+    if found is None:
+        return None
+    target_session_id, row = found
+    message_id = row.get("id")
+    if isinstance(message_id, bool) or not isinstance(message_id, int) or message_id < 1:
+        return None
+    try:
+        persisted_at = max(1, int(float(row.get("timestamp") or 0)))
+    except (TypeError, ValueError):
+        return None
+    return {
+        "schema": "hermes.delivery-ack.v1",
+        "delivery_id": envelope["delivery_id"],
+        "request_key": envelope["request_key"],
+        "turn_identity_sha256": envelope["turn_identity_sha256"],
+        "target_session_id": target_session_id,
+        "target_message_id": message_id,
+        "adapter": adapter,
+        "state": "persisted",
+        "accepted_at": envelope["accepted_at"],
+        "persisted_at": persisted_at,
+    }
+
+# Suppress startup messages for clean CLI experience
+os.environ["HERMES_QUIET"] = "1"  # Our own modules
 os.environ["HERMES_QUIET"] = "1"  # suppress our modules' startup chatter
 
 
@@ -1702,6 +1831,7 @@ def main(
     output_format: str = "text",
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
+    delivery_envelope_file: str | None = None,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -1763,6 +1893,13 @@ def main(
 
     _join_worktree = _start_worktree_setup(list_tools, list_toolsets, worktree, w)
     query = query or q
+    try:
+        query, _query_delivery_envelope = _decode_delivery_query(query)
+        _delivery_envelope = _load_delivery_envelope(delivery_envelope_file) or _query_delivery_envelope
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        print(f"Delivery envelope refused: {exc}", file=sys.stderr)
+        raise SystemExit(2)
+
     # ``hermes chat`` already validated this; the direct Fire entry point gets the same contract.
     if output_format == "stream-json":
         if not query:
@@ -1788,7 +1925,7 @@ def main(
     _install_single_query_signal_handlers(cli)
 
     if query or image:
-        _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json=output_format == "stream-json")
+        _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json=output_format == "stream-json", delivery_envelope=_delivery_envelope)
         return
     cli.run()
 

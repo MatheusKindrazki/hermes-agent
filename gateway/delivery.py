@@ -1,6 +1,7 @@
 """Delivery routing for cron job outputs and agent responses, by target: explicit ("telegram:123456789"),
 platform home channel ("telegram"), origin (back to where the job was created), or local (files)."""
 
+import hashlib
 import logging
 import re
 from pathlib import Path
@@ -34,6 +35,9 @@ def _is_silence_narration(content: Optional[str]) -> bool:
     """True when ``content`` is *only* a silence-narration token (length-guarded)."""
     stripped = content.strip() if content else ""
     return bool(stripped) and len(stripped) <= 64 and bool(_SILENCE_NARRATION.match(stripped))
+
+from .egress_policy import EgressPolicy
+from .reliability_outbox import ReliabilityOutbox
 
 
 class PartialDeliveryError(RuntimeError):
@@ -165,11 +169,24 @@ class DeliveryRouter:
     """Resolves delivery targets and dispatches messages to platform adapters."""
 
     def __init__(self, config: GatewayConfig, adapters: dict[Platform, Any] | None = None,
-                 dead_targets: Optional[DeadTargetRegistry] = None):  # profile-local registry when omitted
+                 dead_targets: Optional[DeadTargetRegistry] = None,
+                 reliability_outbox: Optional[ReliabilityOutbox] = None,
+                 egress_policy: Optional[EgressPolicy] = None):
+        """
+        Initialize the delivery router.
+
+        Args:
+            config: Gateway configuration
+            adapters: Dict mapping platforms to their adapter instances
+            dead_targets: Optional shared registry of confirmed-unreachable
+                targets.  When omitted, a profile-local registry is created.
+        """
         self.config = config
         self.adapters = adapters or {}
         self.output_dir = get_hermes_home() / "cron" / "output"
         self.dead_targets = dead_targets or DeadTargetRegistry()
+        self.reliability_outbox = reliability_outbox or ReliabilityOutbox.from_config()
+        self.egress_policy = egress_policy or EgressPolicy.from_config()
 
     async def deliver(self, content: str, targets: list[DeliveryTarget], job_id: Optional[str] = None,
                       job_name: Optional[str] = None, metadata: Optional[dict[str, Any]] = None) -> dict[str, Any]:
@@ -306,8 +323,8 @@ class DeliveryRouter:
                 if not _looks_like_int(thread_id):
                     # Named topic: create via createForumTopic, use message_thread_id directly.
                     named_topic = thread_id
-                    send_metadata["thread_id"] = await _ensure_named_dm_topic(adapter, target.chat_id, thread_id, refresh=False)
-                    send_metadata["telegram_dm_topic_created_for_send"] = True
+                    # Resolve/create only after policy admission and outbox ownership.
+                    # A shadow delivery must not create a real Telegram topic.
                 elif send_metadata.get("telegram_reply_to_message_id") is None:
                     # Legacy numeric private topic ids not created by this send path need a reply
                     # anchor to stay visible in the requested lane.
@@ -318,6 +335,60 @@ class DeliveryRouter:
                 else:
                     send_metadata["telegram_dm_topic_reply_fallback"] = True
 
+        send_metadata, egress_decision = self.egress_policy.prepare_metadata(
+            action="send",
+            destination=target.to_string(),
+            content=content.encode("utf-8"),
+            metadata=send_metadata,
+        )
+        if not egress_decision.allowed:
+            logger.warning(
+                "Egress policy rejected delivery to %s: %s",
+                target.to_string(),
+                ",".join(egress_decision.reasons),
+            )
+            return {
+                "success": False,
+                "error": "egress_policy_rejected",
+                "reason_codes": list(egress_decision.reasons),
+            }
+        if self.reliability_outbox.mode == "shadow":
+            payload = {
+                "schema": "kindra.outbox-payload/v1",
+                "content": content,
+                "destination": target.to_string(),
+                "metadata": send_metadata,
+            }
+            work_id = str(send_metadata.get("work_id") or "")
+            milestone = str(send_metadata.get("milestone") or "delivery")
+            version = str(
+                send_metadata.get("version")
+                or send_metadata.get("delivery_id")
+                or send_metadata.get("client_turn_id")
+                or hashlib.sha256(content.encode("utf-8")).hexdigest()
+            )
+            receipt = self.reliability_outbox.enqueue_json(
+                payload,
+                producer="hermes-agent.gateway.delivery",
+                work_id=work_id,
+                event_type="gateway_delivery",
+                milestone=milestone,
+                version=version,
+                destination=target.to_string(),
+            )
+            return {
+                "success": True,
+                "shadow_enqueued": True,
+                "delivered": False,
+                "event_id": receipt.event_id,
+                "idempotency_key": receipt.idempotency_key,
+            }
+        if transport.is_relay and self.egress_policy.mode != "off":
+            send_metadata["_egress_policy_checked"] = egress_decision.mode
+        if named_topic:
+            send_metadata["thread_id"] = await _ensure_named_dm_topic(
+                adapter, target.chat_id, named_topic, refresh=False)
+            send_metadata["telegram_dm_topic_created_for_send"] = True
         for retry in (False, True):
             result = await transport.send(target.platform, target.chat_id, content, metadata=send_metadata or None)
             error = _send_result_error(result)

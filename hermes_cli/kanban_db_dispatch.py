@@ -100,6 +100,10 @@ class DispatchResult:
     is
     """
 
+    target_reason: Optional[str] = None
+    """Stable outcome for an explicit task-id dispatch; None for a global tick."""
+    worker_path_error: Optional[str] = None
+    """Launcher validation failure, before claims, housekeeping or process effects."""
     reclaimed: int = 0
     promoted: int = 0
     reconciled_orphans: list[str] = field(default_factory=list)
@@ -1978,9 +1982,11 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
-def dispatch_once(
+def _dispatch_once_prevalidated(
     conn: sqlite3.Connection,
     *,
+    task_id: Optional[str] = None,
+    worker_path_snapshot=None,
     spawn_fn=None,
     ttl_seconds: Optional[int] = None,
     dry_run: bool = False,
@@ -2005,6 +2011,8 @@ def dispatch_once(
         return _dispatch_once_locked(
             conn,
             spawn_fn=spawn_fn,
+            task_id=task_id,
+            worker_path_snapshot=worker_path_snapshot,
             ttl_seconds=ttl_seconds,
             dry_run=dry_run,
             max_spawn=max_spawn,
@@ -2064,6 +2072,8 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    worker_path_snapshot=None,
+    target_constraints=None,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -2076,6 +2086,8 @@ def _dispatch_lane_task(
     # it by assigning a profile, and health telemetry suppresses "stuck" for it.
     profile_exists = _profile_exists_fn()
     if profile_exists is not None and not profile_exists(assignee):
+        if target_constraints is not None:
+            result.target_reason = "assignee_not_spawnable"
         result.skipped_nonspawnable.append(task_id)
         # Per-task diagnostic so ``show``/``tail`` name the missing profile instead of leaving
         # the card in ``ready`` with zero board evidence (#122422). Unlike a respawn guard the
@@ -2096,10 +2108,14 @@ def _dispatch_lane_task(
     if per_profile_cap is not None:
         current = per_profile_running.get(assignee, 0)
         if current >= per_profile_cap:
+            if target_constraints is not None:
+                result.target_reason = "assignee_capacity_exhausted"
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
+        if target_constraints is not None:
+            result.target_reason = "respawn_guarded"
         result.respawn_guarded.append((task_id, guard_reason))
         # Event so ``hermes kanban tail`` shows why the task looks stuck.
         # Honour kanban.default_assignee: when the dispatcher hits an unassigned ready task and an
@@ -2120,11 +2136,18 @@ def _dispatch_lane_task(
             per_profile_running[name] = per_profile_running.get(name, 0) + 1
 
     if dry_run:
+        if target_constraints is not None:
+            result.target_reason = "spawned"
         result.spawned.append((task_id, assignee, ""))
         _count_spawn(assignee)
         return True
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
-    claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
+    if target_constraints is not None:
+        outcome = claim(conn, task_id, ttl_seconds=ttl_seconds, target_constraints=target_constraints)
+        claimed = outcome.task
+        result.target_reason = outcome.reason or "claim_failed"
+    else:
+        claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
         return False
     try:
@@ -2134,6 +2157,8 @@ def _dispatch_lane_task(
         else:
             workspace = _kbw.resolve_workspace(claimed, board=board)
     except Exception as exc:
+        if target_constraints is not None:
+            result.target_reason = "spawn_failed"
         if _record_task_failure(
             conn, claimed.id, f"workspace: {exc}",
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
@@ -2149,7 +2174,10 @@ def _dispatch_lane_task(
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
     try:
-        pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
+        if spawn_fn is None:
+            pid = _default_spawn(claimed, str(workspace), board=board, worker_path_snapshot=worker_path_snapshot)
+        else:
+            pid = _call_spawn_fn(spawn_fn, claimed, str(workspace), board)
         if pid:
             _set_worker_pid(conn, claimed.id, int(pid), run_id=claimed.current_run_id, claim_lock=claimed.claim_lock)
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
@@ -2157,10 +2185,14 @@ def _dispatch_lane_task(
         # consecutive_failures is deliberately NOT reset here: resetting on
         # spawn would let a task that keeps timing out loop forever. Cleared
         # only on successful completion (complete_task).
+        if target_constraints is not None:
+            result.target_reason = "spawned"
         result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
         _count_spawn(claimed.assignee)
         return True
     except Exception as exc:
+        if target_constraints is not None:
+            result.target_reason = "spawn_failed"
         from tools.process_registry import RestartSafeScopeUnavailable
 
         # The host refused the spawn (no restart-safe scope): nothing about the
@@ -2356,6 +2388,8 @@ def _resolve_default_assignee(default_assignee: Optional[str]) -> Optional[str]:
 def _dispatch_once_locked(
     conn: sqlite3.Connection,
     *,
+    task_id: Optional[str] = None,
+    worker_path_snapshot=None,
     spawn_fn=None,
     ttl_seconds: Optional[int] = None,
     dry_run: bool = False,
@@ -2374,20 +2408,43 @@ def _dispatch_once_locked(
     the PID so later ticks catch crashes before the TTL. Cap semantics:
     :func:`_tick_spawn_budget`."""
     result = DispatchResult()
-    _run_reclaim_phase(
-        conn, result, stale_timeout_seconds=stale_timeout_seconds,
-        failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
-    )
+    target_constraints = None
+    if task_id:
+        reason = _target_dispatch_preflight_reason(
+            conn, task_id=task_id, board=board, max_spawn=max_spawn,
+            max_in_progress=max_in_progress,
+            max_in_progress_per_profile=max_in_progress_per_profile,
+        )
+        if reason:
+            result.target_reason = reason
+            return result
+        target = conn.execute("SELECT tenant, assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        target_constraints = _kb.TargetClaimConstraints(
+            expected_tenant=(target["tenant"] or "").strip() or None,
+            expected_assignee=target["assignee"].strip(),
+            max_board_running=max_spawn, max_host_running=max_in_progress,
+            other_boards_running=count_running_tasks_other_boards(board),
+            max_assignee_running=max_in_progress_per_profile,
+        )
+    else:
+        _run_reclaim_phase(
+            conn, result, stale_timeout_seconds=stale_timeout_seconds,
+            failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
+        )
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
     )
     if not may_spawn:
+        if task_id:
+            result.target_reason = "memory_pressure" if result.memory_pressure else "board_capacity_exhausted"
         return result
 
     ready_rows = _lane_rows(conn, "ready")
+    if task_id:
+        ready_rows = [row for row in ready_rows if row["id"] == task_id]
     # Review rows are enumerated up front so the budget split can see whether
     # review work exists at all.
-    review_rows = _lane_rows(conn, "review") if review_dispatch_enabled() else []
+    review_rows = _lane_rows(conn, "review") if not task_id and review_dispatch_enabled() else []
     # Per-profile cap. Deferred tasks go to skipped_per_profile_capped, not
     # skipped_unassigned — "busy, retry later" differs from "needs routing".
     # Resolved BEFORE the review reservation so the reservation can see which
@@ -2421,6 +2478,7 @@ def _dispatch_once_locked(
     lane_kwargs: dict[str, Any] = dict(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
+        worker_path_snapshot=worker_path_snapshot, target_constraints=target_constraints,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
@@ -2752,7 +2810,7 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
     ).argv
 
 
-def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
+def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None, worker_path_snapshot=None) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
     Returns the child's PID so the dispatcher can detect crashes before the
@@ -2763,6 +2821,9 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     """
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
+
+    if worker_path_snapshot is None:
+        worker_path_snapshot = _kb._snapshot_worker_path_lib(os.environ)
 
     from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
 
@@ -2874,8 +2935,12 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     cmd = _restart_safe_worker_argv(task, cmd)
     from tools.process_registry import systemd_user_bus_env
     env = systemd_user_bus_env(env)
-    log_f = _open_worker_log(task, board)
+    source_image = worker_path_snapshot.open_source_image()
+    cmd = ["/bin/bash", "-c", _kb._WORKER_PATH_EXEC_SCRIPT, "hermes-worker-path",
+           worker_path_snapshot.source_path_for(source_image.fileno()), *cmd]
+    log_f = None
     try:
+        log_f = _open_worker_log(task, board)
         proc = subprocess.Popen(
             cmd,
             cwd=workspace if os.path.isdir(workspace) else None,
@@ -2883,15 +2948,19 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
             stdout=log_f,
             stderr=subprocess.STDOUT,
             env=env,
+            pass_fds=(source_image.fileno(),),
             start_new_session=True,
             creationflags=subprocess.CREATE_NO_WINDOW if _kb._IS_WINDOWS else 0,
         )
     except FileNotFoundError:
-        log_f.close()
+        if log_f is not None:
+            log_f.close()
         raise RuntimeError(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
+    finally:
+        source_image.close()
     # Intentionally NOT closing log_f: the child keeps writing after return;
     # the OS-level FD stays open in the child until it exits.
     if _kb._IS_WINDOWS:
@@ -2963,3 +3032,118 @@ def run_daemon(
 from hermes_cli import kanban_db as _kb
 from hermes_cli import kanban_db_connect as _kbc
 from hermes_cli import kanban_db_workspace as _kbw
+
+
+def _target_dispatch_preflight_reason(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    board: Optional[str],
+    max_spawn: Optional[int],
+    max_in_progress: Optional[int],
+    max_in_progress_per_profile: Optional[int],
+) -> Optional[str]:
+    """Read-only fast-fail before the immutable launcher gate.
+
+    This establishes operator-facing reason precedence without weakening the
+    later transactional revalidation, which remains the authority for claim.
+    """
+    if board is not None:
+        actual_row = conn.execute("PRAGMA database_list").fetchone()
+        actual = str(
+            actual_row["file"] if hasattr(actual_row, "keys") else actual_row[2]
+        )
+        expected = str(_kb.kanban_db_path(board=board))
+        if actual and Path(actual).resolve() != Path(expected).resolve():
+            return "board_mismatch"
+    target = conn.execute(
+        "SELECT status, assignee, tenant FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if target is None:
+        return "task_not_found"
+    expected_tenant = (os.environ.get("HERMES_TENANT") or "").strip() or None
+    target_tenant = (target["tenant"] or "").strip() or None
+    if expected_tenant != target_tenant:
+        return "tenant_mismatch"
+    if target["status"] != "ready":
+        return "status_not_ready"
+    if not (target["assignee"] or "").strip():
+        return "assignee_required"
+    running = int(conn.execute(
+        "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+    ).fetchone()[0])
+    if max_spawn is not None and running >= max_spawn:
+        return "board_capacity_exhausted"
+    if max_in_progress is not None:
+        total_running = running + count_running_tasks_other_boards(board)
+        if total_running >= max_in_progress:
+            return "host_capacity_exhausted"
+    if (
+        isinstance(max_in_progress_per_profile, int)
+        and max_in_progress_per_profile > 0
+    ):
+        assignee_running = int(conn.execute(
+            "SELECT COUNT(*) FROM tasks "
+            "WHERE status = 'running' AND assignee = ?",
+            (target["assignee"],),
+        ).fetchone()[0])
+        if assignee_running >= max_in_progress_per_profile:
+            return "assignee_capacity_exhausted"
+    return None
+
+
+
+def dispatch_once(
+    conn: sqlite3.Connection,
+    *,
+    task_id: Optional[str] = None,
+    spawn_fn=None,
+    ttl_seconds: Optional[int] = None,
+    dry_run: bool = False,
+    max_spawn: Optional[int] = None,
+    max_in_progress: Optional[int] = None,
+    failure_limit: int = DEFAULT_FAILURE_LIMIT,
+    stale_timeout_seconds: int = 0,
+    board: Optional[str] = None,
+    default_assignee: Optional[str] = None,
+    max_in_progress_per_profile: Optional[int] = None,
+    reconcile_orphans: bool = True,
+) -> DispatchResult:
+    """Validate the immutable real-launcher image before any tick effect."""
+    if task_id:
+        preflight_reason = _target_dispatch_preflight_reason(
+            conn,
+            task_id=task_id,
+            board=board,
+            max_spawn=max_spawn,
+            max_in_progress=max_in_progress,
+            max_in_progress_per_profile=max_in_progress_per_profile,
+        )
+        if preflight_reason is not None:
+            return DispatchResult(target_reason=preflight_reason)
+    worker_path_snapshot = None
+    if spawn_fn is None and not dry_run:
+        try:
+            worker_path_snapshot = _kb._snapshot_worker_path_lib(os.environ)
+        except RuntimeError as exc:
+            reason = str(exc)
+            return DispatchResult(
+                target_reason=reason if task_id else None,
+                worker_path_error=reason,
+            )
+    return _dispatch_once_prevalidated(
+        conn,
+        task_id=task_id,
+        spawn_fn=spawn_fn,
+        worker_path_snapshot=worker_path_snapshot,
+        ttl_seconds=ttl_seconds,
+        dry_run=dry_run,
+        max_spawn=max_spawn,
+        max_in_progress=max_in_progress,
+        failure_limit=failure_limit,
+        stale_timeout_seconds=stale_timeout_seconds,
+        board=board,
+        default_assignee=default_assignee,
+        max_in_progress_per_profile=max_in_progress_per_profile,
+        reconcile_orphans=reconcile_orphans,
+    )

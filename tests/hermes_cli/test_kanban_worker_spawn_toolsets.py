@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+import os
 import subprocess
 
 
@@ -111,10 +112,29 @@ def test_default_spawn_does_not_pass_mutable_launch_overrides(monkeypatch, tmp_p
     task.model_override = "gpt-5.6-sol"
     kbd._default_spawn(task, str(workspace))
 
+    # The signed launcher is intentionally visible: validate its fixed shell
+    # wrapper, then unwrap only the positional Hermes payload and exercise the
+    # real shared parser. This catches regressions in both layers.
+    wrapped = captured["cmd"]
+    assert wrapped[:2] == ["/bin/bash", "-c"]
+    assert 'source "$1"' in wrapped[2]
+    assert 'exec "$@"' in wrapped[2]
+    assert wrapped[3] == "hermes-worker-path"
+    assert wrapped[4].startswith("/dev/fd/")
     # Mutable model strings are not launch authority; the owner reads the claimed card.
     assert captured["cmd"][-2:] == ["-m", "hermes_cli.kanban_worker_client"]
     assert task.model_override not in captured["cmd"]
 
+def test_signed_worker_path_fixture_preserves_explicit_inputs(
+    _signed_worker_path_env,
+):
+    """Caller-provided K5 path/hash always win over pytest's fallback."""
+    explicit_path = _signed_worker_path_env["explicit_path"]
+    explicit_hash = _signed_worker_path_env["explicit_hash"]
+    if explicit_path is not None:
+        assert os.environ["HERMES_WORKER_PATH_LIB"] == explicit_path
+    if explicit_hash is not None:
+        assert os.environ["K5_WORKER_PATH_SHA256"] == explicit_hash
 def test_default_spawn_resolves_env_passthrough_under_multiplex(monkeypatch, tmp_path):
     """Under multiplex a worker spawn with ``terminal.env_passthrough`` configured must
     forward the ASSIGNEE profile's own value, never crash on an unscoped read or leak the

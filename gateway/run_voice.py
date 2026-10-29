@@ -460,9 +460,16 @@ class GatewayVoiceMixin:
         is_in_vc = getattr(adapter, "is_in_voice_channel", None)
         if guild_id and callable(play) and callable(is_in_vc) and is_in_vc(guild_id):
             for path in audio_paths:
-                await play(guild_id, path)
+                async def deliver_voice_channel(_metadata):
+                    return await play(guild_id, path)
+                await self._deliver_external_action(
+                    adapter=adapter, chat_id=event.source.chat_id, action="send_media",
+                    content=path.encode(), payload={"action": "play_in_voice_channel", "audio_path": path},
+                    metadata=self._thread_metadata_for_source(event.source),
+                    event_type="gateway_runner_auto_tts", milestone="auto-tts", deliver=deliver_voice_channel,
+                )
             return
-        if not callable(send_voice := getattr(adapter, "send_voice", None)):
+        if not callable(getattr(adapter, "send_voice", None)):
             return
         reply_anchor = self._reply_anchor_for_event(event)
         # notify=True mirrors the final-text path in platforms/base.py so notification-gating
@@ -470,5 +477,7 @@ class GatewayVoiceMixin:
         thread_meta = dict(self._thread_metadata_for_source(event.source, reply_anchor) or {})
         thread_meta["notify"] = True
         for path in audio_paths:
-            await send_voice(chat_id=event.source.chat_id, audio_path=path, reply_to=reply_anchor,
-                             metadata=thread_meta)
+            await self._deliver_native_final(
+                adapter, "send_voice", event_type="gateway_runner_auto_tts",
+                chat_id=event.source.chat_id, audio_path=path, reply_to=reply_anchor, metadata=thread_meta,
+            )

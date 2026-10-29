@@ -2099,6 +2099,21 @@ def load_config_readonly() -> dict[str, Any]:
     return _load_config_impl(want_deepcopy=False)
 
 
+def load_config_readonly_for_home(home: Path) -> dict[str, Any]:
+    """Read effective config for an explicit delivery destination.
+
+    Delivery must not fall back to a different route on malformed config.
+    Use a strict snapshot without home initialization or cached fallbacks,
+    scoped to this context without mutating process environment.
+    """
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+    token = set_hermes_home_override(home)
+    try:
+        return _load_config_impl(want_deepcopy=False, strict=True)
+    finally:
+        reset_hermes_home_override(token)
+
 def _ensure_dict(parent: dict[str, Any], key: str) -> dict[str, Any]:
     """Return ``parent[key]`` as a dict, replacing a missing or non-dict value with ``{}``."""
     child = parent.get(key)
@@ -2279,13 +2294,13 @@ def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: 
     return lkg_copy
 
 
-def _merge_managed_overlay(expanded: dict[str, Any]) -> tuple[dict[str, Any], Any]:
+def _merge_managed_overlay(expanded: dict[str, Any], *, strict: bool = False) -> tuple[dict[str, Any], Any]:
     """Apply the managed-scope overlay; returns ``(merged, managed_config_or_falsy)``.
     Managed wins at the leaf and is applied AFTER user expansion so a user ``${VAR}`` cannot shadow
     a managed literal: managed values expand only against the process environment. This
     deliberately inverts the usual env-over-config precedence for the keys the managed layer pins
     (docs/design/managed-scope.md §4.1)."""
-    managed_config = managed_scope.load_managed_config()
+    managed_config = managed_scope.load_managed_config(strict=True) if strict else managed_scope.load_managed_config()
     if not managed_config:
         return expanded, managed_config
     # Same canonicalization as the user config BEFORE merging (parity with
@@ -2322,7 +2337,7 @@ def _load_config_cache_hit(path_key: str, cache_sig: Any) -> Optional[dict[str, 
     return None
 
 
-def _load_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:
+def _load_config_impl(*, want_deepcopy: bool, strict: bool = False) -> dict[str, Any]:
     snapshot = _worker_config_snapshot()
     if snapshot is not None:
         return _deep_merge(copy.deepcopy(DEFAULT_CONFIG), snapshot)
@@ -2334,7 +2349,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:
     try:
         config_path = get_config_path()
         path_key = str(config_path)
-        if path_key in _LOAD_CONFIG_CACHE:
+        if not strict and path_key in _LOAD_CONFIG_CACHE:
             _, fast_sig = _load_config_cache_sig(config_path)
             hit = _load_config_cache_hit(path_key, fast_sig)
             if hit is not None:
@@ -2345,13 +2360,14 @@ def _load_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:
         pass
 
     with _CONFIG_LOCK:
-        ensure_hermes_home()
+        if not strict:
+            ensure_hermes_home()
         config_path = get_config_path()
         path_key = str(config_path)
 
         user_sig, cache_sig = _load_config_cache_sig(config_path)
 
-        hit = _load_config_cache_hit(path_key, cache_sig)
+        hit = None if strict else _load_config_cache_hit(path_key, cache_sig)
         if hit is not None:
             return copy.deepcopy(hit) if want_deepcopy else hit
 
@@ -2360,8 +2376,13 @@ def _load_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:
         if user_sig is not None:
             try:
                 with open(config_path, encoding="utf-8-sig") as f:
-                    user_config = fast_safe_load(f) or {}
-                _CONFIG_PARSE_FAILURES.pop(path_key, None)  # the file reads now (a transient error left the record)
+                    user_config = fast_safe_load(f)
+                if user_config is None:
+                    user_config = {}
+                if strict and not isinstance(user_config, dict):
+                    raise ValueError("Delivery configuration must be a mapping")
+                user_config = user_config or {}
+                _CONFIG_PARSE_FAILURES.pop(path_key, None)
 
                 if "max_turns" in user_config:
                     agent_user_config = dict(user_config.get("agent") or {})
@@ -2379,6 +2400,8 @@ def _load_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:
                 from hermes_cli.config_backups import backup_config
                 backup_config(config_path, "good")
             except Exception as e:
+                if strict:
+                    raise
                 lkg_copy = _last_known_good_fallback(config_path, path_key, cache_sig, e)
                 if lkg_copy is not None:
                     return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
@@ -2391,7 +2414,9 @@ def _load_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:
                 return copy.deepcopy(fallback) if want_deepcopy else fallback
 
         normalized = _canonicalize_config(config)
-        expanded, managed_config = _merge_managed_overlay(_expand_env_vars(normalized))
+        expanded, managed_config = _merge_managed_overlay(_expand_env_vars(normalized), strict=strict)
+        if strict:
+            return expanded
         _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
         if cache_sig is not None:
             # The cache stores its own deepcopy so load_config() callers can mutate freely while

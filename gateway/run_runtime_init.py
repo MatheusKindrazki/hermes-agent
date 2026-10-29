@@ -131,6 +131,9 @@ class GatewayRuntimeInitMixin:
         self._completion_notification_batch_flush_tasks: set[asyncio.Task] = set()
         self._completion_notification_batch_window = 0.1
         self._completion_notification_batches_stopping = False
+        # Deduplicate equivalent internal conclusions across producer callbacks.
+        self._internal_equivalence_seen: OrderedDict = OrderedDict()
+        self._internal_equivalence_inflight: dict = {}
 
     def _init_runtime_caches(self) -> None:
         """Agent cache, profile identity, Teams runtime, failed-platform tracking, slash-confirm counter."""

@@ -5,6 +5,7 @@ import { MemoryRouter } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { assistantTextPart, type ChatMessage } from '@/lib/chat-messages'
+import { $connectionsRegistry } from '@/store/connection-registry-state'
 import {
   $activeSessionId,
   $awaitingResponse,
@@ -21,6 +22,9 @@ import {
 } from '@/store/session'
 
 const threadRenderCount = vi.hoisted(() => ({ current: 0 }))
+const getApiCapabilities = vi.hoisted(() => vi.fn())
+
+vi.mock('@/api/capabilities', () => ({ getApiCapabilities }))
 
 vi.mock('@/components/assistant-ui/thread', async () => {
   const React = await import('react')
@@ -49,7 +53,42 @@ vi.mock('@/lib/model-options', () => ({
 }))
 vi.mock('./chat-drop-overlay', () => ({ ChatDropOverlay: () => null }))
 vi.mock('./chat-swap-overlay', () => ({ ChatSwapOverlay: () => null, ChatSyncBadge: () => null }))
-vi.mock('./composer', () => ({ ChatBar: () => null, ChatBarFallback: () => null }))
+vi.mock('./composer', async () => {
+  const React = await import('react')
+
+  return {
+    ChatBar: ({
+      allowDraftingWhileDisabled,
+      disabled,
+      onSteer,
+      onSubmit
+    }: {
+      allowDraftingWhileDisabled?: boolean
+      disabled?: boolean
+      onSteer?: (text: string) => void
+      onSubmit: (text: string) => void
+    }) =>
+      React.createElement(
+        'div',
+        {
+          'data-composer-disabled': disabled ? 'true' : 'false',
+          'data-drafting-while-disabled': allowDraftingWhileDisabled ? 'true' : 'false',
+          'data-testid': 'composer-probe'
+        },
+        React.createElement(
+          'button',
+          { onClick: () => onSubmit('identity probe'), type: 'button' },
+          'submit identity probe'
+        ),
+        React.createElement(
+          'button',
+          { onClick: () => onSteer?.('identity steer probe'), type: 'button' },
+          'steer identity probe'
+        )
+      ),
+    ChatBarFallback: () => null
+  }
+})
 vi.mock('./hooks/use-file-drop-zone', () => ({
   useFileDropZone: () => ({ dragKind: null, dropHandlers: {} })
 }))
@@ -74,6 +113,14 @@ function assistantMessage(id: string, text: string): ChatMessage {
 
 describe('ChatView render isolation', () => {
   beforeEach(() => {
+    getApiCapabilities.mockResolvedValue({
+      features: {
+        active_context_v2: {
+          enabled: false,
+          receipt_schema: 'kindra.active-context/v1'
+        }
+      }
+    })
     threadRenderCount.current = 0
     $activeSessionId.set('runtime-1')
     $awaitingResponse.set(false)
@@ -87,6 +134,12 @@ describe('ChatView render isolation', () => {
     $messages.set([assistantMessage('assistant-1', 'Stable historical answer')])
     $selectedStoredSessionId.set('stored-1')
     $sessions.set([{ id: 'stored-1', message_count: 1, title: 'Stable chat' } as never])
+    $connectionsRegistry.set({
+      connections: [{ id: 'homelab', kind: 'ssh', label: 'Homelab', tokenSet: false }],
+      primary: 'homelab',
+      secureTokenStorage: true,
+      version: 1
+    } as never)
   })
 
   afterEach(() => {
@@ -104,6 +157,7 @@ describe('ChatView render isolation', () => {
     $messages.set([])
     $selectedStoredSessionId.set(null)
     $sessions.set([])
+    $connectionsRegistry.set(null)
   })
 
   it('does not re-render chat history when an unrelated parent idle tick updates', () => {
@@ -161,5 +215,186 @@ describe('ChatView render isolation', () => {
     // memo(ChatView) with stable props must absorb the parent's idle tick —
     // the transcript (Thread) must not re-render. This is PR #38470's contract.
     expect(threadRenderCount.current).toBe(1)
+  })
+
+  it('blocks the production submit entrypoint when the backend receipt diverges', () => {
+    const onSubmit = vi.fn()
+    const onSteer = vi.fn()
+    $sessions.set([
+      {
+        active_context: {
+          schema: 'kindra.active-context/v1',
+          connection_id: 'homelab',
+          gateway_generation: 'gateway-sha',
+          machine: 'personal-mac-mini',
+          profile: 'research',
+          runtime_session_id: 'runtime-1',
+          stored_session_id: 'different-session',
+          tenant: 'research-team',
+          work_id: null,
+          xirp_session_id: null
+        },
+        connection_id: 'homelab',
+        gateway_generation: 'gateway-sha',
+        id: 'stored-1',
+        machine: 'personal-mac-mini',
+        message_count: 1,
+        profile: 'research',
+        runtime_session_id: 'runtime-1',
+        tenant: 'research-team',
+        title: 'Stable chat'
+      } as never
+    ])
+
+    const props = {
+      gateway: null,
+      identityV2Enabled: true,
+      onAddContextRef: vi.fn(),
+      onAddUrl: vi.fn(),
+      onAttachDroppedItems: vi.fn(),
+      onAttachImageBlob: vi.fn(),
+      onCancel: vi.fn(),
+      onDeleteSelectedSession: vi.fn(),
+      onEdit: vi.fn(),
+      onPasteClipboardImage: vi.fn(),
+      onPickFiles: vi.fn(),
+      onPickFolders: vi.fn(),
+      onPickImages: vi.fn(),
+      onReload: vi.fn(),
+      onRemoveAttachment: vi.fn(),
+      onRetryResume: vi.fn(),
+      onSteer,
+      onSubmit,
+      onThreadMessagesChange: vi.fn(),
+      onToggleSelectedPin: vi.fn()
+    }
+
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } }
+    })
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={['/stored-1']}>
+          <ChatView {...props} />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'submit identity probe' }))
+    fireEvent.click(screen.getByRole('button', { name: 'steer identity probe' }))
+
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(onSteer).not.toHaveBeenCalled()
+  })
+
+  it('keeps a fresh draft editable but blocks submit and steer without a receipt when the canary is enabled', async () => {
+    getApiCapabilities.mockResolvedValue({
+      features: {
+        active_context_v2: {
+          enabled: true,
+          receipt_schema: 'kindra.active-context/v1'
+        }
+      }
+    })
+    $gatewayState.set('open')
+    $activeSessionId.set(null)
+    $selectedStoredSessionId.set(null)
+    $sessions.set([])
+    const onSubmit = vi.fn()
+    const onSteer = vi.fn()
+
+    const props = {
+      gateway: null,
+      onAddContextRef: vi.fn(),
+      onAddUrl: vi.fn(),
+      onAttachDroppedItems: vi.fn(),
+      onAttachImageBlob: vi.fn(),
+      onCancel: vi.fn(),
+      onDeleteSelectedSession: vi.fn(),
+      onEdit: vi.fn(),
+      onPasteClipboardImage: vi.fn(),
+      onPickFiles: vi.fn(),
+      onPickFolders: vi.fn(),
+      onPickImages: vi.fn(),
+      onReload: vi.fn(),
+      onRemoveAttachment: vi.fn(),
+      onRetryResume: vi.fn(),
+      onSteer,
+      onSubmit,
+      onThreadMessagesChange: vi.fn(),
+      onToggleSelectedPin: vi.fn()
+    }
+
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } }
+    })
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={['/']}>
+          <ChatView {...props} />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+
+    await vi.waitFor(() => {
+      const surface = screen.getByRole('button', { name: 'submit identity probe' }).closest('[data-chat-surface]')
+
+      expect(surface?.getAttribute('data-active-context-submit')).toBe('blocked')
+      expect(screen.getByTestId('composer-probe').getAttribute('data-composer-disabled')).toBe('true')
+      expect(screen.getByTestId('composer-probe').getAttribute('data-drafting-while-disabled')).toBe('true')
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'submit identity probe' }))
+    fireEvent.click(screen.getByRole('button', { name: 'steer identity probe' }))
+
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(onSteer).not.toHaveBeenCalled()
+  })
+
+  it('blocks an immediate draft click while backend capability is pending', () => {
+    getApiCapabilities.mockReturnValue(new Promise(() => {}))
+    $gatewayState.set('open')
+    $activeSessionId.set(null)
+    $selectedStoredSessionId.set(null)
+    $sessions.set([])
+    const onSubmit = vi.fn()
+
+    const props = {
+      gateway: null,
+      onAddContextRef: vi.fn(),
+      onAddUrl: vi.fn(),
+      onAttachDroppedItems: vi.fn(),
+      onAttachImageBlob: vi.fn(),
+      onCancel: vi.fn(),
+      onDeleteSelectedSession: vi.fn(),
+      onEdit: vi.fn(),
+      onPasteClipboardImage: vi.fn(),
+      onPickFiles: vi.fn(),
+      onPickFolders: vi.fn(),
+      onPickImages: vi.fn(),
+      onReload: vi.fn(),
+      onRemoveAttachment: vi.fn(),
+      onRetryResume: vi.fn(),
+      onSteer: vi.fn(),
+      onSubmit,
+      onThreadMessagesChange: vi.fn(),
+      onToggleSelectedPin: vi.fn()
+    }
+
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } }
+    })
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={['/']}>
+          <ChatView {...props} />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'submit identity probe' }))
+
+    expect(onSubmit).not.toHaveBeenCalled()
   })
 })

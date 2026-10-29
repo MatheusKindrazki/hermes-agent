@@ -180,7 +180,7 @@ def _single_query_exit_code(result, *, credentials_rate_limited: bool = False,
     )
 
 
-def _run_quiet_single_query(cli, effective_query, emitter=None):
+def _run_quiet_single_query(cli, effective_query, emitter=None, delivery_envelope=None):
     """Quiet (-Q) one-shot turn: run, print the response (stderr for errors/session_id), then sys.exit with the automation exit code.
     With a ``StreamJsonEmitter`` the final answer and the exit line become the terminal ``result`` JSONL record instead.
     HERMES_TURN_AUTHOR (set only by a bot-to-bot dispatcher) is consumed here so tool subprocesses do not inherit it.
@@ -194,6 +194,22 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
         bind_quiet_session_key, continue_quiet_notify_completions, exit_single_query, quiet_notify_linger_seconds, take_turn_report_path, write_turn_report,
     )
 
+    from cli import _delivery_ack, _delivery_display_metadata, DeliveryRebindError
+    import json
+    delivery_db = getattr(cli.agent, "_session_db", None)
+    delivery_kwargs = {}
+    if delivery_envelope is not None:
+        if emitter is not None:
+            raise ValueError("delivery_envelope_stream_json_unsupported")
+        if delivery_db is None:
+            raise ValueError("delivery_session_db_unavailable")
+        existing = _delivery_ack(delivery_db, cli.session_id, delivery_envelope, adapter="cli")
+        if existing is not None:
+            print(json.dumps({"reply": "", "session_id": existing["target_session_id"], "delivery_ack": existing}, sort_keys=True))
+            print(f"\nsession_id: {existing['target_session_id']}", file=sys.stderr)
+            exit_single_query(0)
+        delivery_kwargs = {"persist_user_display_kind": "bot_delivery", "persist_user_display_metadata": _delivery_display_metadata(delivery_envelope)}
+
     author = take_turn_author_from_env()
     # A spawner that bounds only the turn (cron Bot Chat lane) learns the outcome from this
     # report, written before the linger below; popped so tool subprocesses do not inherit it.
@@ -202,7 +218,7 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
     with bind_quiet_session_key(getattr(cli, "session_id", "") or "default"):
         try:
             result = cli.agent.run_conversation(
-                user_message=effective_query, conversation_history=cli.conversation_history, **author_kwargs,
+                user_message=effective_query, conversation_history=cli.conversation_history, **author_kwargs, **delivery_kwargs,
             )
         except KeyboardInterrupt:
             _emit_interrupted_session_end(cli, reason="keyboard_interrupt")
@@ -292,8 +308,14 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
         and (result.get("failed") or result.get("partial"))
     ):
         print(t("gateway.model.error_prefix", error=result["error"]), file=sys.stderr)
-    elif response:
+    elif response and delivery_envelope is None:
         print(response)
+
+    if delivery_envelope is not None:
+        ack = _delivery_ack(delivery_db, cli.session_id, delivery_envelope, adapter="cli")
+        if ack is None:
+            raise DeliveryRebindError("delivery_ack_unavailable_after_persistence")
+        print(json.dumps({"reply": response, "session_id": ack["target_session_id"], "delivery_ack": ack}, sort_keys=True))
 
     # ONE exit-code decision point for this driver, shared with the non-quiet one-shot
     # path via _single_query_exit_code: a quota/billing wall keeps the EX_TEMPFAIL
@@ -467,7 +489,7 @@ def _configure_quiet_agent(agent) -> None:
     agent.tool_progress_mode = "off"
 
 
-def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool = False):
+def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool = False, delivery_envelope=None):
     """``-q``/``--image`` entry: seed an interactive session on a TTY, else run the one-shot turn and exit.
     ``stream_json`` (implies quiet) swaps the plain-text final answer for the JSONL event protocol."""
     from cli import _SeededQueryMessage, _collect_kanban_task_images, _collect_query_images, _configure_quiet_agent, _finalize_single_query, _route_single_query_images, _run_kanban_goal_loop_chat, _run_quiet_single_query, _should_seed_interactive, _single_query_exit_code
@@ -529,7 +551,7 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
                     _configure_quiet_agent(cli.agent)
                     if emitter is not None:
                         emitter.attach(cli.agent)
-                    _run_quiet_single_query(cli, effective_query, emitter=emitter)
+                    _run_quiet_single_query(cli, effective_query, emitter=emitter, delivery_envelope=delivery_envelope)
 
             fail_code = _single_query_exit_code(
                 None, credentials_rate_limited=getattr(cli, "_credentials_rate_limited", False),

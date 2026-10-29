@@ -164,9 +164,11 @@ async def _close_unless_sidecar_allowed(ws: WebSocket) -> bool:
     if not _DASHBOARD_EMBEDDED_CHAT_ENABLED:
         await ws.close(code=4403)
         return False
-    if not _ws_auth_ok(ws):
+    auth_reason, auth_method = _ws_auth_reason(ws)
+    if auth_reason is not None:
         await ws.close(code=4401)
         return False
+    ws._hermes_native_auth_method = auth_method
     if not _ws_request_is_allowed(ws):
         await ws.close(code=4403)
         return False
@@ -730,6 +732,7 @@ async def gateway_ws(ws: WebSocket) -> None:
         ws,
         auth_identity=identity,
         operator=True,  # The dashboard upgrade gate above has verified this operator.
+        auth_method=getattr(ws, "_hermes_native_auth_method", None),
         subprotocol=getattr(ws, "_hermes_ws_subprotocol", None),
     )
 

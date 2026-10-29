@@ -14,6 +14,14 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
 
 
+def _worker_argv_after_path_source(cmd):
+    """Scope assertions inspect the exec argv inside the signed PATH launcher."""
+    assert cmd[:2] == ["/bin/bash", "-c"]
+    assert cmd[3] == "hermes-worker-path"
+    assert cmd[4].startswith("/dev/fd/")
+    return cmd[5:]
+
+
 @pytest.fixture
 def worker_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, kb.Task]:
     root = tmp_path / ".hermes"
@@ -63,7 +71,7 @@ def test_managed_gateway_worker_is_spawned_in_restart_safe_scope(
 
     def fake_popen(cmd, **kwargs):
         nonlocal captured_cwd
-        captured_cmd.extend(cmd)
+        captured_cmd.extend(_worker_argv_after_path_source(cmd))
         captured_env.update(kwargs.get("env") or {})
         captured_cwd = kwargs.get("cwd")
         return FakeProc()
@@ -135,7 +143,7 @@ def test_standalone_dispatcher_keeps_direct_worker_spawn(
 
     # Standalone = no systemd unit at all (CI runners inherit INVOCATION_ID).
     monkeypatch.delenv("INVOCATION_ID", raising=False)
-    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kwargs: captured_cmd.extend(cmd) or FakeProc())
+    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kwargs: captured_cmd.extend(_worker_argv_after_path_source(cmd)) or FakeProc())
     monkeypatch.setattr("tools.process_registry._is_supervised_gateway_process", lambda: False)
     monkeypatch.setattr(
         "tools.process_registry._systemd_run_user_scope_available",
@@ -164,7 +172,7 @@ def test_oneshot_unit_dispatcher_scope_wraps_or_warns_never_dooms_silently(
     class FakeProc:
         pid = 4243
 
-    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kwargs: spawned.append(list(cmd)) or FakeProc())
+    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kwargs: spawned.append(_worker_argv_after_path_source(cmd)) or FakeProc())
     monkeypatch.setenv("INVOCATION_ID", "oneshot-dispatch-timer")
     monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: False)
     monkeypatch.setattr(process_registry, "_systemd_run_user_scope_available", lambda: True)

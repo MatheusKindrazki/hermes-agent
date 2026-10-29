@@ -476,7 +476,7 @@ _ACTIONS: dict[str, _ActionSpec] = {
         else backend.set_value(value=str(args["value"]), element=args.get("element")))),
     "focus_app": _ActionSpec(lambda backend, action, args, **_: (
         json.dumps({"error": "focus_app requires `app`"}) if not args.get("app")
-        else backend.focus_app(args["app"], raise_window=bool(args.get("raise_window")))), destructive=True,
+        else backend.focus_app(args["app"], raise_window=bool(args.get("raise_window")))), destructive=False,
         summarize=lambda a, args, fg: f"focus {args.get('app', '')!r}" + (" (raise)" if args.get("raise_window") else "")),
     "capture": _ActionSpec(_do_capture),
     "wait": _ActionSpec(lambda backend, action, args, **_: _text_response(backend.wait(float(args.get("seconds", 1.0))))),

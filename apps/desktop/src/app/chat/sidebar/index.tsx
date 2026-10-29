@@ -192,6 +192,7 @@ import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section
 import { CONTEXT_SPLIT_KIT, SplitSubmenu } from './split-submenu'
 import { useEnteredProjectSessions } from './use-entered-project-sessions'
 import { useServerSessionSearch } from './use-server-session-search'
+import { WorkControlSection } from './work-control-section'
 
 // Non-session groups (messaging platforms) stay compact: show a few rows up
 // front, reveal more in larger steps on demand. Keeps a busy platform from
@@ -1709,6 +1710,7 @@ export function ChatSidebar({
           </SidebarGroupContent>
         </SidebarGroup>
 
+        <WorkControlSection />
         <SidebarStorageCorruptNotice />
 
         {showSessionSections && (

@@ -6,6 +6,7 @@ keeps intercepting them at call time.
 """
 
 from __future__ import annotations
+from gateway.turn_context import compose_request_context, request_context_scope, request_context_v2_enabled
 
 import asyncio
 import dataclasses
@@ -995,7 +996,14 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             before = (getattr(agent, 'session_prompt_tokens', 0) or 0,
                       getattr(agent, 'session_completion_tokens', 0) or 0)
             with notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""):
-                result = agent.run_conversation(api_message, **kwargs)
+                carrier = getattr(ctx, "k8_pre_admission", None)
+                if carrier is not None: agent._k8_pre_admission = carrier
+                try:
+                    result = agent.run_conversation(api_message, **kwargs)
+                finally:
+                    if carrier is not None:
+                        carrier.invalidate()
+                        agent._k8_pre_admission = None
             if captured is not None:
                 incoming = max(0, (getattr(agent, 'session_prompt_tokens', 0) or 0) - before[0])
                 outgoing = max(0, (getattr(agent, 'session_completion_tokens', 0) or 0) - before[1])
@@ -1170,7 +1178,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         unique_tags = (["[[audio_as_voice]]"] if has_voice_directive else []) + list(dict.fromkeys(media_tags))
         return final_response + "\n" + "\n".join(unique_tags)
 
-    def run_sync(self):
+    def _run_sync_with_policy(self):
         from contextlib import ExitStack
         from gateway.session_policy import bind_turn_workspace, policy_for_source, policy_scope, workspace_unavailable_result
         from gateway.session_api_turn import api_policy_scope
@@ -1187,7 +1195,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             else:
                 scope.enter_context(api_policy_scope())
                 bind_turn_workspace(policy, self._ctx.session_id)
-                result = self._run_sync_scoped()
+                result = self._run_sync_with_request_context()
             from gateway.session_results import execution_result
             captured = execution_result.get()
             if captured is not None:
@@ -1200,7 +1208,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 )
             return result
 
-    def _run_sync_scoped(self):
+    def _run_sync_inner(self, *, resolved_runtime=None):
         """Executor-thread body of the turn; returns the gateway result dict.
 
         The turn message lives on the shared TurnContext (``ctx.message``) so ``_run_agent_inner`` sees
@@ -1237,7 +1245,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             max_iterations = room.max_iterations
             ctx.enabled_toolsets = list(room.enabled_toolsets)
         try:
-            model, runtime_kwargs = runner._resolve_session_agent_runtime(
+            model, runtime_kwargs = resolved_runtime if resolved_runtime is not None else runner._resolve_session_agent_runtime(
                 source=ctx.source, session_key=ctx.session_key, user_config=ctx.user_config,
             )
             # Stashed by _resolve_session_agent_runtime when the primary's credentials failed and a
@@ -1416,3 +1424,62 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             # didn't — see codex_runtime.py); default True keeps skip-db for the standard runtime.
             "agent_persisted": result.get("agent_persisted", True),
         }
+
+
+    def run_sync(self):
+        from agent.durable_admission import effect_origin_scope
+
+        with effect_origin_scope(self._ctx.effect_origin):
+            return self._run_sync_with_policy()
+
+
+    def _run_sync_with_request_context(self):
+        """Execute one turn under its immutable request authority snapshot.
+
+        Runtime model/provider resolution happens exactly once when the v2
+        gate is enabled, before the snapshot is published.  The scoped body
+        is the same production turn body used when the gate is disabled, so
+        tool workers inherit the ContextVar through the gateway's
+        ``copy_context`` executor seam without falling back to process globals.
+        """
+        ctx = self._ctx
+        if not request_context_v2_enabled(ctx.user_config):
+            return self._run_sync_inner()
+
+        try:
+            model, runtime_kwargs = self._runner._resolve_session_agent_runtime(
+                source=ctx.source,
+                session_key=ctx.session_key,
+                user_config=ctx.user_config,
+            )
+            request_cfg = (
+                ((ctx.user_config or {}).get("gateway") or {})
+                .get("reliability", {})
+                .get("request_context", {})
+            )
+            source_profile = str(getattr(ctx.source, "profile", "") or "").strip()
+            profile = source_profile or str(request_cfg.get("profile") or "").strip()
+            tenant = str(request_cfg.get("tenant") or "").strip()
+            approval = str(request_cfg.get("approval") or "").strip()
+            provider = str(runtime_kwargs.get("provider") or "").strip()
+            request_context = compose_request_context(
+                profile=profile,
+                tenant=tenant,
+                model=str(model or ""),
+                provider=provider,
+                approval=approval,
+                session_id=str(ctx.session_id or ctx.session_key or ""),
+            )
+        except Exception as exc:
+            return {
+                "final_response": f"⚠️ Provider authentication failed: {exc}",
+                "messages": [],
+                "api_calls": 0,
+                "tools": [],
+            }
+
+        ctx.request_context = request_context
+        with request_context_scope(request_context, config=ctx.user_config):
+            return self._run_sync_inner(
+                resolved_runtime=(model, runtime_kwargs),
+            )

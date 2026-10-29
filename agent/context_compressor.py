@@ -829,6 +829,14 @@ _MICRO_COMPACT_MAX_CONSECUTIVE_FAILURES = 3
 # see _bound_summary_input). NEVER add a max_tokens wire cap on the summary call.
 _SUMMARY_INPUT_MAX_CHARS = 160_000
 
+# Above this estimated input size automatic compression must finish without
+# auxiliary I/O. This is deliberately absolute as well as window-relative:
+# ordinary small-context tests and configured providers still exercise their
+# auth/cooldown behavior, while the observed 1M-token failure class gets a
+# deterministic handoff before the host's 600s compression ceiling.
+_OVERSIZED_LOCAL_FALLBACK_MIN_TOKENS = 1_000_000
+
+# Placeholder used when pruning old tool results
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
 
 
@@ -5535,11 +5543,15 @@ Write only the summary body. Do not include any preamble or prefix."""
         from agent.conversation_compression import _raise_if_stale_attempt
 
         _raise_if_stale_attempt(self)
-        feasibility_skip = not force and (
+        oversized_local_fallback = bool(not force and display_tokens >= _OVERSIZED_LOCAL_FALLBACK_MIN_TOKENS and display_tokens >= self.context_length)
+        feasibility_skip = oversized_local_fallback or (not force and (
             self._fallback_streak_skip(telemetry)
             or self._feasibility_skip(telemetry, turns_to_summarize, compress_start, compress_end)
-        )
-        summary = None  # pre-LLM summary skip (feasibility or benched model): no LLM call; Phase 4 inserts the deterministic fallback
+        ))
+        if oversized_local_fallback:
+            self._last_feasibility_skip = True
+            telemetry.update(failure_class="oversized_local_fallback", chunking=False, chunk_count=0, aux_time_budget_seconds=0, aux_token_budget=0)
+        summary = None  # feasibility skip: no LLM call; Phase 4 inserts the deterministic fallback
         if not feasibility_skip:
             summary = self._summarize_window(
                 messages, turns_to_summarize, scan, focus_topic, memory_context, bypass_cooldown,

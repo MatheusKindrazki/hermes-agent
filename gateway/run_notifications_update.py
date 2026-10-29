@@ -70,13 +70,22 @@ class GatewayUpdateNotificationsMixin:
         session_key: Optional[str]
         metadata: Any
         platform: Any
+        owner: Any = None
 
         def send_metadata(self):
             from gateway.run import _non_conversational_metadata
             return _non_conversational_metadata(self.metadata, platform=self.platform)
 
         async def send(self, text: str):
-            return await self.adapter.send(self.chat_id, text, metadata=self.send_metadata())
+            from gateway.external_egress import deliver_external_action
+            async def deliver(metadata):
+                return await self.adapter.send(self.chat_id, text, metadata=metadata)
+            return await deliver_external_action(
+                owner=self.owner or self.adapter, adapter=self.adapter, chat_id=self.chat_id,
+                action="send", content=text.encode(), payload={"action": "send", "content": text},
+                metadata=self.send_metadata(), event_type="gateway_update", milestone="update-status",
+                deliver=deliver,
+            )
 
     def _schedule_update_notification_watch(self) -> None:
         """Ensure a background task is watching for update completion."""
@@ -151,7 +160,7 @@ class GatewayUpdateNotificationsMixin:
                 metadata = self._pending_marker_metadata(platform, chat_id, pending, adapter)
                 # Fallback session key if not stored (old pending files)
                 return self._UpdateTarget(
-                    adapter, chat_id, session_key or f"{platform_str}:{chat_id}", metadata, platform,
+                    adapter, chat_id, session_key or f"{platform_str}:{chat_id}", metadata, platform, self,
                 )
         return None
 
@@ -207,7 +216,8 @@ class GatewayUpdateNotificationsMixin:
         adapter = target.adapter
         if getattr(type(adapter), "send_update_prompt", None) is not None:
             with _log_suppressed(logging.DEBUG, "Button-based update prompt failed: %s"):
-                await adapter.send_update_prompt(
+                await self._deliver_native_final(
+                    adapter, "send_update_prompt", event_type="gateway_update_prompt", action="send",
                     chat_id=target.chat_id, prompt=prompt_text, default=default,
                     session_key=target.session_key, metadata=target.send_metadata(),
                 )
@@ -363,7 +373,14 @@ class GatewayUpdateNotificationsMixin:
                     msg = _update_failed_notice()
                     if output:
                         msg = t("gateway.update.last_lines", msg=msg, tail=_update_output_tail(output, 800))
-                await adapter.send(chat_id, msg, metadata=_non_conversational_metadata(metadata, platform=platform))
+                async def deliver_update(prepared_metadata):
+                    return await adapter.send(chat_id, msg, metadata=prepared_metadata)
+                await self._deliver_external_action(
+                    adapter=adapter, chat_id=chat_id, action="send", content=msg.encode(),
+                    payload={"action": "send", "content": msg},
+                    metadata=_non_conversational_metadata(metadata, platform=platform),
+                    event_type="gateway_update_notification", milestone="update-complete", deliver=deliver_update,
+                )
                 logger.info("Sent post-update notification to %s:%s (exit=%s)", platform_str, chat_id, exit_code)
         except Exception as e:
             logger.warning("Post-update notification failed: %s", e)

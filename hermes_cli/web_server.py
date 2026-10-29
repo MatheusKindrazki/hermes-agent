@@ -33,6 +33,7 @@ PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from hermes_cli.work_control_projection import (SCHEMA as _WORK_CONTROL_SCHEMA, ProjectionUnavailable as _WorkControlProjectionUnavailable, work_control_projection)
 from hermes_cli.config import load_config
 from hermes_cli.version_info import get_version_info
 
@@ -214,6 +215,33 @@ app.add_middleware(AuthBodyLimitMiddleware)
 from hermes_cli.memory_oauth import router as _memory_oauth_router
 
 app.include_router(_memory_oauth_router)
+
+
+@app.get("/api/work-control/projection")
+def get_work_control_projection():
+    """Return the sanitized Jarvis projection; never expose its credential."""
+    try:
+        return work_control_projection.get()
+    except _WorkControlProjectionUnavailable:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "schema_version": _WORK_CONTROL_SCHEMA,
+                "records": [],
+                "stale": True,
+                "source": "unavailable",
+            },
+        )
+
+# ---------------------------------------------------------------------------
+# Session token for protecting sensitive endpoints (reveal).
+# The desktop shell mints the token and injects it via
+# HERMES_DASHBOARD_SESSION_TOKEN so its main process can authenticate the
+# /api calls it makes on the user's behalf; otherwise we generate one fresh
+# on every server start. Either way it dies when the process exits and is
+# injected into the SPA HTML so only the legitimate web UI can use it.
+# ---------------------------------------------------------------------------
+
 
 # Session token for sensitive endpoints. The desktop shell mints it via
 # HERMES_DASHBOARD_SESSION_TOKEN; otherwise fresh per server start. It dies with
@@ -453,7 +481,7 @@ async def auth_middleware(request: Request, call_next):
         not getattr(request.state, "token_authenticated", False)
         and not getattr(request.state, "native_http_principal", None)
         and not getattr(request.app.state, "auth_required", False)
-        and path.startswith("/api/")
+        and (path.startswith("/api/") or path == "/v1/capabilities")
         and path not in _PUBLIC_API_PATHS
         and not path.startswith("/api/mcp/oauth/callback/")
         and not _has_valid_session_token(request)
@@ -814,6 +842,51 @@ app.include_router(_tools_routes.router)
 app.include_router(_analytics_routes.router)
 app.include_router(_chat_ws_routes.router)
 app.include_router(_chat_workspaces_routes.router)
+@app.get("/v1/capabilities")
+async def get_desktop_api_capabilities(profile: Optional[str] = None):
+    """Advertise capability gates for the exact dashboard profile requested.
+
+    The native Desktop sends REST traffic to ``hermes serve`` while its chat
+    RPCs ride this process's embedded gateway WebSocket. The standalone API
+    server exposes the same path, but it is not necessarily running on a
+    Desktop connection; keeping this route here prevents a valid dashboard
+    connection from turning a missing endpoint into an ``unknown`` fail-closed
+    identity gate.
+    """
+    from gateway.active_context_receipt import (
+        ACTIVE_CONTEXT_SCHEMA,
+        active_context_v1_enabled,
+    )
+
+    from hermes_cli.web_server_profiles import _config_profile_scope
+
+    def _read_active_context_gate() -> bool:
+        # Resolve the profile before the fail-safe config read. An invalid
+        # profile must remain a 400/404 instead of silently borrowing the
+        # dashboard process's config.
+        with _config_profile_scope(profile):
+            try:
+                return active_context_v1_enabled(load_config())
+            except Exception:
+                _log.exception(
+                    "Desktop capability config read failed; active_context_v2 remains off"
+                )
+                return False
+
+    active_context_enabled = await asyncio.to_thread(_read_active_context_gate)
+
+    return {
+        "object": "hermes.dashboard.capabilities",
+        "platform": "hermes-agent",
+        "features": {
+            "active_context_v2": {
+                "enabled": active_context_enabled,
+                "receipt_schema": ACTIVE_CONTEXT_SCHEMA,
+            }
+        },
+    }
+
+
 app.include_router(_dashboard_ui_routes.router)
 app.include_router(_shared_metrics_routes.router)
 app.include_router(_delegation_routes.router)

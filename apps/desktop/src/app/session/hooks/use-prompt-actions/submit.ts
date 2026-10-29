@@ -7,6 +7,7 @@ import { type ChatMessage, finalizeInterruptedMessages, textPart } from '@/lib/c
 import { optimisticAttachmentRef } from '@/lib/chat-runtime'
 import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
 import { setMutableRef } from '@/lib/mutable-ref'
+import { createPromptSourceEventId } from '@/lib/prompt-source-event'
 import {
   isVoicePlaybackActive,
   markVoicePlaybackInterrupted,
@@ -513,7 +514,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         : captured
 
       let requestGateway = destination.requestGateway
-      const submissionId = retained?.id ?? options?.submission_id ?? crypto.randomUUID()
+      const submissionId = retained?.id ?? options?.submission_id ?? options?.sourceEventId ?? createPromptSourceEventId()
 
       let startingStoredSessionId = routedSessionNeedsResume
         ? routedStoredSessionId
@@ -1171,11 +1172,35 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
                   await writePreparedSubmission(retryKey, prepared)
                   const { submission_id: _id, ...legacyParams } = params
 
-                  const result = await requestGateway<SubmitReceipt>(
-                    'prompt.submit',
-                    legacyParams,
-                    PROMPT_SUBMIT_REQUEST_TIMEOUT_MS
-                  )
+                  // The fork's legacy serve protocol calls the same input identity source_event_id.
+                  // Try that spelling only after an explicit pre-admission refusal of submission_id.
+                  // An older upstream server may explicitly refuse that field too; only that typed
+                  // validation refusal permits the existing identityless compatibility path.
+                  let result: SubmitReceipt
+
+                  try {
+                    result = await requestGateway<SubmitReceipt>(
+                      'prompt.submit',
+                      { ...legacyParams, source_event_id: submissionId },
+                      PROMPT_SUBMIT_REQUEST_TIMEOUT_MS
+                    )
+                  } catch (legacyError) {
+                    const validation = legacyError as { code?: unknown; message?: unknown }
+
+                    if (
+                      validation?.code !== 4000 ||
+                      typeof validation.message !== 'string' ||
+                      !validation.message.includes('source_event_id')
+                    ) {
+                      throw legacyError
+                    }
+
+                    result = await requestGateway<SubmitReceipt>(
+                      'prompt.submit',
+                      legacyParams,
+                      PROMPT_SUBMIT_REQUEST_TIMEOUT_MS
+                    )
+                  }
 
                   legacyAccepted = true
 

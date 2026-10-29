@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import {
   acceptsTriggerCompletion,
+  composerEditorIsDisabled,
   implicitSlashAcceptIndex,
   isPendingDraftPersistCurrent,
   liveComposerDraft,
@@ -14,6 +15,22 @@ import {
   type TriggerAcceptInput
 } from './composer-utils'
 import { normalizeComposerEditorDom, RICH_INPUT_SLOT } from './rich-editor'
+
+describe('composerEditorIsDisabled', () => {
+  it('keeps ordinary disabled composers read-only', () => {
+    expect(composerEditorIsDisabled({ disabled: true, reconnecting: false })).toBe(true)
+  })
+
+  it('keeps reconnecting drafts editable without enabling dispatch', () => {
+    expect(composerEditorIsDisabled({ disabled: true, reconnecting: true })).toBe(false)
+  })
+
+  it('allows an explicitly draft-only surface during initial boot or an identity gate', () => {
+    expect(composerEditorIsDisabled({ allowDraftingWhileDisabled: true, disabled: true, reconnecting: false })).toBe(
+      false
+    )
+  })
+})
 
 const item = (group: string): Unstable_TriggerItem =>
   ({ id: 'x', type: 'slash', label: 'x', metadata: { group } }) as unknown as Unstable_TriggerItem

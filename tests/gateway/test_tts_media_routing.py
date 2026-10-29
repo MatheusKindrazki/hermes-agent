@@ -83,8 +83,8 @@ async def test_base_adapter_routes_voice_tagged_telegram_ogg_media_tag_to_voice_
     adapter.send_voice.assert_awaited_once_with(
         chat_id="chat-1",
         audio_path=str(media_file),
-        metadata={"notify": True},
         is_voice=True,
+        metadata={"notify": True},
     )
     adapter.send_document.assert_not_awaited()
 
@@ -92,10 +92,9 @@ async def test_base_adapter_routes_voice_tagged_telegram_ogg_media_tag_to_voice_
 def _fake_runner(thread_meta):
     """Build a fake GatewayRunner-like object with the helper methods needed by
     _deliver_media_from_response."""
-    runner = SimpleNamespace(
-        _thread_metadata_for_source=lambda source, anchor=None: thread_meta,
-        _reply_anchor_for_event=lambda event: None,
-    )
+    runner = object.__new__(GatewayRunner)
+    runner._thread_metadata_for_source = lambda source, anchor=None: thread_meta
+    runner._reply_anchor_for_event = lambda event: None
     return runner
 
 

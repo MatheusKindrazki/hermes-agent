@@ -13,6 +13,9 @@ except ModuleNotFoundError as exc:  # a partial ``hermes update`` can leave the 
 import asyncio
 import concurrent.futures
 import dataclasses
+import faulthandler
+import hashlib
+import inspect
 import json
 import logging
 import os
@@ -69,6 +72,17 @@ _HOUSEKEEPING_MAX_WORKERS = 4
 _USER_BOUNDARY_END_REASONS = ("session_reset", "user_exit", "session_switch", "new_session")
 # Bounds one stall-notify send so a wedged transport can't block the watcher; on timeout the next tick retries.
 _STALL_NOTIFY_SEND_TIMEOUT_SECONDS = 15.0
+# How long one internal conclusion stays "already said" on a route
+# (_internal_event_equivalence_key). Long enough to span the gap between a
+# wrapped process and its wrapper exiting, plus the cascade turn each of them
+# would otherwise start — the 0.1s completion fan-in window and the 2.0s
+# delegation drain tick are both far too short for that. Short enough that a
+# genuinely repeated run minutes later still surfaces: this supersedes a
+# restatement, it does not mute a signal.
+_INTERNAL_EQUIVALENCE_TTL_SECONDS = 120.0
+# Bounded like every other per-lifetime gateway cache. Keys are small tuples
+# and only routes with recent internal traffic ever appear.
+_INTERNAL_EQUIVALENCE_MAX_ENTRIES = 256
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
@@ -2189,6 +2203,12 @@ from gateway.session_state import SessionState, legacy_dict_property, legacy_lea
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
+from gateway.turn_context import (
+    TurnContext,
+    compose_request_context,
+    request_context_scope,
+    request_context_v2_enabled,
+)
 from gateway.run_voice import GatewayVoiceMixin
 from gateway.run_adapters import GatewayAdapterLifecycleMixin
 from gateway.run_topics import GatewayTopicThreadsMixin
@@ -4281,6 +4301,40 @@ class GatewayRunner(
         timeout_fired: Any = None
         cleanup_lock: Any = None
         is_current: Any = None
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def _run_planned_stop_watcher(

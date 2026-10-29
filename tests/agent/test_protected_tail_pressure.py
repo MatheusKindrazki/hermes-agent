@@ -13,6 +13,7 @@ This is the core compressor contract — not Desktop/Windows-specific.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 import json
 from unittest.mock import patch
 
@@ -148,6 +149,109 @@ class TestProtectedTailPressure61932:
         # Either we recovered under threshold, or the last pass still made
         # progress (never a pure no-op dead-end above the window).
         assert tok < c.threshold_tokens or last_progress
+
+    def test_oversized_forced_summary_is_bounded_and_preserves_live_tail(
+        self, compressor_128k, monkeypatch
+    ):
+        """Oversized history never becomes an unbounded auxiliary request; the
+        live attachment and checkpoint survive exactly once in the protected tail."""
+        c = compressor_128k
+        del c._generate_summary
+        monkeypatch.setattr(ContextCompressor, "_SUMMARY_INPUT_MAX_CHARS", 40_000)
+        attachment_turn = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "continue with this checkpoint"},
+                {"type": "image_url", "image_url": {"url": "file:///tmp/live.png"}},
+            ],
+            "checkpoint": {"reply_to_message_id": "reply-42"},
+        }
+        messages = [
+            {"role": "system", "content": "You are Hermes."},
+            {"role": "user", "content": "old task"},
+            {"role": "assistant", "content": "old acknowledgement"},
+        ]
+        for i in range(84):
+            messages.extend(
+                [
+                    {"role": "user", "content": f"turn-{i}: " + ("u" * 24_000)},
+                    {"role": "assistant", "content": f"result-{i}: " + ("a" * 24_000)},
+                ]
+            )
+        messages.append(attachment_turn)
+        before = estimate_messages_tokens_rough(messages)
+        assert before > c.context_length
+
+        prompts: list[str] = []
+
+        def bounded_llm(**kwargs):
+            prompt = kwargs["messages"][0]["content"]
+            prompts.append(prompt)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="bounded checkpoint"))]
+            )
+
+        with patch("agent.context_compressor.call_llm", side_effect=bounded_llm), patch(
+            "agent.auxiliary_client.call_llm", side_effect=bounded_llm
+        ), patch.object(c, "_build_summary_prompt", wraps=c._build_summary_prompt) as build_prompt:
+            out = c.compress(messages, current_tokens=before, force=True)
+
+        # Upstream removed auxiliary map digests. A forced summary may issue
+        # one bounded summary request, or take the deterministic local fallback.
+        assert len(prompts) <= 1
+        assert all(len(call.args[0]) <= c._SUMMARY_INPUT_MAX_CHARS for call in build_prompt.call_args_list)
+        assert all(estimate_messages_tokens_rough([{"role": "user", "content": prompt}]) < c.context_length for prompt in prompts)
+        assert estimate_messages_tokens_rough(out) < c.context_length
+        assert sum(message is attachment_turn for message in out) == 0
+        preserved = [m for m in out if m.get("checkpoint") == attachment_turn["checkpoint"]]
+        assert len(preserved) == 1
+        assert preserved[0]["content"] == attachment_turn["content"]
+        assert preserved[0]["checkpoint"] == attachment_turn["checkpoint"]
+
+    def test_automatic_over_million_token_fallback_is_local_and_bounded(
+        self, compressor_128k
+    ):
+        """Automatic recovery above the model window must not wait on aux maps."""
+        c = compressor_128k
+        del c._generate_summary
+        attachment_turn = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "pending turn exactly once"},
+                {"type": "image_url", "image_url": {"url": "file:///tmp/one.png"}},
+            ],
+            "checkpoint": {"reply_to_message_id": "checkpoint-1"},
+        }
+        messages = [
+            {"role": "system", "content": "You are Hermes."},
+            {"role": "user", "content": "original task"},
+            {"role": "assistant", "content": "working"},
+        ]
+        for i in range(96):
+            messages.extend(
+                [
+                    {"role": "user", "content": f"old-{i}:" + ("u" * 24_000)},
+                    {"role": "assistant", "content": f"done-{i}:" + ("a" * 24_000)},
+                ]
+            )
+        messages.append(attachment_turn)
+        before = estimate_messages_tokens_rough(messages)
+        assert before > 1_000_000
+
+        with patch("agent.context_compressor.call_llm") as main_aux, patch(
+            "agent.auxiliary_client.call_llm"
+        ) as digest_aux, patch("time.sleep") as sleep:
+            out = c.compress(messages, current_tokens=before)
+        sleep.assert_not_called()
+        main_aux.assert_not_called()
+        digest_aux.assert_not_called()
+        assert estimate_messages_tokens_rough(out) < c.context_length
+        preserved = [m for m in out if m.get("checkpoint") == attachment_turn["checkpoint"]]
+        assert len(preserved) == 1
+        assert preserved[0]["content"] == attachment_turn["content"]
+        assert preserved[0]["checkpoint"] == attachment_turn["checkpoint"]
+        assert c._last_summary_fallback_used is True
+        assert c._last_compression_telemetry["failure_class"] == "oversized_local_fallback"
 
     def test_all_oversized_tail_dead_end_shape_now_compresses(
         self, compressor_128k

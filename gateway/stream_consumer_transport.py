@@ -331,6 +331,10 @@ class StreamTransportMixin:
                                               "Finalize empty stream failed: %s")):
                 self._mark_final_delivered()
             return True  # cursor-only / whitespace-only update
+        if finalize and is_turn_final:
+            reliability_outcome = self._gate_or_shadow_final(text)
+            if reliability_outcome is not None:
+                return reliability_outcome
         # Don't open a new message for 1-2 tokens + cursor (rapid tool-calling): if
         # the cursor-strip edit is then rate-limited, "X ▉" stays forever.
         # A segment-break finalize never carries the cursor, so gate it too or a 1-2 token

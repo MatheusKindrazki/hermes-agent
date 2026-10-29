@@ -51,6 +51,7 @@ import {
   acceptsTriggerCompletion,
   COMPOSER_FADE_BACKGROUND,
   composerInputWidthClass,
+  composerEditorIsDisabled,
   implicitSlashAcceptIndex,
   liveComposerDraft,
   type QueueEditState,
@@ -120,6 +121,7 @@ import {
 import { VoiceActivity, VoicePlaybackActivity } from './voice-activity'
 
 export function ChatBar({
+  allowDraftingWhileDisabled = false,
   busy,
   cwd,
   disabled,
@@ -273,6 +275,7 @@ export function ChatBar({
   const gatewayState = useStore($gatewayState)
   const reconnecting = gatewayState !== 'open'
   const inputDisabled = shouldDisableComposerInput(disabled, gatewayState)
+  const editorDisabled = composerEditorIsDisabled({ allowDraftingWhileDisabled, disabled, reconnecting })
 
   // The draft engine — detached source of truth (DOM + draftRef + edge
   // selectors); typing never re-renders the chrome. ChatBar owns `queueEditRef`
@@ -297,7 +300,7 @@ export function ChatBar({
     stashAt,
     syncDraftFromEditor,
     takeDraftRetry
-  } = useComposerDraft({ activeQueueSessionKey, focusKey, inputDisabled, queueEditRef, sessionId })
+  } = useComposerDraft({ activeQueueSessionKey, focusKey, inputDisabled: editorDisabled, queueEditRef, sessionId })
 
   useComposerScreenshot({ sessionKey: activeQueueSessionKey, focusKey, onAttachImageBlob })
 
@@ -1157,7 +1160,7 @@ export function ChatBar({
   const input = (
     <div className={cn('relative', inputWidthClass)}>
       <div
-        aria-disabled={inputDisabled ? true : undefined}
+        aria-disabled={editorDisabled ? true : undefined}
         aria-label={t.composer.message}
         autoCapitalize="off"
         // Chromium's macOS text-replacement path shares the autocorrect gate.
@@ -1173,7 +1176,7 @@ export function ChatBar({
           // becomes unclickable. Buttons use the global no-drag rule.
           hudNativeDrag && '[-webkit-app-region:no-drag]'
         )}
-        contentEditable={!inputDisabled}
+        contentEditable={!editorDisabled}
         data-placeholder={placeholder}
         data-slot={RICH_INPUT_SLOT}
         dir={textDirection}

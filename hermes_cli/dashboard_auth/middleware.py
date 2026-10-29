@@ -42,6 +42,21 @@ _GATE_PUBLIC_PREFIXES: tuple[str, ...] = (
     "/api/auth/providers", "/api/mcp/oauth/callback/",
     "/assets/", "/dashboard-plugins/", "/favicon.ico", "/ds-assets/", "/fonts/", "/fonts-terminal/")
 
+# The Desktop shares the standalone API server's stable capability URL while
+# sending the request to ``hermes serve``. It is still an API fetch for auth
+# semantics: never redirect it through an HTML login flow.
+_DASHBOARD_NON_API_PREFIX_ENDPOINTS: frozenset[str] = frozenset({
+    "/v1/capabilities",
+})
+
+
+def _path_is_api(path: str) -> bool:
+    return (
+        path == "/api"
+        or path.startswith("/api/")
+        or path in _DASHBOARD_NON_API_PREFIX_ENDPOINTS
+    )
+
 
 def _path_is_public(path: str) -> bool:
     """:data:`PUBLIC_API_PATHS` (shared with the legacy middleware) matched exactly so
@@ -60,7 +75,7 @@ def _safe_next_target(request: Request) -> str:
     is prepended AFTER validation so the post-login redirect lands within the mount
     (``/hermes/sessions`` rather than bare ``/sessions``)."""
     path = request.url.path
-    if not path or not is_safe_next_path(path):
+    if not path or _path_is_api(path) or not is_safe_next_path(path):
         return ""
     prefix = prefix_from_request(request)
     if prefix:
@@ -76,7 +91,7 @@ def _unauth_response(request: Request, *, reason: str) -> Response:
     next_param = _safe_next_target(request)
     prefix = prefix_from_request(request)
     login_url = f"{prefix}/login?next={next_param}" if next_param else f"{prefix}/login"
-    if request.url.path.startswith("/api/"):
+    if _path_is_api(request.url.path):
         expired = reason == "invalid_or_expired_session"
         # Same reason the client already receives. Never include the bearer.
         audit_log(AuditEvent.SESSION_REJECTED, reason=reason, path=request.url.path,
@@ -95,7 +110,9 @@ def _auto_sso_response(request: Request) -> Response | None:
     absent — a present marker means the portal had no session last time: clear it and fall back
     to ``/login`` rather than ping-pong. Convenience, not a security check.
     """
-    if request.url.path.startswith("/api/"):
+    path = request.url.path
+    # APIs never auto-redirect (see _unauth_response). Only document loads.
+    if _path_is_api(path):
         return None
     if read_sso_attempt_cookie(request):
         resp = _unauth_response(request, reason="no_cookie")

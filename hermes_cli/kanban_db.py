@@ -18,21 +18,30 @@ import contextlib
 import json
 import os
 import re
+import hashlib
 import secrets
 import sqlite3
+import stat
 import subprocess
 import sys
+import tempfile
+import threading
 import logging
 import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
+
+# Keep the worker-path probe independent from tests/custom launchers that
+# replace ``subprocess.Popen`` to capture the actual worker invocation. The
+# probe is a distinct security boundary and must still execute real bash.
+_REAL_SUBPROCESS_POPEN = subprocess.Popen
 
 
 # --- Shared micro-helpers (row access, JSON, env, git) ---
@@ -1221,16 +1230,6 @@ def create_task(
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
 
-    # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
-    # race may insert twice, the next lookup stabilises on the newest.
-    if idempotency_key:
-        row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1", (idempotency_key,),
-        ).fetchone()
-        if row:
-            return row["id"]
 
     now = int(time.time())
 
@@ -1243,11 +1242,26 @@ def create_task(
 
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
-        task_id = _new_task_id()
         try:
             # allow_nested: graph builders compose create_task under one outer
             # commit so the dispatcher never sees a half-built graph.
             with write_txn(conn, allow_nested=True):
+                # The idempotency lookup and insert share the same IMMEDIATE
+                # transaction. SQLite serializes writers, so two connections
+                # using the same key cannot both pass the lookup: the loser
+                # observes and returns the winner's canonical id without an
+                # exposed IntegrityError or a second workspace-bearing row.
+                if idempotency_key:
+                    row = conn.execute(
+                        "SELECT id FROM tasks WHERE idempotency_key = ? "
+                        "AND status != 'archived' "
+                        "ORDER BY created_at DESC LIMIT 1",
+                        (idempotency_key,),
+                    ).fetchone()
+                    if row:
+                        return row["id"]
+
+                task_id = _new_task_id()
                 task_status, tenant = initial_task_state(conn, parents, initial_status, triage, tenant)
                 # Project worktree: fresh dir under the repo + deterministic
                 # branch, instead of the random ``wt/<id>`` worker fallback.
@@ -1987,11 +2001,13 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     releases it; a task with no such event at all (direct DB edit) auto-recovers.
     """
     row = conn.execute(
-        "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "SELECT kind, payload FROM task_events "
+        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked', 'created', 'promoted_manual') "
         "ORDER BY id DESC LIMIT 1", (task_id,),
     ).fetchone()
-    if row and row["kind"] == "blocked":
+    if row and (row["kind"] == "blocked" or (
+        row["kind"] == "created" and _json_dict(row["payload"]).get("status") == "blocked"
+    )):
         return True
     trip = conn.execute(
         "SELECT payload FROM task_events "
@@ -2096,6 +2112,21 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
 
 # --- Claim / complete / block ---
 
+@dataclass(frozen=True)
+class TargetClaimConstraints:
+    expected_tenant: Optional[str]
+    expected_assignee: str
+    max_board_running: Optional[int] = None
+    max_host_running: Optional[int] = None
+    other_boards_running: int = 0
+    max_assignee_running: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class TargetClaimResult:
+    task: Optional[Task]
+    reason: Optional[str]
+
 def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return whether every direct parent is terminal for dependency gating."""
     return conn.execute(
@@ -2170,7 +2201,8 @@ def _claim_and_open_run(
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
-) -> Optional[Task]:
+    target_constraints: Optional[TargetClaimConstraints] = None,
+) -> Optional[Task] | TargetClaimResult:
     """Atomically transition ``ready -> running``.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
@@ -2180,6 +2212,47 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if target_constraints is not None:
+            identity = conn.execute(
+                "SELECT status, claim_lock, tenant, assignee FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if identity is None:
+                return TargetClaimResult(None, "task_not_found")
+            if identity["status"] != "ready" or identity["claim_lock"] is not None:
+                return TargetClaimResult(None, "status_not_ready")
+            tenant = (identity["tenant"] or "").strip() or None
+            if tenant != target_constraints.expected_tenant:
+                return TargetClaimResult(None, "tenant_mismatch")
+            assignee = (identity["assignee"] or "").strip()
+            if not assignee:
+                return TargetClaimResult(None, "assignee_required")
+            if assignee != target_constraints.expected_assignee:
+                return TargetClaimResult(None, "assignee_mismatch")
+
+            running = int(conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+            ).fetchone()[0])
+            if (
+                target_constraints.max_board_running is not None
+                and running >= target_constraints.max_board_running
+            ):
+                return TargetClaimResult(None, "board_capacity_exhausted")
+            if (
+                target_constraints.max_host_running is not None
+                and running + target_constraints.other_boards_running
+                >= target_constraints.max_host_running
+            ):
+                return TargetClaimResult(None, "host_capacity_exhausted")
+            if target_constraints.max_assignee_running is not None:
+                assignee_running = int(conn.execute(
+                    "SELECT COUNT(*) FROM tasks "
+                    "WHERE status = 'running' AND assignee = ?",
+                    (assignee,),
+                ).fetchone()[0])
+                if assignee_running >= target_constraints.max_assignee_running:
+                    return TargetClaimResult(None, "assignee_capacity_exhausted")
+
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
         # recompute_ready re-promotes when the parents finish.
@@ -2189,6 +2262,8 @@ def claim_task(
                 "WHERE id = ? AND status = 'ready'", (task_id,),
             )
             _append_event(conn, task_id, "claim_rejected", {"reason": "parents_not_done"})
+            if target_constraints is not None:
+                return TargetClaimResult(None, "parents_not_done")
             return None
         # Close a leaked prior run so the CAS below doesn't strand it.
         _reclaim_dangling_run(
@@ -2196,9 +2271,13 @@ def claim_task(
         )
         run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now)
         if run_id is None:
+            if target_constraints is not None:
+                return TargetClaimResult(None, "claim_failed")
             return None
         claimed = get_task(conn, task_id)
     _fire_task_hook("kanban_task_claimed", claimed, task_id, run_id)
+    if target_constraints is not None:
+        return TargetClaimResult(claimed, None)
     return claimed
 
 
@@ -4239,3 +4318,150 @@ from hermes_cli.kanban_db_dispatch import (
     _worker_survived_termination,
     _worker_terminal_timeout_env,
 )
+
+
+_WORKER_PATH_SOURCE_SCRIPT = r'''
+source "$1" || {
+  rc=$?
+  printf '%s\n' worker_path_source_failed >&2
+  exit "$rc"
+}
+'''
+
+_WORKER_PATH_EXEC_SCRIPT = _WORKER_PATH_SOURCE_SCRIPT + r'''
+shift
+exec "$@"
+'''
+
+
+@dataclass(frozen=True)
+class _WorkerPathSnapshot:
+    approved_bytes: bytes
+    original_path: str
+    sha256: str
+
+    def open_source_image(self):
+        """Return an unlinked, read-only FD containing approved bytes."""
+        write_fd, temp_path = tempfile.mkstemp(prefix="hermes-worker-path-")
+        try:
+            view = memoryview(self.approved_bytes)
+            while view:
+                written = os.write(write_fd, view)
+                view = view[written:]
+            os.fsync(write_fd)
+        finally:
+            os.close(write_fd)
+        try:
+            read_fd = os.open(temp_path, os.O_RDONLY)
+        finally:
+            os.unlink(temp_path)
+        return os.fdopen(read_fd, "rb")
+
+    # Tests and callers can use one stable spelling without knowing the FD
+    # until an immutable per-process image is opened.
+    @staticmethod
+    def source_path_for(fd: int) -> str:
+        return f"/dev/fd/{fd}"
+
+    @property
+    def fd(self) -> int:
+        image = getattr(self, "_test_image", None)
+        if image is None:
+            image = self.open_source_image()
+            object.__setattr__(self, "_test_image", image)
+        return image.fileno()
+
+    @property
+    def source_path(self) -> str:
+        return self.source_path_for(self.fd)
+
+    def close(self) -> None:
+        image = getattr(self, "_test_image", None)
+        if image is not None:
+            image.close()
+            object.__setattr__(self, "_test_image", None)
+
+
+def _probe_worker_path_snapshot(
+    snapshot: _WorkerPathSnapshot,
+    env: Mapping[str, str],
+) -> None:
+    image = snapshot.open_source_image()
+    try:
+        probe = _REAL_SUBPROCESS_POPEN(
+            [
+                "/bin/bash",
+                "-c",
+                _WORKER_PATH_SOURCE_SCRIPT,
+                "hermes-worker-path-probe",
+                snapshot.source_path_for(image.fileno()),
+            ],
+            env=dict(env),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            pass_fds=(image.fileno(),),
+        )
+        probe.communicate()
+    finally:
+        image.close()
+    if probe.returncode != 0:
+        raise RuntimeError("worker_path_source_failed")
+
+
+def _snapshot_worker_path_lib(env: Mapping[str, str]) -> _WorkerPathSnapshot:
+    """Read once, hash once, then source only immutable approved bytes.
+
+    The configured pathname is opened exactly once with ``O_NOFOLLOW`` when
+    available. Probe and launcher receive separate unlinked read-only images
+    of the same immutable ``bytes`` object, so replacing or rewriting the
+    configured pathname after approval cannot change what gets sourced.
+    """
+    lib_value = (env.get("HERMES_WORKER_PATH_LIB") or "").strip()
+    if not lib_value:
+        raise RuntimeError("worker_path_lib_missing")
+    lib_path = Path(lib_value)
+    if not lib_path.is_absolute():
+        raise RuntimeError("worker_path_lib_invalid")
+
+    expected = (env.get("K5_WORKER_PATH_SHA256") or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise RuntimeError("worker_path_hash_invalid")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        source_fd = os.open(str(lib_path), flags)
+        try:
+            if not stat.S_ISREG(os.fstat(source_fd).st_mode):
+                raise RuntimeError("worker_path_lib_invalid")
+            chunks = []
+            while True:
+                chunk = os.read(source_fd, 65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            approved_bytes = b"".join(chunks)
+        finally:
+            os.close(source_fd)
+    except RuntimeError:
+        raise
+    except OSError as exc:
+        raise RuntimeError("worker_path_hash_unavailable") from exc
+    actual = hashlib.sha256(approved_bytes).hexdigest()
+    if not secrets.compare_digest(actual, expected):
+        raise RuntimeError("worker_path_hash_mismatch")
+
+    snapshot = _WorkerPathSnapshot(
+        approved_bytes=approved_bytes,
+        original_path=str(lib_path),
+        sha256=expected,
+    )
+    _probe_worker_path_snapshot(snapshot, env)
+    return snapshot
+
+
+def _validate_worker_path_lib(env: Mapping[str, str]) -> tuple[str, str]:
+    """Backward-compatible validation helper backed by immutable snapshot."""
+    snapshot = _snapshot_worker_path_lib(env)
+    return snapshot.original_path, snapshot.sha256

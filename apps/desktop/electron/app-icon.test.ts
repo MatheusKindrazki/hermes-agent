@@ -5,7 +5,7 @@ import path from 'node:path'
 
 import { test } from 'vitest'
 
-import { appIconCandidates, decodingFileProbe, resolveAppIcon, shouldOverrideDockIcon } from './app-icon'
+import { appIconCandidates, decodingFileProbe, resolveAppIcon, shouldOverrideDockIcon, windowIconOptions } from './app-icon'
 
 // Regression: a packaged app.asar can contain a TRUNCATED apple-touch-icon.png
 // (interrupted electron-builder run, partial copy). Electron's
@@ -142,4 +142,21 @@ test('shouldOverrideDockIcon never applies off macOS (there is no dock)', () => 
     assert.equal(shouldOverrideDockIcon({ platform, isPackaged: false }), false)
     assert.equal(shouldOverrideDockIcon({ platform, isPackaged: true }), false)
   }
+})
+
+test('packaged mac icon prefers the Resources fallback outside app.asar', () => {
+  const candidates = [
+    '/Hermes.app/Contents/Resources/icon.icns',
+    '/Hermes.app/Contents/Resources/app.asar/public/apple-touch-icon.png',
+  ]
+
+  assert.equal(
+    resolveAppIcon(candidates, (candidate) => candidate.endsWith('icon.icns')),
+    candidates[0],
+  )
+})
+
+test('missing packaged icons omit BrowserWindow icon instead of loading a bad path', () => {
+  assert.deepEqual(windowIconOptions(undefined), {})
+  assert.deepEqual(windowIconOptions('/valid/icon.icns'), { icon: '/valid/icon.icns' })
 })

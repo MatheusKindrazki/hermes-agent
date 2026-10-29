@@ -55,6 +55,12 @@ def peer_gateway(tmp_path, monkeypatch):
     adapter._session_db = db
 
     async def fake_run_agent(user_message, **kwargs):
+        if kwargs.get("delivery_metadata"):
+            db.append_message(
+                kwargs.get("session_id"), "user", user_message,
+                display_kind="bot_delivery",
+                display_metadata=kwargs["delivery_metadata"],
+            )
         return (
             {
                 "final_response": f"e2e reply to: {user_message}",
@@ -91,6 +97,7 @@ def peer_gateway(tmp_path, monkeypatch):
         yield SimpleNamespace(
             url=f"http://127.0.0.1:{state['port']}",
             db=db,
+            adapter=adapter,
             hidden_id=hidden_id,
         )
     finally:
@@ -143,6 +150,29 @@ def test_hidden_lookup_requires_title_filter_e2e(peer_gateway):
     assert "ordinary_1" in ids
 
 
+def test_peer_delivery_returns_same_durable_ack_without_second_inbound(peer_gateway, monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr("tools.bot_live_delivery.find_canonical_live_owner", lambda home: None)
+    monkeypatch.setattr(peer_cmd, "_load_peers", lambda: {"spark": {"url": peer_gateway.url}})
+    monkeypatch.setattr(peer_cmd, "_peer_secret", lambda name: API_KEY)
+    envelope = {
+        "schema": "hermes.delivery-envelope.v1", "delivery_id": "delivery-peer-1",
+        "request_key": "request-peer-1", "turn_identity_sha256": "a" * 64,
+        "accepted_at": 10,
+    }
+    envelope_file = tmp_path / "delivery.json"
+    envelope_file.write_text(json.dumps(envelope), encoding="utf-8")
+    envelope_file.chmod(0o600)
+    args = SimpleNamespace(peer_action="dm", target="spark", message="once", json=True,
+                           delivery_envelope_file=str(envelope_file))
+
+    assert peer_cmd.cmd_peer(args) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert peer_cmd.cmd_peer(args) == 0
+    second = json.loads(capsys.readouterr().out)
+
+    assert first["delivery_ack"] == second["delivery_ack"]
+    rows = peer_gateway.db.get_messages(peer_gateway.hidden_id)
+    assert sum(1 for row in rows if row.get("role") == "user" and row.get("content") == "once") == 1
 @pytest.fixture()
 def peer_gateway_compressed_hidden(peer_gateway):
     """Aged Bot Mode footprint: the hidden canonical Bot Chat has a live
@@ -177,3 +207,27 @@ def test_peer_dm_reaches_compressed_hidden_bot_chat_e2e(
 
     # No duplicate "Bot Chat" row was minted; the title still lives on the root.
     assert gw.db.get_session_by_title("Bot Chat")["id"] == gw.hidden_id
+
+
+def test_delivery_envelope_refuses_live_canonical_owner_without_agent_turn(peer_gateway, monkeypatch):
+    import urllib.error
+    import urllib.request
+    from unittest.mock import AsyncMock
+
+    run_agent = AsyncMock()
+    monkeypatch.setattr(peer_gateway.adapter, "_run_agent", run_agent)
+    monkeypatch.setattr("tools.bot_live_delivery.find_canonical_live_owner",
+                        lambda home: {"session_id": peer_gateway.hidden_id})
+    envelope = {"schema": "hermes.delivery-envelope.v1", "delivery_id": "busy-owner",
+                "request_key": "busy-request", "turn_identity_sha256": "b" * 64,
+                "accepted_at": 10}
+    request = urllib.request.Request(
+        f"{peer_gateway.url}/api/sessions/{peer_gateway.hidden_id}/chat",
+        data=json.dumps({"message": "must wait for owner", "delivery": envelope}).encode(),
+        headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"})
+    with pytest.raises(urllib.error.HTTPError) as raised:
+        urllib.request.urlopen(request, timeout=10)
+    assert raised.value.code == 503
+    assert json.loads(raised.value.read())["error"]["code"] == "delivery_owner_busy"
+    run_agent.assert_not_called()
+    assert peer_gateway.db.get_messages(peer_gateway.hidden_id) == []

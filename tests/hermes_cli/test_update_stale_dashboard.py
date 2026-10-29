@@ -512,6 +512,7 @@ class TestManualBackendRespawn:
                 return None
 
         with patch.object(live.subprocess, "Popen", _FakePopen), \
+             patch("hermes_cli._launchers.installation_command", side_effect=lambda root, args: ["new-install-launcher", *args]), \
              patch.object(live.time, "sleep"):
             failed = live._respawn_dashboard_processes([
                 ["hermes", "dashboard", "--port", "8300"],
@@ -519,8 +520,26 @@ class TestManualBackendRespawn:
             ])
 
         assert failed == []
-        assert spawned[0] == ["hermes", "dashboard", "--port", "8300", "--no-open"]
-        assert spawned[1] == ["hermes", "serve", "--host", "0.0.0.0"]
+        assert spawned[0] == ["new-install-launcher", "dashboard", "--port", "8300", "--no-open"]
+        assert spawned[1] == ["new-install-launcher", "serve", "--host", "0.0.0.0"]
+
+    def test_respawn_replaces_stale_python_console_script(self, tmp_path, monkeypatch):
+        """A user command changed to a shell shim must never be fed to old Python."""
+        live = self._live()
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        shim = tmp_path / "hermes"
+        shim.write_text('#!/bin/sh\nexit 0\n', encoding="utf-8")
+        captured = ["/old/python", str(shim), "--profile", "research",
+                    "dashboard", "--port", "8300"]
+        with patch("hermes_cli._launchers.installation_command",
+                   return_value=["/updated/.hermes/bin/hermes", "--profile", "research",
+                                 "dashboard", "--port", "8300"]) as resolve, \
+             patch.object(live.subprocess, "Popen") as spawn:
+            spawn.return_value.poll.return_value = None
+            assert live._respawn_dashboard_processes([captured]) == []
+        assert resolve.call_args.args[1] == ("--profile", "research", "dashboard", "--port", "8300")
+        assert spawn.call_args.args[0] == ["/updated/.hermes/bin/hermes", "--profile", "research",
+                                           "dashboard", "--port", "8300", "--no-open"]
 
     def test_respawn_failure_returned(self, tmp_path, monkeypatch, capsys):
         live = self._live()
@@ -552,13 +571,13 @@ class TestManualBackendRespawn:
             "dashboard", "--no-open", "--host", "127.0.0.1", "--port", "34553",
         ]
         from hermes_cli import _launchers
-        from hermes_cli._launchers import runtime_command
+        from hermes_cli._launchers import installation_command
 
         with patch.object(live.subprocess, "Popen", _FakePopen), \
              patch.object(live.time, "sleep"), \
              patch.object(_launchers, "resolve_store_python", return_value=None):
             failed = live._respawn_dashboard_processes([captured])
-            expected = runtime_command(Path(live.__file__).resolve().parents[1], captured[2:])
+            expected = installation_command(Path(live.__file__).resolve().parents[1], captured[2:])
 
         assert failed == []
         assert spawned == [expected]

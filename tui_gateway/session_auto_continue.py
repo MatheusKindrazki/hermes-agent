@@ -127,6 +127,7 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
                     _emit("message.start", sid)
                 render_notification(announce, platform="tui", diagnostic=diagnostic)
                 _run_prompt_submit(rid, sid, session, text, display_kind="auto_continue",
+                    **({"source_event_id": marker["source_event_id"]} if marker.get("source_event_id") else {}),
                     **({"display_metadata": {"notification_category": "diagnostic"}} if diagnostic else {}))
         except Exception as exc:
             _notif_log_failure("auto-continue dispatch failed", exc)
@@ -145,13 +146,27 @@ def _ac_inflight_original(session: dict) -> str:
 
 
 def _enqueue_prompt(session: dict, text: Any, transport: Any, image_paths: list[str] | None = None,
-                    turn_author: dict | None = None) -> dict | None:
+                    turn_author: dict | None = None, source_event_id: str | None = None, observe_input: bool = False) -> dict | None:
     """Queue a message for the next turn. Text-only arrivals share a slot and merge losslessly (like the
     consecutive-user merge in ``repair_message_sequence``); image-bearing and authored ones stay separate
     envelopes so attachment chronology and the sender survive. ``transport`` is pinned so the drained turn
     streams to its sender. Returns the envelope dict the text landed in (the merged head on a merge)
     so the caller can attach durable state to it; None when the text was dropped as a duplicate."""
     image_paths = list(image_paths or [])
+    if source_event_id is not None or observe_input:
+        entries = ([session["queued_prompt"]] if session.get("queued_prompt") else []) + list(session.get("queued_prompts") or [])
+        if source_event_id and any(e.get("source_event_id") == source_event_id for e in entries):
+            return None
+        entry = {"text": text, "transport": transport, "observation_isolated": True}
+        if source_event_id: entry["source_event_id"] = source_event_id
+        if image_paths: entry["image_paths"] = image_paths
+        if turn_author: entry["turn_author"] = turn_author
+        if session.get("queued_prompt"):
+            session.setdefault("queued_prompts", []).append(entry)
+        else:
+            session["queued_prompt"] = entry
+        return entry
+
     # Scrub live-turn self-duplicates first so the text merge below can't glue "{original}\n\n{later}" and re-fire the
     # original after a correction settles.
     # See #84417.
@@ -165,6 +180,7 @@ def _enqueue_prompt(session: dict, text: Any, transport: Any, image_paths: list[
     existing = session.get("queued_prompt")
     if (existing and text_only and not turn_author and isinstance(existing.get("text"), str)
             and not existing.get("image_paths") and not existing.get("turn_author")
+            and not existing.get("observation_isolated")
             and not session.get("queued_prompts")):
         prev = existing["text"]
         existing["text"] = f"{prev}\n\n{text}" if prev and text else (prev or text)
@@ -188,7 +204,8 @@ def _sanitize_queued_entry_vs_inflight_user(entry: Any, original: str) -> dict |
     if not isinstance(entry, dict):
         return None
     text = entry.get("text")
-    if not original or entry.get("image_paths") or entry.get("turn_author") or not isinstance(text, str):
+    if (not original or entry.get("image_paths") or entry.get("turn_author")
+            or entry.get("observation_isolated") or not isinstance(text, str)):
         return entry
     # A lossless text-merge may have glued the live original onto a later follow-up: keep the remainder.
     rest = next((text[len(original + sep):] for sep in ("\n\n", "\n") if text.startswith(original + sep)), text).strip()
@@ -398,12 +415,12 @@ def _replace_queued_user_row_for_turn(session: dict, queued: dict, is_dispatchin
 
 
 def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False,
-                        turn_author: dict | None = None, display_kind: str | None = None) -> dict | None:
+                        turn_author: dict | None = None, display_kind: str | None = None, source_event_id: str | None = None, observe_input: bool = False) -> dict | None:
     """Apply ``display.busy_input_mode`` to a mid-turn prompt instead of rejecting it (rejection made clients busy-retry
     and drop sends): ``interrupt`` (default) → redirect, falling back to hard interrupt + queue; ``queue`` → queue only;
     ``steer`` → inject after the current atomic action. ``queued=True`` (client queue drain) forces queue mode: a "run
     after" message must NEVER become a live correction."""
-    mode = "queue" if queued else _load_busy_input_mode()
+    mode = "queue" if queued or source_event_id is not None or observe_input else _load_busy_input_mode()
     agent = session.get("agent")
     # Compression in flight demotes steer/interrupt to queue: a correction delivered
     # mid-compression aborts the compression instead of waiting for it (#61042). The
@@ -436,7 +453,7 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any,
             if image_paths:
                 session["attached_images"] = image_paths + list(session.get("attached_images", []))
             return None
-        envelope = _enqueue_prompt(session, text, transport, image_paths=image_paths, turn_author=turn_author)
+        envelope = _enqueue_prompt(session, text, transport, image_paths=image_paths, turn_author=turn_author, source_event_id=source_event_id, observe_input=observe_input)
         # Durable AT ACCEPT (not when the turn runs): a cold resume sees the queued message and a
         # backend restart cannot lose it. Lives on the envelope, never the shared session slot.
         if envelope is not None:
@@ -503,6 +520,8 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             session.pop("_submit_user_row", None)
     # The compute-host frame has no author field, so only the inline runner receives it.
     author_kwargs = {"turn_author": queued["turn_author"]} if queued.get("turn_author") else {}
+    if queued.get("source_event_id"):
+        author_kwargs["source_event_id"] = queued["source_event_id"]
     dispatch_failed = False
     try:
         if not use_compute_host:

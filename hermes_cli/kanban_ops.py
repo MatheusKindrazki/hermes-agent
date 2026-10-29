@@ -84,6 +84,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
         res = kbd.dispatch_once(
             conn,
+            task_id=getattr(args, "task_id", None),
             dry_run=args.dry_run,
             max_spawn=max_spawn,
             max_in_progress=max_in_progress,
@@ -91,6 +92,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
         )
+    targeted = bool(getattr(args, "task_id", None))
+    exit_code = 0 if not targeted or res.target_reason == "spawned" else 1
     if getattr(args, "json", False):
         _print_json({
             **{k: getattr(res, k)
@@ -113,8 +116,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "rate_limited": res.rate_limited,
             "skipped_locked": res.skipped_locked,
             "memory_pressure": res.memory_pressure,
+            "target_reason": res.target_reason,
+            "worker_path_error": res.worker_path_error,
         }, ascii=True)
-        return 0
+        return exit_code
     print(f"Reclaimed:    {res.reclaimed}")
     if res.reaped_terminal_workers:
         print(f"Reaped workers of finished tasks: {', '.join(res.reaped_terminal_workers)}")
@@ -154,7 +159,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print("Skipped: another dispatcher holds this board's lock (no writes this tick)")
     if res.memory_pressure:
         print(f"Memory pressure {res.memory_pressure}: new workers restricted this tick")
-    return 0
+    return exit_code
 
 
 _DAEMON_DEPRECATED = (

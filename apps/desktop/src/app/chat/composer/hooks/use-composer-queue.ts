@@ -10,6 +10,7 @@ import { resetBrowseState } from '@/store/composer-input-history'
 import {
   $parkedQueueSessions,
   $queuedPromptsBySession,
+  canDispatchQueuedPrompt,
   clearQueuedPromptDrainFailures,
   enqueueQueuedPrompt,
   getQueuedPrompts,
@@ -499,6 +500,10 @@ export function useComposerQueue({
 
           if (!entry) {
             return null
+          }
+
+          if (!canDispatchQueuedPrompt(entry)) {
+            return false
           }
 
           const resolved = resolveQueuedPromptTransport(entry)

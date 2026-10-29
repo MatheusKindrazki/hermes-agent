@@ -75,6 +75,18 @@ export const zhHantOverrides = {
     results: (count: number) => `${count.toLocaleString('zh-Hant')} 個結果`,
     back: '返回結果'
   },
+  activeContext: {
+    unknownProfile: '未知設定檔',
+    unknownTenant: '未知租戶',
+    unknownDevice: '未知裝置',
+    newChat: '新聊天',
+    chat: '對話',
+    thisChat: '此對話',
+    ownerUnknown: (profile, device) => `擁有者未知 — ${profile}（${device}）`,
+    ownerKnown: (profile, device) => `${profile}（${device}）`,
+    detail: (what, owner, tenant) => `${what}：${owner}；租戶 ${tenant}`,
+    text: (what, profile, tenant, device) => `${what} · ${profile} · ${tenant} · ${device}`
+  },
   connectors: {
     directory: {
       suggested: '推薦',

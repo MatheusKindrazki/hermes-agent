@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 import uuid
 
 BOT_CHAT_TITLE = "Bot Chat"
@@ -27,6 +29,30 @@ _PROFILE_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 # One synchronous agent turn can legitimately take minutes.
 DM_TIMEOUT_S = 600
 LIST_TIMEOUT_S = 30
+
+
+def _load_delivery_envelope(path_value: str | None) -> dict | None:
+    if not path_value:
+        return None
+    path = Path(path_value)
+    if not path.is_absolute() or path.is_symlink() or not path.is_file():
+        raise RuntimeError("delivery envelope path is invalid")
+    info = path.stat()
+    if info.st_uid != getattr(os, "getuid", lambda: info.st_uid)() or (info.st_mode & 0o077):
+        raise RuntimeError("delivery envelope permissions are invalid")
+    document = json.loads(path.read_text(encoding="utf-8-sig"))
+    fields = {"schema", "delivery_id", "request_key", "turn_identity_sha256", "accepted_at"}
+    if not isinstance(document, dict) or set(document) != fields:
+        raise RuntimeError("delivery envelope fields are invalid")
+    if document.get("schema") != "hermes.delivery-envelope.v1":
+        raise RuntimeError("delivery envelope schema is invalid")
+    if not all(isinstance(document.get(k), str) and document[k] for k in ("delivery_id", "request_key")):
+        raise RuntimeError("delivery envelope identity is invalid")
+    if re.fullmatch(r"[0-9a-f]{64}", str(document.get("turn_identity_sha256") or "")) is None:
+        raise RuntimeError("delivery envelope identity is invalid")
+    if isinstance(document.get("accepted_at"), bool) or not isinstance(document.get("accepted_at"), int) or document["accepted_at"] < 1:
+        raise RuntimeError("delivery envelope timestamp is invalid")
+    return document
 
 
 def _peer_key_env(name: str) -> str:
@@ -345,10 +371,11 @@ def _peer_run(args, message: str, peer_name: str, profile: str | None, base: str
 def _peer_dm(args, message: str, peer_name: str, profile: str | None, base: str, key: str) -> int:
     session_id = ""
     try:
+        delivery = _load_delivery_envelope(getattr(args, "delivery_envelope_file", None))
         session_id = _ensure_bot_chat(base, key)
         result = _request(
             f"{base}/api/sessions/{urllib.parse.quote(session_id, safe='')}/chat", key,
-            method="POST", body=_turn_body(message, message_key="message"), timeout=DM_TIMEOUT_S)
+            method="POST", body={**_turn_body(message, message_key="message"), **({"delivery": delivery} if delivery else {})}, timeout=DM_TIMEOUT_S)
     except RuntimeError as exc:
         print(f"Peer '{peer_name}': {exc}", file=sys.stderr)
         return 1
@@ -385,7 +412,7 @@ def _peer_dm(args, message: str, peer_name: str, profile: str | None, base: str,
     if is_intentional_silence_response(reply):
         reply = ""
     payload = {"peer": peer_name, "profile": profile,
-               "session_id": result.get("session_id") or session_id, "reply": reply}
+               "session_id": result.get("session_id") or session_id, "reply": reply, **({"delivery_ack": result.get("delivery_ack")} if delivery else {})}
     return _emit(args, payload, [reply or "(no reply)"])
 
 
@@ -466,6 +493,8 @@ def build_peer_parser(subparsers) -> None:
             if name == "run":
                 sp.add_argument(
                     "--idempotency-key", default=None, help="Stable retry key (generated when omitted)")
+        if name == "dm":
+            sp.add_argument("--delivery-envelope-file", default=None, help=argparse.SUPPRESS)
         sp.add_argument("--json", action="store_true", default=False, help="Emit a JSON result")
 
     _remote("dm", "Message an agent on a peer gateway and print its reply", run_id=False)

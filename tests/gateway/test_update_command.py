@@ -6,6 +6,9 @@ the _send_update_notification startup hook (sends results after restart).
 
 import json
 import os
+
+
+import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch, MagicMock, AsyncMock
@@ -13,6 +16,8 @@ from unittest.mock import patch, MagicMock, AsyncMock
 import pytest
 
 from gateway.config import Platform
+from gateway.egress_policy import EgressPolicy
+from gateway.reliability_outbox import ReliabilityOutbox
 from gateway.platforms.event import MessageEvent
 from gateway.session import SessionSource
 
@@ -334,6 +339,60 @@ class TestSendUpdateNotification:
         call_args = mock_adapter.send.call_args
         assert call_args[0][0] == "67890"  # chat_id
         assert "Update complete" in call_args[0][1] or "update finished" in call_args[0][1].lower()
+
+    @pytest.mark.asyncio
+    async def test_shadow_completion_notification_enqueues_without_native_send(
+        self, tmp_path, unit_tone_gate
+    ):
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / ".update_pending.json").write_text(
+            json.dumps({"platform": "telegram", "chat_id": "67890"})
+        )
+        (hermes_home / ".update_output.txt").write_text("done")
+        (hermes_home / ".update_exit_code").write_text("0")
+        adapter = AsyncMock()
+        runner.adapters = {Platform.TELEGRAM: adapter}
+        identity = {
+            "profile": "luguistaff",
+            "tenant": "lugui",
+            "machine": "personal-mac-mini",
+            "work_id": "01a04a0f-455a-7bea-a064-4aa68b009d39",
+            "session_id": "update-session",
+            "policy_version": "tone-v1",
+            "milestone": "update-complete",
+            "version": "update-7",
+            "tone_envelope": unit_tone_gate(),
+        }
+        runner._thread_metadata_for_target = MagicMock(return_value=identity)
+        config = {
+            "gateway": {
+                "reliability": {
+                    "egress": {"mode": "enforce"},
+                    "outbox": {
+                        "mode": "shadow",
+                        "db_path": str(tmp_path / "outbox.sqlite3"),
+                        "payload_dir": str(tmp_path / "payloads"),
+                    },
+                }
+            }
+        }
+        runner._egress_policy = EgressPolicy.from_config(config)
+        runner._reliability_outbox = ReliabilityOutbox.from_config(
+            config, hermes_home=tmp_path
+        )
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            delivered = await runner._send_update_notification()
+
+        assert delivered is True
+        adapter.send.assert_not_awaited()
+        with sqlite3.connect(tmp_path / "outbox.sqlite3") as connection:
+            events = connection.execute(
+                "SELECT event_type,milestone FROM outbox_events"
+            ).fetchall()
+        assert events == [("gateway_update_notification", "update-complete")]
 
 
     @pytest.mark.asyncio

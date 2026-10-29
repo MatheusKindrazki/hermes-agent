@@ -239,6 +239,15 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
     only if the gateway config loads AND reports it unconnected; config load failures fail OPEN.
     ``failure_deliver`` gets the same rules — a typo'd failure platform would otherwise only
     surface when a failure occurs (NS-788)."""
+    from hermes_cli import notification_inbox
+    from hermes_constants import get_hermes_home
+
+    try:
+        if notification_inbox.enabled(get_hermes_home()):
+            return None  # isolated delivery uses only this profile's local DB
+    except Exception as exc:
+        return f"notification inbox configuration failed: {type(exc).__name__}"
+
     deliver_value = _delivery._normalize_deliver_value(job.get("deliver", "local"))
     failure_deliver_value = _delivery._normalize_deliver_value(
         _delivery._delivery_lane_value(job, for_failure=True))
@@ -252,7 +261,7 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
             if not part or part.lower() in {"local", "origin", "all"}:
                 continue
             # bot-chat targets deliver via a local subprocess; failures land in last_delivery_error.
-            if _delivery.parse_bot_chat_deliver_token(part) is not None:
+            if _delivery.parse_bot_chat_deliver_token(part) is not None or _delivery.parse_bot_chat_notify_deliver_token(part) is not None:
                 continue
             platform_parts.append(part.split(":", 1)[0].strip())
     if not platform_parts:

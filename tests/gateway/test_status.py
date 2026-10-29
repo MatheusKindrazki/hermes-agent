@@ -273,6 +273,67 @@ class TestScopedGatewayPidQuery:
 
 
 class TestGatewayRuntimeStatus:
+    @pytest.mark.parametrize("legacy_home", [None, "/tmp/wrong-hermes-home"])
+    def test_write_runtime_status_restamps_process_home_from_legacy_state(
+        self, tmp_path, monkeypatch, legacy_home
+    ):
+        """A surviving gateway_state.json must describe its current writer.
+
+        Legacy releases did not persist ``hermes_home`` consistently, and a
+        stale value is equally unsafe: release activation verifies this field
+        before accepting the new process as ready.
+        """
+        process_home = tmp_path / "default"
+        process_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(process_home))
+        payload = {
+            "gateway_state": "running",
+            "pid": 1,
+            "kind": "hermes-gateway",
+            "argv": ["legacy"],
+            "start_time": 1,
+        }
+        if legacy_home is not None:
+            payload["hermes_home"] = legacy_home
+        (process_home / "gateway_state.json").write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+
+        status.write_runtime_status(active_agents=0)
+
+        current = json.loads(
+            (process_home / "gateway_state.json").read_text(encoding="utf-8")
+        )
+        assert current["hermes_home"] == str(process_home.resolve())
+
+    def test_write_runtime_status_ignores_context_profile_home(
+        self, tmp_path, monkeypatch
+    ):
+        """A multiplexed profile context cannot retarget process identity."""
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        process_home = tmp_path / "default"
+        process_home.mkdir()
+        profile_home = tmp_path / "profiles" / "cfo"
+        profile_home.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(process_home))
+        (process_home / "gateway_state.json").write_text(
+            json.dumps({"gateway_state": "running", "hermes_home": str(profile_home)}),
+            encoding="utf-8",
+        )
+
+        token = set_hermes_home_override(str(profile_home))
+        try:
+            status.write_runtime_status(active_agents=0)
+        finally:
+            reset_hermes_home_override(token)
+
+        current = json.loads(
+            (process_home / "gateway_state.json").read_text(encoding="utf-8")
+        )
+        assert current["hermes_home"] == str(process_home.resolve())
+        assert not (profile_home / "gateway_state.json").exists()
+
     def test_clear_profile_platforms_preserves_primary_entries(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         (tmp_path / "gateway_state.json").write_text(
@@ -1376,20 +1437,28 @@ class TestPlannedStopMarker:
 class TestReadProcessCmdlinePsFallback:
     """Tests for _read_process_cmdline falling back to ps on non-Linux."""
 
+    @pytest.mark.platforms("posix")
     def test_ps_fallback_when_proc_unavailable(self, monkeypatch):
-        monkeypatch.setattr(status.Path, "read_bytes", lambda self: (_ for _ in ()).throw(FileNotFoundError))
-        # psutil sits between /proc and ps; left real, it reads whatever process holds this pid on the
-        # host (CI saw `/usr/sbin/haveged` at 873) and ps is never reached.
-        def _no_such_process(pid):
-            raise ProcessLookupError(pid)
+        import psutil
 
-        monkeypatch.setitem(sys.modules, "psutil", SimpleNamespace(Process=_no_such_process))
-        monkeypatch.setattr(
-            status.subprocess, "run",
-            lambda args, **kwargs: SimpleNamespace(returncode=0, stdout="/usr/libexec/bluetoothuserd\n"),
-        )
+        monkeypatch.setattr(status.Path, "read_bytes", lambda self: (_ for _ in ()).throw(FileNotFoundError))
+
+        def inaccessible_process(pid):
+            raise psutil.AccessDenied(pid)
+
+        # The reader tries psutil between /proc and ps. Model the permission
+        # failure explicitly instead of accidentally reading a real host PID.
+        monkeypatch.setattr(psutil, "Process", inaccessible_process)
+        calls = []
+
+        def read_ps(args, **kwargs):
+            calls.append(args)
+            return SimpleNamespace(returncode=0, stdout="/usr/libexec/bluetoothuserd\n")
+
+        monkeypatch.setattr(status.subprocess, "run", read_ps)
         result = status._read_process_cmdline(873)
         assert result == "/usr/libexec/bluetoothuserd"
+        assert calls == [["ps", "-p", "873", "-o", "command="]]
 
 
     def test_proc_cmdline_takes_priority_over_ps(self, monkeypatch):

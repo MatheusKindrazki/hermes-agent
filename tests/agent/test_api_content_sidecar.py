@@ -559,6 +559,8 @@ class TestWireInvariant:
         agent1 = make_agent()
         agent1.run_conversation("hello please", conversation_history=[], task_id="t1")
         turn_n_user = _user_messages(_chat_requests(handler)[0])[0]
+        assert "client_turn_id" not in turn_n_user
+        durable_turn_id = agent1._session_messages[0]["client_turn_id"]
         turn_n_bytes = json.dumps(turn_n_user, sort_keys=True)
 
         # ── Turn N+1: fresh agent, history reloaded from the store ──
@@ -566,6 +568,7 @@ class TestWireInvariant:
         # The stored history carries the sidecar, not the injected content.
         assert history[0]["content"] == "hello please"
         assert history[0]["api_content"] == turn_n_user["content"]
+        assert history[0]["display_metadata"]["_compression_turn_id"] == durable_turn_id
 
         handler.captured_requests = []
         agent2 = make_agent()
@@ -579,6 +582,18 @@ class TestWireInvariant:
         # And the new current-turn message got its own injection + sidecar.
         current = _user_messages(_chat_requests(handler)[0])[-1]
         assert current["content"] == "second question\n\nPLUGIN-CTX"
+
+    def test_metadata_only_preserves_compression_identity_after_reload(self, wire_env):
+        make_agent, _handler, db, sid = wire_env
+        agent = make_agent()
+        agent.run_conversation("hello", conversation_history=[], task_id="metadata-only",
+                               persist_user_display_metadata={"source": "native"})
+        durable_id = agent._session_messages[0]["client_turn_id"]
+        reloaded = db.get_messages_as_conversation(sid)[0]
+        assert reloaded["display_metadata"]["source"] == "native"
+        assert reloaded["display_metadata"]["_compression_turn_id"] == durable_id
+        from agent.conversation_compression import ensure_compression_turn_identity
+        assert ensure_compression_turn_identity(reloaded) == durable_id
 
     def test_multimodal_turn_sends_persists_and_replays_context_part(self, wire_env):
         """#71998: on a list-content (image) turn the ``pre_llm_call`` context reaches the

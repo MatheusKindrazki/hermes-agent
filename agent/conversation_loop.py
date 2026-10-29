@@ -17,6 +17,8 @@ from typing import Any, Dict, List, Optional
 
 from agent.agent_runtime_helpers_placeholders import hidden_interrupt_placeholder_row
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.durable_admission import admit_turn_or_block
+from agent.conversation_compression import ensure_compression_turn_identity, spool_deferred_compression_turn
 from agent.fast_mode import begin_turn as begin_fast_mode_turn
 from agent.message_metadata import append_message, without_persistence_fields
 from agent.message_sanitization import _repair_tool_call_arguments, _sanitize_surrogates
@@ -1162,39 +1164,69 @@ def _partial_turn_result(
     }
 
 
-def _compression_deferred_result(agent, messages: list[dict], api_call_count: int, reason: str = "lock") -> dict[str, Any]:
+def _compression_deferred_result(agent, messages: list[dict], api_call_count: int, reason: str = "lock", *, token_count: int = 0) -> dict[str, Any]:
     """Soft turn result for a transiently-deferred compression. Both reasons must end as
     ``compression_deferred``, never ``compression_exhausted`` — the gateway wipes the
     session on exhaustion (#9893/#35809). ``failed`` stays False; the turn persists."""
-    session = agent.session_id or "none"
     if reason == "transient_block":
-        block = getattr(agent, "_compression_blocked_transient", None)
-        logger.info(
-            "turn deferred: compression transiently blocked (%s) (session=%s) — not counting as "
-            "compression exhaustion", block if isinstance(block, str) else "unknown guard", session,
-        )
-        _final = (
+        try:
+            agent._flush_status_buffer()
+        except Exception:
+            pass
+        return _partial_turn_result(
             "Context compression is temporarily paused after a recent failed attempt. Please retry "
-            "in a moment — compression will resume automatically (or run /compress to force a retry now)."
+            "in a moment — compression will resume automatically (or run /compress to force a retry now).",
+            messages, api_call_count, failed=False, compression_deferred=True,
+            session_id=agent.session_id,
         )
-    else:
-        holder = getattr(agent, "_compression_skipped_due_to_lock", None)
-        logger.info(
-            "turn deferred: compression lock held by another path (session=%s holder=%s) — not "
-            "counting as compression exhaustion", session, holder if isinstance(holder, str) else "unconfirmed",
+    holder = getattr(agent, "_compression_skipped_due_to_lock", None)
+    logger.info(
+        "turn deferred: compression lock held by another path "
+        "(session=%s holder=%s) — not counting as compression exhaustion",
+        agent.session_id or "none",
+        holder if isinstance(holder, str) else "unconfirmed",
+    )
+    receipt = None
+    spool_error = None
+    try:
+        receipt = spool_deferred_compression_turn(
+            agent.session_id or "",
+            messages,
+            token_count=int(token_count or 0),
         )
-        _final = (
-            "Context compression is already running for this session. Please retry in a moment — "
-            "your next message will be processed once the concurrent compression finishes."
-        )
+    except Exception as exc:
+        spool_error = type(exc).__name__
+        logger.warning("compression turn durable handoff failed: %s", exc)
     try:
         agent._flush_status_buffer()
     except Exception:
         pass
-    return _partial_turn_result(
-        _final, messages, api_call_count,
-        failed=False, compression_deferred=True, session_id=agent.session_id,
-    )
+    accepted = bool(receipt and receipt.get("durable"))
+    if accepted:
+        _final = (
+            "Your turn was durably accepted while context compression finishes. "
+            "It will resume automatically on the live continuation."
+        )
+    else:
+        _final = (
+            "Context compression is still in progress. This turn was not "
+            "accepted for automatic handoff; please retry shortly."
+        )
+    return {
+        "final_response": _final,
+        "messages": messages,
+        "completed": False,
+        "api_calls": api_call_count,
+        "error": None if accepted else _final,
+        "partial": True,
+        "failed": False,
+        "compression_deferred": True,
+        "compression_handoff_accepted": accepted,
+        "compression_spool_turn_id": receipt.get("turn_id") if accepted else None,
+        "compression_spool_error": spool_error,
+        "retryable": True,
+        "session_id": agent.session_id,
+    }
 
 
 def _provider_overflow_exhausted_result(
@@ -1651,6 +1683,65 @@ def _run_conversation_turn(
         user_message, moa_config, persist_user_message = _decode_inline_moa_turn(
             user_message, persist_user_message
         )
+
+    # ── Durable admission (K8) ──
+    # Nothing model-facing may run before the kernel has durably recorded this
+    # input. The seam sits HERE — after the MoA decode, so what is admitted is
+    # the text the user actually wrote rather than the transport envelope, and
+    # before ``build_turn_context``, which runs preflight compression, the
+    # oversized-resume rebuild and the ``pre_llm_call`` hook. The Codex
+    # app-server runtime branches further down, after that call, so it is
+    # covered by this one gate.
+    #
+    # On a gateway turn the Signal was already recorded at ingress, before
+    # vision/STT/compression rewrote this text; that verified outcome is
+    # consumed here rather than re-admitted, so one inbound message is one
+    # Signal and never two. Nothing about the request is altered either way:
+    # no synthetic turn, no system-prompt or history edit, no toolset change.
+    #
+    # Unarmed, this is a single environment read and a ``None``, so the pre-K8
+    # turn is preserved exactly: no config file is opened, no subprocess exists,
+    # and no database is touched.
+    _admission_block = admit_turn_or_block(
+        agent, user_message, conversation_history=conversation_history
+    )
+    if _admission_block is not None:
+        return _admission_block
+
+    # Bind a durable, per-input identity before build_turn_context performs
+    # its crash-resilience append. The staged mapping is the same object the
+    # turn prologue adopts, so the ID reaches both SessionDB display metadata
+    # and a later compression spool without changing provider-visible content.
+    _expected_persist_content = (
+        persist_user_message if persist_user_message is not None else user_message
+    )
+    _staged_user = getattr(agent, "_pending_cli_user_message", None)
+    if not (
+        isinstance(_staged_user, dict)
+        and _staged_user.get("content") == _expected_persist_content
+    ):
+        _staged_user = {"role": "user", "content": _expected_persist_content}
+        if persist_user_timestamp is not None:
+            _staged_user["timestamp"] = persist_user_timestamp
+        agent._pending_cli_user_message = _staged_user
+    _typed_metadata = (
+        dict(persist_user_display_metadata)
+        if isinstance(persist_user_display_metadata, dict)
+        else {}
+    )
+    _typed_metadata.pop("_compression_turn_id", None)
+    _staged_metadata = _staged_user.get("display_metadata")
+    if not isinstance(_staged_metadata, dict):
+        _staged_metadata = {}
+    else:
+        _staged_metadata = dict(_staged_metadata)
+    _staged_metadata.update(_typed_metadata)
+    _staged_user["display_metadata"] = _staged_metadata
+    ensure_compression_turn_identity(_staged_user)
+    if persist_user_display_kind or persist_user_display_metadata is not None:
+        # turn_context applies typed metadata after adopting this staged dict;
+        # pass the merged mapping so that assignment retains the internal ID.
+        persist_user_display_metadata = _staged_user["display_metadata"]
 
     # The gateway caches agents across turns; compression state is per-turn, or a stale
     # in-place boundary would make a later uncompressed result look compacted.

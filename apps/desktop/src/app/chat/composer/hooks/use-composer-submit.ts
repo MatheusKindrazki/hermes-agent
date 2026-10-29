@@ -191,6 +191,7 @@ export function useComposerSubmit({
           surfaceId !== null &&
           requestedSurfaceId === surfaceId &&
           paneVisible &&
+          !disabled &&
           !inputDisabled
         ) {
           const current = externalSubmitRef.current
@@ -243,7 +244,7 @@ export function useComposerSubmit({
           }
         }
       }),
-    [activeQueueSessionKeyRef, inputDisabled, paneVisible, scope.target, sessionId, surfaceId]
+    [disabled, activeQueueSessionKeyRef, inputDisabled, paneVisible, scope.target, sessionId, surfaceId]
   )
 
   // Returns false when the submit was refused and must not refocus the input.

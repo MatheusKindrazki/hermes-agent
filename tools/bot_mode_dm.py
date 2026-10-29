@@ -28,8 +28,19 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
+
+if __name__ == "__main__":
+    # The delivery runner must use the same checkout as this script, including
+    # when a worktree borrows an interpreter with another editable install.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback below
+    fcntl = None
 
 # Top-level imports stay stdlib-only: this module also runs directly as the background
 # delivery runner (``python bot_mode_dm.py --run-delivery …``); Hermes helpers import lazily.
@@ -57,6 +68,31 @@ _LIVE_WAIT_MAX_SECONDS = 30 * 60
 _PEER_TARGET_RE = re.compile(r"^([a-z0-9][a-z0-9_-]{0,63})/([a-zA-Z0-9][a-zA-Z0-9_-]{0,63})$")
 # Same shape as ``tools.bot_relay._HANDLE_RE`` (kept local: see import note above).
 _LOCAL_TARGET_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
+DELIVERY_ACK_SCHEMA = "hermes.delivery-ack.v1"
+DELIVERY_ENVELOPE_SCHEMA = "hermes.delivery-envelope.v1"
+_DELIVERY_QUERY_PREFIX = "HERMES_DELIVERY_V1\n"
+
+
+def _canonical(document: Any) -> str:
+    return json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _canonical_sha256(document: Any) -> str:
+    return hashlib.sha256(_canonical(document).encode("utf-8")).hexdigest()
+
+
+def _encode_delivery_query(envelope: Mapping[str, Any], message: str) -> str:
+    return _DELIVERY_QUERY_PREFIX + _canonical({"delivery": dict(envelope), "message": message})
+
+
+def _public_delivery_receipt(record: dict[str, Any]) -> dict[str, Any]:
+    hidden = {"turn_identity", "fence", "adapter_ack", "observation", "release_event_id", "release_state", "release_receipt"}
+    return {key: value for key, value in record.items() if key not in hidden}
+
+
+def _hermes_root(home: Path) -> Path:
+    from tools.bot_mode_probe import _hermes_root as resolve
+    return resolve(home)
 
 
 def _default_home() -> str:
@@ -137,6 +173,9 @@ def message_agent_authorized(agent: Any) -> bool:
         return False
 
 
+message_agent_tool_enabled = message_agent_authorized
+
+
 def ensure_message_agent_tool(agent: Any) -> bool:
     """Inject the ``message_agent`` schema into a Bot Chat agent's tool list (once per turn).
     Idempotent and deterministic for the session's life (the gate is stable from the
@@ -187,6 +226,27 @@ def _resolve_local_name(target: str, roster: list[str], root: Path | None = None
     return next(iter(hits)) if len(hits) == 1 else None
 
 
+
+def _relay_enforce_refusal() -> Optional[str]:
+    """Desktop relay has enqueue only, so enforced delivery cannot use it."""
+    try:
+        from agent.durable_admission import (
+            admission_enabled,
+            revalidate_current_turn_identity,
+        )
+        if not admission_enabled():
+            return None
+        revalidate_current_turn_identity()
+    except Exception as exc:
+        return _err(f"Desktop relay authority refused: {type(exc).__name__}: {exc}")
+    return _err(
+        "Desktop relay has no durable destination ACK; delivery is disabled under enforce."
+    )
+
+
+# ── the tool ─────────────────────────────────────────────────────────────────
+
+
 def _err(message: str, *, roster: list[str] | None = None, peers: list[str] | None = None) -> str:
     from tools.bot_failure_reasons import classify_agent_error
 
@@ -198,9 +258,17 @@ def _err(message: str, *, roster: list[str] | None = None, peers: list[str] | No
     return json.dumps(payload)
 
 
-def message_agent_tool(target: str = "", message: str = "", task_id: Optional[str] = None, agent: Any = None) -> str:
+def message_agent_tool(
+    target: str = "",
+    message: str = "",
+    task_id: Optional[str] = None,
+    origin_session_id: Optional[str] = None,
+    agent: Any = None,
+) -> str:
     """Deliver ``message`` to ``target``'s Bot Chat. Returns a JSON ack/error.
     ``agent`` is the calling AIAgent — used for the Bot Chat gate and sender identity."""
+    if not getattr(agent, "_bot_mode_protocol", True):
+        return _err("message_agent is disabled for this agent session. Do not retry.")
     home = _agent_home(agent)
     try:
         from tools.bot_mode_probe import (
@@ -241,7 +309,7 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
         return _roster_err("target is required.")
     # Sender signature: the friendly name when the bot has one (#89720); the @handle stays the routing alias.
     content = f"Message from 🤖 {_display_name(me, roster_homes.get(me, Path(home)))} (@{_handle(me)}): " + body
-    delivery = dict(task_id=task_id, agent=agent)
+    delivery = dict(task_id=task_id, agent=agent, origin_session_id=origin_session_id)
     # Attribution for the recipient's memory hooks; the text prefix above stays the human-facing signature.
     author = {"id": f"bot:{me}", "name": _handle(me), "is_bot": True}
 
@@ -271,7 +339,10 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
     # hands out for a colliding row, and stamps on replies. Resolved locally first, a local bot whose friendly
     # name slugs to 'hermes-mini' captured it. An '@' name no connection answers to still resolves locally.
     if "@" in raw_target.strip().lstrip("@"):
-        relayed = _try_relay_delivery(root, raw_target, content, me, **delivery)
+        relay_refusal = _relay_enforce_refusal()
+        if relay_refusal is not None:
+            return relay_refusal
+        relayed = _try_relay_delivery(root, raw_target, content, me, task_id=task_id, agent=agent)
         if relayed is not None:
             return relayed
     # Local teammate — folder id, or a friendly name / Desktop @-slug ('Scribe', 'Dr. Foo').
@@ -283,7 +354,10 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
         # Unknown locally, or same-name target on ANOTHER connection (this gateway's 'default'
         # messaging the cloud 'default'): every Desktop-connected gateway is reachable via the
         # relay roster, so try that before reporting a resolution failure / self-message.
-        relayed = _try_relay_delivery(Path(home), raw_target, content, me, **delivery)
+        relay_refusal = _relay_enforce_refusal()
+        if relay_refusal is not None:
+            return relay_refusal
+        relayed = _try_relay_delivery(Path(home), raw_target, content, me, task_id=task_id, agent=agent)
         if relayed is not None:
             return relayed
         if resolved == me:
@@ -291,10 +365,40 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
         return _roster_err(f"No teammate named '{raw_target}' on this install, on a connected "
                            "machine, or on a registered peer. Pick a name from the roster "
                            "(roles are listed in your system prompt).")
-    # Local teammates are admitted through the profile authority; the argv only names the
-    # profile for the runner's lock/home lookups and is never executed.
-    return _start_delivery([_hermes_cli(), "-p", resolved], content, f"@{_handle(resolved)}",
-                           stdin_file=False, profile_home=roster_homes[resolved], author=author, **delivery)
+    exact_session, route_reason = _resolve_target_bot_session(resolved, origin_session_id)
+    if origin_session_id and not exact_session:
+        return _err(f"Delivery origin session {origin_session_id!r} is not an eligible Bot Chat "
+                    f"for profile '{resolved}' ({route_reason}); refusing title fallback.")
+    argv = [_hermes_cli(), "-p", resolved]
+    if exact_session:
+        argv += ["--resume", exact_session]
+    return _start_delivery(argv, content, f"@{_handle(resolved)}",
+                           stdin_file=False, profile_home=roster_homes[resolved], author=author, route_reason=route_reason, **delivery)
+
+
+def _resolve_target_bot_session(
+    profile: str, origin_session_id: Optional[str]
+) -> tuple[Optional[str], str]:
+    """Resolve an explicit destination session; title is only a labeled fallback."""
+    if not origin_session_id:
+        return None, "canonical_title_fallback"
+    try:
+        from hermes_cli.profiles import get_profile_dir
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=get_profile_dir(profile) / "state.db")
+        try:
+            row = db.get_session(str(origin_session_id))
+            if not row:
+                return None, "origin_session_not_found"
+            if str(row.get("title") or "") != "Bot Chat":
+                return None, "origin_session_not_bot_chat"
+            return db.get_compression_tip(str(origin_session_id)) or str(origin_session_id), "origin_exact"
+        finally:
+            db.close()
+    except Exception:
+        logger.debug("exact Bot Chat session resolution failed", exc_info=True)
+        return None, "origin_session_unavailable"
 
 
 def _try_relay_delivery(root: Path, raw_target: str, content: str, me: str, *,
@@ -319,6 +423,16 @@ def _try_relay_delivery(root: Path, raw_target: str, content: str, me: str, *,
             forms = ", ".join(form for r, form in zip(roster, remote_target_forms(roster, local_taken_forms(root)))
                               if want in _target_aliases(r))
             return _err(f"'{raw_target}' exists on several connected machines — disambiguate with one of: {forms}.")
+        relay_refusal = _relay_enforce_refusal()
+        if relay_refusal is not None:
+            return relay_refusal
+        from agent.durable_admission import reserve_observed_effect, observation_gap
+        relay_observation = reserve_observed_effect(
+            "relay:" + str(match["connection_id"]) + ":" + str(match["handle"]), content,
+        )
+        if relay_observation is not None:
+            # Desktop owns a different ACK seam. This adapter cannot claim it.
+            observation_gap(relay_observation, "ack_missing")
         try:
             envelope = enqueue_envelope(root, target=match, message=content, sender_profile=me, sender_handle=_handle(me))
         except EnvelopeRefusedError as exc:
@@ -402,6 +516,461 @@ def _write_dm_file(content: str) -> str:
     return path
 
 
+def _delivery_ledger_path(idempotency_key: str) -> Path:
+    return _dm_dir() / ("delivery-" + idempotency_key + ".json")
+
+
+def _delivery_envelope_path(dm_file: str) -> Path:
+    return Path(dm_file + ".delivery.json")
+
+
+def _atomic_json(path: Path, document: Mapping[str, Any]) -> None:
+    fd, temporary = tempfile.mkstemp(prefix="." + path.name + ".", dir=str(path.parent), text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(_canonical(document))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+        directory_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except BaseException:
+        _unlink_dm_file(temporary)
+        raise
+
+
+@contextlib.contextmanager
+def _delivery_ledger_lock(idempotency_key: str):
+    """Cross-process lock whose ownership dies with the process, not the file."""
+    path = _delivery_ledger_path(idempotency_key).with_suffix(".lock")
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(str(path), flags, 0o600)
+    try:
+        info = os.fstat(fd)
+        uid = getattr(os, "getuid", lambda: info.st_uid)()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != uid
+                or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600):
+            raise RuntimeError("delivery_lock_unsafe")
+        if fcntl is None:
+            import msvcrt  # pragma: no cover - Windows
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+        else:
+            deadline = time.monotonic() + 2.0
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("delivery idempotency lock busy")
+                    time.sleep(0.01)
+        yield
+    finally:
+        try:
+            if fcntl is None:
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)  # type: ignore[name-defined]  # pragma: no cover
+                except Exception:
+                    pass
+            else:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _read_delivery_ledger(path: Path, idempotency_key: str) -> Optional[dict[str, Any]]:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(str(path), flags)
+    except FileNotFoundError:
+        return None
+    try:
+        info = os.fstat(fd)
+        uid = getattr(os, "getuid", lambda: info.st_uid)()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != uid
+                or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600):
+            raise RuntimeError("delivery_ledger_unsafe")
+        try:
+            with os.fdopen(fd, "r", encoding="utf-8-sig") as stream:
+                fd = -1
+                document = json.load(stream)
+        except (OSError, ValueError, TypeError) as exc:
+            raise RuntimeError("delivery_ledger_unreadable") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if not isinstance(document, dict) or document.get("idempotency_key") != idempotency_key:
+        raise RuntimeError("delivery_ledger_rebind")
+    if not isinstance(document.get("delivery_id"), str) or not document["delivery_id"]:
+        raise RuntimeError("delivery_ledger_invalid")
+    return document
+
+
+def _write_delivery_receipt(
+    dm_file: str, *, origin_session_id: str, origin_reason: str, route_reason: str,
+    label: str, idempotency_key: str, turn_identity: Optional[Mapping[str, Any]] = None,
+    fence: Optional[Mapping[str, Any]] = None,
+    observation: Optional[dict] = None, ledger_locked: bool = False, enforced_effect: bool = False,
+    author: Optional[dict] = None, profile_home: Path | None = None,
+) -> dict[str, Any]:
+    """Persist the accepted-state receipt before spawning a child process.
+
+    A terminal PID only proves that the Desktop accepted a spawn request.  The
+    sidecar is intentionally content-free and gives retries a stable delivery
+    identity tied to the originating Bot Chat session.  The child updates this
+    same record to a terminal state in :func:`_run_delivery`.
+    """
+    ledger = _delivery_ledger_path(idempotency_key)
+    with (contextlib.nullcontext() if ledger_locked else _delivery_ledger_lock(idempotency_key)):
+        existing = _read_delivery_ledger(ledger, idempotency_key)
+        if isinstance(existing, dict) and existing.get("idempotency_key") == idempotency_key:
+            existing["duplicate"] = True
+            _atomic_json(Path(dm_file + ".receipt.json"), existing)
+            if isinstance(existing.get("turn_identity"), dict):
+                _atomic_json(_delivery_envelope_path(dm_file), {
+                    "schema": DELIVERY_ENVELOPE_SCHEMA,
+                    "delivery_id": existing["delivery_id"],
+                    "request_key": existing["turn_identity"]["request_key"],
+                    "turn_identity_sha256": _canonical_sha256(existing["turn_identity"]),
+                    "accepted_at": int(existing["accepted_at"]),
+                })
+            return existing
+        delivery_id = str(uuid.uuid4())
+        record = {
+            "schema": "hermes.delivery/v1", "delivery_id": delivery_id,
+            "origin_session_id": str(origin_session_id or ""),
+            "origin_reason": origin_reason, "route_reason": route_reason, "target": label,
+            "idempotency_key": idempotency_key, "state": "accepted",
+            "accepted_at": int(time.time()),
+        }
+        if author:
+            record["turn_author"] = dict(author)
+        if profile_home is not None:
+            record["profile_home"] = str(profile_home)
+        if observation is not None or enforced_effect:
+            from agent.durable_admission import new_release_event_id
+            record["release_event_id"] = new_release_event_id()
+        if observation is not None:
+            record["observation"] = observation
+        if enforced_effect:
+            record["enforced_effect"] = True
+        if turn_identity is not None:
+            record["turn_identity"] = dict(turn_identity)
+            record["fence"] = dict(fence or {})
+        path = Path(dm_file + ".receipt.json")
+        _atomic_json(path, record)
+        _atomic_json(ledger, record)
+        if turn_identity is not None:
+            _atomic_json(_delivery_envelope_path(dm_file), {
+                "schema": DELIVERY_ENVELOPE_SCHEMA,
+                "delivery_id": delivery_id,
+                "request_key": turn_identity["request_key"],
+                "turn_identity_sha256": _canonical_sha256(turn_identity),
+                "accepted_at": record["accepted_at"],
+            })
+        return record
+
+
+def _update_delivery_receipt(dm_file: str, state: str, *, ack: Optional[dict[str, Any]] = None,
+                             ack_row_validated: bool = False) -> None:
+    try:
+        record = json.loads(Path(dm_file + ".receipt.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError, TypeError):
+        from agent.durable_admission import observation_enabled, observation_gap
+        if observation_enabled():
+            observation_gap(None, "ledger_failed")
+            return
+        record = {}
+    if not record.get("observation") and not record.get("enforced_effect"):
+        return _update_delivery_receipt_inner(dm_file, state, ack=ack, ack_row_validated=ack_row_validated)
+    from agent.durable_admission import observation_gap
+    try:
+        key = record["idempotency_key"]
+        with _delivery_ledger_lock(key):
+            canonical = _read_delivery_ledger(_delivery_ledger_path(key), key)
+            if canonical is None or canonical["delivery_id"] != record["delivery_id"]:
+                raise ValueError("delivery ledger mismatch")
+            if canonical.get("adapter_ack") is not None:
+                return
+            return _update_delivery_receipt_inner(dm_file, state, ack=ack, ack_row_validated=ack_row_validated)
+    except Exception:
+        observation_gap(record.get("observation"), "ledger_failed")
+
+
+def _update_delivery_receipt_inner(dm_file: str, state: str, *, ack=None, ack_row_validated=False):
+    path = Path(dm_file + ".receipt.json")
+    try:
+        record = json.loads(path.read_text(encoding="utf-8-sig"))
+        if (record.get("observation") or record.get("enforced_effect")) and record.get("adapter_ack") is not None:
+            return  # ACK/release replay: never fence, renew, resend or release.
+        record["state"] = state
+        record["updated_at"] = int(time.time())
+        if ack is not None:
+            record["adapter_ack"] = dict(ack)
+            record["adapter_receipt_sha256"] = _canonical_sha256(ack)
+        _atomic_json(path, record)
+        idempotency_key = str(record.get("idempotency_key") or "")
+        if idempotency_key:
+            ledger = _delivery_ledger_path(idempotency_key)
+            _atomic_json(ledger, record)
+        if ack is not None and state == "delivered":
+            if record.get("observation"):
+                _settle_observed_delivery(record, path, ack, ack_row_validated=ack_row_validated)
+            elif record.get("enforced_effect"):
+                _settle_enforced_delivery(record, path, ack, ack_row_validated=ack_row_validated)
+            else:
+                _emit_delivery_shadow_receipt(record, state, ack_bytes=_canonical(ack))
+        elif record.get("observation"):
+            from agent.durable_admission import observation_gap
+            observation_gap(record["observation"], "ack_missing" if state in {"delivered", "unknown"} else "delivery_failed")
+    except (OSError, ValueError, TypeError):
+        if isinstance(locals().get("record"), dict) and record.get("observation"):
+            from agent.durable_admission import observation_gap
+            observation_gap(record["observation"], "ledger_failed")
+        else:
+            logger.debug("delivery receipt update failed", exc_info=True)
+
+
+def _settle_enforced_delivery(record: dict, path: Path, ack: dict, *, ack_row_validated: bool):
+    """Only the independently persisted destination ACK releases our effect."""
+    if not ack_row_validated:
+        record["release_state"] = "ack_not_validated"
+    else:
+        from agent.durable_admission import release_observed_effect
+        _emit_delivery_shadow_receipt(record, "delivered", ack_bytes=_canonical(ack))
+        record["release_state"] = "requested"
+        _atomic_json(path, record)
+        _atomic_json(_delivery_ledger_path(record["idempotency_key"]), record)
+        try:
+            record["release_receipt"] = release_observed_effect(record["turn_identity"], record["release_event_id"])
+            record["release_state"] = "acknowledged"
+        except Exception:
+            record["release_state"] = "unknown"
+    _atomic_json(path, record)
+    _atomic_json(_delivery_ledger_path(record["idempotency_key"]), record)
+
+
+def _settle_observed_delivery(record: dict, path: Path, ack: dict, *, ack_row_validated: bool):
+    from agent.durable_admission import ObservationWriter, observation_gap, release_observed_effect
+
+    observation = record["observation"]
+    if not ack_row_validated:
+        observation_gap(observation, "ack_missing")
+        return
+    try:
+        spool = _emit_delivery_shadow_receipt(record, "delivered", ack_bytes=_canonical(ack))
+        if spool is None:
+            raise ValueError("spool disabled")
+    except Exception:
+        observation_gap(observation, "spool_failed")
+        return
+    try:
+        record["release_state"] = "requested"
+        _atomic_json(path, record)
+        ledger = _delivery_ledger_path(record["idempotency_key"])
+        _atomic_json(ledger, record)
+        ledger_hash = hashlib.sha256(ledger.read_bytes()).hexdigest()
+    except Exception:
+        observation_gap(observation, "ledger_failed")
+        return
+    try:
+        release = release_observed_effect(record["turn_identity"], record["release_event_id"])
+    except Exception:
+        observation_gap(observation, "release_ambiguous")
+        return
+    try:
+        spool_document = json.loads(spool.read_text(encoding="utf-8-sig"))
+        record["release_state"] = "acknowledged"
+        record["release_receipt"] = release
+        _atomic_json(path, record)
+        _atomic_json(ledger, record)
+        ledger_hash = hashlib.sha256(ledger.read_bytes()).hexdigest()
+        identity = record["turn_identity"]
+        writer = ObservationWriter(Path(observation["root"]), code_sha=observation["code_sha"], boot_id=observation["effect"]["boot_id"])
+        writer.transition(observation["effect"]["effect_id"], "settled", settlement={
+            "work_id": identity["work_id"], "attempt_id": identity["attempt_id"], "generation": identity["generation"],
+            "delivery_id": record["delivery_id"], "delivery_event_id": spool_document["event_id"],
+            "ack_sha256": _canonical_sha256(ack), "ledger_sha256": ledger_hash,
+            "spool_sha256": hashlib.sha256(spool.read_bytes()).hexdigest(),
+            "release_event_id": record["release_event_id"], "release_source_event_id": release["source_event_id"],
+            "release_receipt_sha256": _canonical_sha256(release),
+        })
+    except Exception:
+        observation_gap(observation, "storage_failed")
+
+
+def _emit_delivery_shadow_receipt(
+    record: dict[str, Any], state: str, *, ack_bytes: Optional[str] = None
+) -> Optional[Path]:
+    """Observe a terminal DM effect only with an upstream-validated fence."""
+    if os.environ.get("HERMES_KERNEL_SHADOW_PRODUCER_ENABLED", "0") != "1":
+        return
+    if state != "delivered" or not ack_bytes:
+        return
+    try:
+        from gateway.turn_context import write_kernel_shadow_receipt
+        identity = record["turn_identity"]
+        fence = record["fence"] if record.get("observation") else _revalidate_delivery_identity(record)
+        work_id = identity["work_id"]
+        authority_version = identity["authority_version"]
+        tenant = identity["tenant"]
+        profile = identity["profile"]
+        source = identity["source"]
+        attempt_id = identity["attempt_id"]
+        lease_epoch = identity["generation"]
+        delivery_id = str(record["delivery_id"])
+        origin = str(record["origin_session_id"])
+        source_event_id = str(identity["source_event_id"])
+        adapter_hash = hashlib.sha256(ack_bytes.encode("utf-8")).hexdigest()
+        event_id = "agent-delivery-" + hashlib.sha256(
+            (work_id + "\0" + delivery_id + "\0" + state).encode("utf-8")
+        ).hexdigest()
+        return write_kernel_shadow_receipt({
+            "schema": "hermes.kernel-shadow-event/v1",
+            "event_id": event_id,
+            "work_id": work_id,
+            "authority_version": authority_version,
+            "tenant": tenant,
+            "profile": profile,
+            "source": source,
+            "origin_session_id": origin,
+            "source_event_id": source_event_id,
+            "attempt_id": attempt_id,
+            "lease_epoch": lease_epoch,
+            "action": "delivery",
+            "delivery_id": delivery_id,
+            "question_id": "",
+            "outcome": state,
+            "adapter_receipt_sha256": adapter_hash,
+            "observed_at": int(time.time()),
+            "fence_valid": bool(fence["fence_valid"]),
+            "material": False,
+            "waiting_for_human": False,
+            # Terminal DELIVERY, never Work completion. The separate release
+            # projection remains action=terminal, outcome=unknown, terminal=false.
+            "terminal": True,
+        })
+    except (KeyError, TypeError, ValueError, OSError, RuntimeError):
+        if record.get("observation"):
+            raise
+        logger.debug("kernel shadow delivery receipt skipped", exc_info=True)
+
+
+def _revalidate_delivery_identity(record: Mapping[str, Any]) -> dict[str, Any]:
+    from agent.durable_admission import _run_turn_identity_revalidation
+
+    identity = record.get("turn_identity")
+    if not isinstance(identity, Mapping):
+        raise RuntimeError("delivery_turn_identity_missing")
+    return _run_turn_identity_revalidation(identity)
+
+
+def _validated_delivery_ack(
+    payload: Any, record: Mapping[str, Any], *, expected_adapter: Optional[str] = None
+) -> dict[str, Any]:
+    ack = payload.get("delivery_ack") if isinstance(payload, Mapping) else None
+    identity = record.get("turn_identity")
+    if not isinstance(ack, Mapping) or not isinstance(identity, Mapping):
+        raise ValueError("delivery_ack_missing")
+    required = {
+        "schema", "delivery_id", "request_key", "turn_identity_sha256",
+        "target_session_id", "target_message_id", "adapter", "state",
+        "accepted_at", "persisted_at",
+    }
+    if set(ack) != required or ack.get("schema") != DELIVERY_ACK_SCHEMA:
+        raise ValueError("delivery_ack_fields_invalid")
+    expected = {
+        "delivery_id": record.get("delivery_id"),
+        "request_key": identity.get("request_key"),
+        "turn_identity_sha256": _canonical_sha256(identity),
+        "accepted_at": record.get("accepted_at"),
+        "state": "persisted",
+    }
+    if any(ack.get(key) != value for key, value in expected.items()):
+        raise ValueError("delivery_ack_rebind")
+    if ack.get("adapter") not in {"cli", "api_server"}:
+        raise ValueError("delivery_ack_adapter_invalid")
+    if expected_adapter is not None and ack.get("adapter") != expected_adapter:
+        raise ValueError("delivery_ack_adapter_rebind")
+    if not isinstance(ack.get("target_session_id"), str) or not ack["target_session_id"]:
+        raise ValueError("delivery_ack_session_invalid")
+    if isinstance(ack.get("target_message_id"), bool) or not isinstance(ack.get("target_message_id"), int) or ack["target_message_id"] < 1:
+        raise ValueError("delivery_ack_message_invalid")
+    if isinstance(ack.get("persisted_at"), bool) or not isinstance(ack.get("persisted_at"), int) or ack["persisted_at"] < 1:
+        raise ValueError("delivery_ack_timestamp_invalid")
+    response_session = payload.get("session_id") if isinstance(payload, Mapping) else None
+    if response_session != ack["target_session_id"]:
+        raise ValueError("delivery_ack_session_rebind")
+    return dict(ack)
+
+
+def _delivery_envelope_from_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    identity = record["turn_identity"]
+    return {
+        "schema": DELIVERY_ENVELOPE_SCHEMA,
+        "delivery_id": record["delivery_id"],
+        "request_key": identity["request_key"],
+        "turn_identity_sha256": _canonical_sha256(identity),
+        "accepted_at": int(record["accepted_at"]),
+    }
+
+
+def _validate_local_ack_row(db: Any, ack: Mapping[str, Any], record: Mapping[str, Any]) -> None:
+    around = db.get_messages_around(
+        ack["target_session_id"], int(ack["target_message_id"]), window=0
+    )
+    rows = around.get("window") if isinstance(around, Mapping) else None
+    if not isinstance(rows, list) or len(rows) != 1:
+        raise ValueError("delivery_ack_target_message_missing")
+    row = rows[0]
+    metadata = row.get("display_metadata") if isinstance(row, Mapping) else None
+    if (not isinstance(metadata, Mapping)
+            or metadata.get("hermes_delivery") != _delivery_envelope_from_record(record)
+            or row.get("role") != "user"):
+        raise ValueError("delivery_ack_target_message_rebind")
+
+
+def _validate_local_ack_against_destination(
+    ack: Mapping[str, Any], record: Mapping[str, Any], argv: list[str]
+) -> None:
+    try:
+        profile = argv[argv.index("-p") + 1]
+    except (ValueError, IndexError) as exc:
+        raise ValueError("delivery_ack_target_profile_missing") from exc
+    from hermes_cli.profiles import get_profile_dir
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=get_profile_dir(profile) / "state.db")
+    try:
+        _validate_local_ack_row(db, ack, record)
+    finally:
+        db.close()
+
+
+def _release_unspawned_delivery(dm_file: Optional[str]) -> None:
+    """Remove a pre-spawn claim so the same idempotency key may retry."""
+    if not dm_file:
+        return
+    path = Path(dm_file + ".receipt.json")
+    try:
+        record = json.loads(path.read_text(encoding="utf-8-sig"))
+        key = str(record.get("idempotency_key") or "")
+        if key:
+            _unlink_dm_file(str(_delivery_ledger_path(key)))
+    except (OSError, ValueError, TypeError):
+        pass
+    _unlink_dm_file(str(path))
+    _unlink_dm_file(str(_delivery_envelope_path(dm_file)))
+
+
 def _delivery_lock(argv: list[str], *, stdin_file: bool):
     """Per-profile turn lock for a LOCAL teammate delivery: local and relay deliveries
     into one profile both run a Bot Chat turn here, so the turn window is serialized on
@@ -425,6 +994,75 @@ def _delivery_lock(argv: list[str], *, stdin_file: bool):
 def _live_intent_file(dm_file: str | os.PathLike) -> str:
     """The pinned live-delivery intent beside a DM file (the cache sweep globs ``*.live.json``)."""
     return f"{os.fspath(dm_file)}.live.json"
+
+
+def _delivery_runtime_env() -> dict[str, str]:
+    """Keep internal Hermes CLI children on the runner's selected release.
+
+    Terminal tools intentionally remove Hermes-owned PYTHONPATH entries. The
+    delivery runner restores its own source only for its internal transport;
+    otherwise a borrowed interpreter can import an older editable installation.
+    """
+    env = dict(os.environ)
+    root = str(Path(__file__).resolve().parents[1])
+    entries = [entry for entry in env.get("PYTHONPATH", "").split(os.pathsep)
+               if entry and entry != root]
+    env["PYTHONPATH"] = os.pathsep.join([root, *entries])
+    return env
+
+
+def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, str]] = None) -> int:
+    """One Bot Chat turn via ``--query-file`` (plus one policy-gated retry); re-emits
+    the transport's streams and returns its exit code. Transient failures re-run the
+    same session; a context_overflow re-run lets the retried turn's pre-API compaction
+    compact the transcript first (no fresh session is ever minted). Auth/quota/config never retry."""
+
+    def _turn(turn_env=env):
+        return subprocess.run([*argv, "--query-file", dm_file], check=False, stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, encoding="utf-8", errors="replace", env=turn_env)
+
+    proc = _turn()
+    if proc.returncode != 0:
+        from tools.bot_failure_reasons import RETRY_NONE, classify_agent_error, retry_action, turn_failure_text
+        from tools.bot_relay import retry_turn_env
+
+        # The re-run replays the same session and payload; the failed attempt already persisted the
+        # user row, so the retried process is told to resume it (RESUME_UNANSWERED_TURN_ENV).
+        if retry_action(classify_agent_error(turn_failure_text(proc.stdout, proc.stderr))) != RETRY_NONE:
+            proc = _turn(retry_turn_env(env))
+    stderr_text = proc.stderr or ""
+    reason = next((line.removeprefix("hermes-refusal-reason: ").strip()
+                   for line in stderr_text.splitlines()
+                   if line.startswith("hermes-refusal-reason: ")), None)
+    # A code wins over prose, including unknown codes from newer CLIs.
+    # Only older CLIs without a marker need the historical wording fallback.
+    refused_not_owned = (reason == "SESSION_NOT_OWNED" if reason is not None
+                         else "already has a live owner" in stderr_text)
+    if proc.returncode != 0 and refused_not_owned:
+        # The target's Bot Chat is held live by another surface (Desktop); the turn
+        # never ran — tell the sender plainly instead of leaking a raw lease error.
+        # See #100523.
+        who = argv[argv.index("-p") + 1] if "-p" in argv[:-1] else "the teammate"
+        print(json.dumps({
+            "error": f"Delivery failed: @{who}'s Bot Chat is open on another "
+                     "surface right now, so your message was NOT delivered. Try again later.",
+            "reason": "target_busy",
+        }))
+        return 1
+    # Re-emit the transport's streams: stdout is the reply text the
+    # completion notification carries back to the sending agent. A successful bare
+    # silence marker is a delivery decision (same rule as the gateway and the live
+    # Bot Chat completion): the turn stays in the target's transcript, the sender
+    # never sees the marker as prose.
+    from gateway.response_filters import is_intentional_silence_response
+    reply = proc.stdout or ""
+    if proc.returncode == 0 and is_intentional_silence_response(reply):
+        reply = ""
+    for stream, text in ((sys.stdout, reply), (sys.stderr, proc.stderr)):
+        if text:
+            stream.write(text)
+            stream.flush()
+    return proc.returncode
 
 
 def _dm_delivery_id(dm_file: str | os.PathLike) -> str:
@@ -546,7 +1184,8 @@ def _admit_live_dm(profile_home: Path | None, dm_file: str, author: Optional[dic
     return record
 
 
-def _wait_live_dm(home: str, delivery_id: str, *, dm_file: str | os.PathLike | None = None) -> int:
+def _wait_live_dm(home: str, delivery_id: str, *, dm_file: str | os.PathLike | None = None,
+                  on_result=None) -> int:
     from tools.bot_failure_reasons import RUNTIME_OFFLINE
     from tools.bot_live_delivery import await_delivery, cancel_queued_delivery, owner_holds_delivery
 
@@ -580,6 +1219,8 @@ def _wait_live_dm(home: str, delivery_id: str, *, dm_file: str | os.PathLike | N
         if missed > 1:
             break
     status = record["status"] if record else "ambiguous"
+    if on_result is not None:
+        on_result(status)
     payload = {key: record[key] for key in ("reply", "error", "reason") if record and record.get(key)}
     payload.update(status=status, delivery_id=delivery_id)
     if status in ("queued", "claimed", "ambiguous"):
@@ -627,44 +1268,204 @@ def _runner_argv(args: list[str]) -> tuple[Optional[str], str, str, list[str]] |
 
 
 def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
-                  profile_home: Path | None = None, author: Optional[dict] = None) -> int:
-    """Admit local DMs only through the profile authority; retain uncertain intent.
+                  profile_home: Path | None = None, author: Optional[dict] = None,
+                  lock_held: bool = False, strict_authority: bool = False) -> int:
+    """Route to the live owner before attempting a CLI transport. Live deliveries
+    retain their intent/payload and immutable receipt; only CLI/peer payloads are
+    removed after consumption. The CLI turn window holds the profile lock, so two
+    deliveries into one profile queue; a bounded wait ends in a 'target_busy' refusal.
+    ``author`` rides to the child as HERMES_TURN_AUTHOR; ``hermes peer dm`` forwards it in the request body.
 
     The optional peer stdin transport remains an explicit remote route, never a
     fallback after local admission. Background processes wait for delivery only.
     """
-    # The live consumer owns turn admission; never compete for its CLI lease.
-    if not stdin_file:
-        home = profile_home or _local_delivery_home(argv)
-        if home is not None or os.path.exists(_live_intent_file(dm_file)):
-            try:
-                record = _admit_live_dm(home, dm_file, author)
-            except LiveTargetHeldError as exc:
-                print(_settled_no_send(dm_file, exc))  # the owner settled the id: drop the payload too
-                return 1
-            except LiveTargetUnavailableError as exc:
-                print(_unavailable_payload(dm_file, exc))
-                return 1
-            except Exception as exc:
-                print(_live_outcome_unknown(dm_file, exc))
-                return 1
-            if record is not None:
-                return _wait_live_dm(record["profile_home"], record["delivery_id"], dm_file=dm_file)
-    if not stdin_file:
-        print(json.dumps({"reason": "runtime_unavailable", "error": "No canonical Bot Chat authority; payload retained."}))
-        return 1
+    returncode = 1
+    keep_live_intent = False
+    live_state = None
+    record = {}
+    structured = False
+    ack: Optional[dict[str, Any]] = None
+    ack_row_validated = False
     try:
+        receipt_path = Path(dm_file + ".receipt.json")
+        try:
+            record = json.loads(receipt_path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError, TypeError):
+            record = {}
+        structured = isinstance(record.get("turn_identity"), dict)
+        if record.get("observation") or record.get("enforced_effect"):
+            key = record["idempotency_key"]
+            with _delivery_ledger_lock(key):
+                canonical = _read_delivery_ledger(_delivery_ledger_path(key), key)
+                if canonical is not None and canonical.get("adapter_ack") is not None:
+                    if canonical["delivery_id"] != record["delivery_id"]:
+                        raise ValueError("delivery ledger mismatch")
+                    # The effect already has an independent ACK. No fence,
+                    # transport or release is legal on a child replay either.
+                    ack = canonical["adapter_ack"]
+                    returncode = 0
+                    return returncode
         from tools.bot_relay import delivery_env
-
+        author = author or record.get("turn_author")
+        if profile_home is None and record.get("profile_home"):
+            profile_home = Path(record["profile_home"])
         env = delivery_env(author, profile_home if not stdin_file else None)
-        with _delivery_lock(argv, stdin_file=stdin_file):
-            # Keep the file open until the transport exits; cleanup occurs
-            # after subprocess.run returns, not merely after stdin reaches EOF.
-            with open(dm_file, "r", encoding="utf-8-sig") as stream:
-                # Passing the file descriptor as stdin bypasses the BOM-aware decoder.
-                return subprocess.run(argv, input=stream.read().encode("utf-8"), check=False, env=env).returncode
+        # delivery_env starts from ambient env; restore our release path afterwards.
+        env["PYTHONPATH"] = _delivery_runtime_env()["PYTHONPATH"]
+        if not structured and not record.get("observation") and not record.get("enforced_effect") and not stdin_file:
+            keep_live_intent = True
+            # The live consumer owns turn admission; never compete for its CLI lease.
+            if not stdin_file:
+                home = profile_home or _local_delivery_home(argv)
+                if home is not None or os.path.exists(_live_intent_file(dm_file)):
+                    try:
+                        live_record = _admit_live_dm(home, dm_file, author)
+                    except LiveTargetHeldError as exc:
+                        print(_settled_no_send(dm_file, exc))  # the owner settled the id: drop the payload too
+                        return 1
+                    except LiveTargetUnavailableError as exc:
+                        print(_unavailable_payload(dm_file, exc))
+                        return 1
+                    except Exception as exc:
+                        print(_live_outcome_unknown(dm_file, exc))
+                        return 1
+                    if live_record is not None:
+                        # A successful wait can still mean queued/claimed. Only settlement
+                        # proves delivery; keep uncertain receipts out of the delivered ledger.
+                        live_state = "unknown"
+                        def capture_live_status(status):
+                            nonlocal live_state
+                            live_state = "delivered" if status == "settled" else (
+                                "failed" if status in ("failed", "cancelled") else "unknown")
+                        returncode = _wait_live_dm(live_record["profile_home"], live_record["delivery_id"],
+                                                   dm_file=dm_file, on_result=capture_live_status)
+                        return returncode
+            if not stdin_file:
+                print(json.dumps({"reason": "runtime_unavailable", "error": "No canonical Bot Chat authority; payload retained."}))
+                return 1
+        if not structured and stdin_file and not record.get("observation") and not record.get("enforced_effect"):
+            with _delivery_lock(argv, stdin_file=True):
+                with open(dm_file, "r", encoding="utf-8-sig") as stream:
+                    returncode = subprocess.run(argv, input=stream.read().encode("utf-8"), check=False, env=env).returncode
+                    return returncode
+        transport_argv = list(argv)
+        if not stdin_file and "chat" not in transport_argv:
+            transport_argv += ["chat", "--in", "~", "-c", "Bot Chat", "--create-if-missing", "-Q"]
+        if structured:
+            try:
+                fresh_fence = _revalidate_delivery_identity(record)
+                if (
+                    fresh_fence.get("fence_valid") is not True
+                    or fresh_fence.get("identity_sha256") != _canonical_sha256(record["turn_identity"])
+                ):
+                    raise ValueError("delivery fence invalid")
+            except Exception:
+                if record.get("observation") and not strict_authority:
+                    from agent.durable_admission import observation_gap
+                    observation_gap(record["observation"], "admission_failed")
+                    structured = False
+                else:
+                    return 1
+        if structured:
+            if stdin_file:
+                transport_argv += ["--delivery-envelope-file", str(_delivery_envelope_path(dm_file))]
+                transport_argv.append("--json")
+            else:
+                message = Path(dm_file).read_text(encoding="utf-8-sig")
+                Path(dm_file).write_text(
+                    _encode_delivery_query(
+                        json.loads(_delivery_envelope_path(dm_file).read_text(encoding="utf-8-sig")),
+                        message,
+                    ),
+                    encoding="utf-8",
+                )
+                os.chmod(dm_file, 0o600)
+        with (contextlib.nullcontext() if lock_held else _delivery_lock(argv, stdin_file=stdin_file)):
+            if stdin_file:
+                # Keep the file open until the transport exits; cleanup occurs
+                # after subprocess.run returns, not merely after stdin reaches EOF.
+                with open(dm_file, "r", encoding="utf-8-sig") as stream:
+                    proc = subprocess.run(
+                        transport_argv, input=stream.read(), check=False, capture_output=True, text=True,
+                        encoding="utf-8", errors="replace", env=env,
+                    )
+                returncode = proc.returncode
+            else:
+                proc = subprocess.run(
+                    [*transport_argv, "--query-file", dm_file],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8", errors="replace", env=env,
+                )
+                returncode = proc.returncode
+            if proc.returncode != 0 and not stdin_file:
+                from tools.bot_failure_reasons import (
+                    RETRY_NONE,
+                    classify_agent_error,
+                    retry_action,
+                    turn_failure_text,
+                )
+                from tools.bot_relay import retry_turn_env
+
+                detail = turn_failure_text(proc.stdout, proc.stderr)
+                if retry_action(classify_agent_error(detail)) != RETRY_NONE:
+                    proc = subprocess.run(
+                        [*transport_argv, "--query-file", dm_file],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8", errors="replace",
+                        env=retry_turn_env(env),
+                    )
+                    returncode = proc.returncode
+            # Re-emit the transport's streams: stdout is the reply text the
+            # completion notification carries back to the sending agent.
+            if structured and proc.returncode == 0:
+                try:
+                    payload = json.loads(proc.stdout or "")
+                    ack = _validated_delivery_ack(
+                        payload, record,
+                        expected_adapter="api_server" if stdin_file else "cli",
+                    )
+                    if not stdin_file:
+                        _validate_local_ack_against_destination(ack, record, argv)
+                        ack_row_validated = True
+                    reply = str(payload.get("reply") or "")
+                except Exception as exc:
+                    if record.get("observation"):
+                        from agent.durable_admission import observation_gap
+                        observation_gap(record["observation"], "ack_missing")
+                        ack = None
+                        reply = proc.stdout or ""
+                    else:
+                        if not isinstance(exc, (TypeError, ValueError)):
+                            raise
+                        returncode = 1
+                        reply = ""
+                if reply:
+                    sys.stdout.write(reply)
+                    sys.stdout.flush()
+            elif proc.stdout:
+                sys.stdout.write(proc.stdout)
+                sys.stdout.flush()
+            if proc.stderr:
+                sys.stderr.write(proc.stderr)
+                sys.stderr.flush()
+            return returncode
     finally:
-        _unlink_dm_file(dm_file)
+        state = "delivered" if returncode == 0 and (ack is not None or not structured) else "failed"
+        if live_state is not None:
+            state = live_state
+        if record.get("observation") and returncode == 0 and structured and ack is None:
+            state = "unknown"
+        if record.get("observation") or record.get("enforced_effect"):
+            _update_delivery_receipt(dm_file, state, ack=ack, ack_row_validated=ack_row_validated)
+        else:
+            _update_delivery_receipt(dm_file, state, ack=ack)
+        if not keep_live_intent:
+            _unlink_dm_file(dm_file)
+            _unlink_dm_file(str(_delivery_envelope_path(dm_file)))
 
 
 def _delivery_command(argv: list[str], dm_file: str, *, stdin_file: bool,
@@ -686,12 +1487,130 @@ def _delivery_command(argv: list[str], dm_file: str, *, stdin_file: bool,
     return shlex.join(runner_argv)
 
 
-def _start_delivery(argv: list[str], content: str, label: str, *, stdin_file: bool,
-                    task_id: Optional[str], agent: Any, profile_home: Path | None = None,
-                    author: Optional[dict] = None) -> str:
+def _start_delivery(
+    argv: list[str], content: str, label: str, *, stdin_file: bool,
+    task_id: Optional[str], agent: Any, origin_session_id: Optional[str] = None,
+    route_reason: str = "canonical_title_fallback",
+    profile_home: Path | None = None, author: Optional[dict] = None,
+) -> str:
+    from agent import durable_admission as da
+
+    if da.admission_enabled():
+        return _start_enforced_delivery(argv, content, label, stdin_file=stdin_file, task_id=task_id,
+            agent=agent, origin_session_id=origin_session_id, route_reason=route_reason, profile_home=profile_home, author=author)
+    if not da.observation_enabled():
+        return _start_delivery_inner(argv, content, label, stdin_file=stdin_file,
+            task_id=task_id, agent=agent, origin_session_id=origin_session_id, route_reason=route_reason, profile_home=profile_home, author=author)
+    observation = da.reserve_observed_effect(label, content)
+    if observation is None:
+        return _start_delivery_inner(argv, content, label, stdin_file=stdin_file,
+            task_id=task_id, agent=agent, origin_session_id=origin_session_id, route_reason=route_reason, profile_home=profile_home, author=author)
+    effect = observation["effect"]
+    key = effect["effect_id"]
+    # The cross-process delivery ledger arbitrates dispatch, not an expiring
+    # Work lease. Replay is decided before any authority call.
+    with _delivery_ledger_lock(key):
+        existing = _read_delivery_ledger(_delivery_ledger_path(key), key)
+        if existing is not None:
+            return json.dumps({"status": "delivered" if existing["state"] == "delivered" else "accepted",
+                "to": label, "delivery": _public_delivery_receipt(existing),
+                "detail": "Exact delivery already recorded; no resend or authority call."})
+        identity = fence = None
+        if observation["created"]:
+            try:
+                identity = da.admit_observed_effect(observation)
+                if identity is not None:
+                    fence = da._run_turn_identity_revalidation(identity)
+            except Exception:
+                identity = fence = None
+                da.observation_gap(observation, "admission_failed")
+        else:
+            # Reservation survived without a dispatch ledger: no blind remote
+            # admission retry. Legacy transport still owns its first dispatch.
+            da.observation_gap(observation, "delivery_ambiguous")
+        prepared = _start_delivery_inner(argv, content, label, stdin_file=stdin_file,
+            task_id=task_id, agent=agent, origin_session_id=effect["origin_session_id"],
+            route_reason=route_reason, profile_home=profile_home, author=author, _observation=observation, _identity=identity,
+            _fence=fence, _idempotency=key, _defer_spawn=True)
+    if isinstance(prepared, str):
+        return prepared
+    command, dm_file, receipt = prepared
+    return _spawn_delivery(command, label, dm_file=dm_file, receipt=receipt, task_id=task_id, agent=agent)
+
+
+def _start_enforced_delivery(argv, content, label, *, stdin_file, task_id, agent,
+                             origin_session_id, route_reason, profile_home=None, author=None):
+    from agent import durable_admission as da
+
+    parent = da.current_admitted_turn()
+    origin = str(origin_session_id or getattr(agent, "session_id", "") or "")
+    carrier = da.current_effect_origin()
+    mapped = (parent is not None and carrier is not None and carrier.session_id == origin
+              and carrier.ingress_session_id == parent.session_id and carrier.event_id == parent.event_id
+              and carrier.profile == da._active_profile())
+    if parent is None or not origin or (parent.session_id != origin and not mapped) or not parent.event_id:
+        return _err("Delivery authority refused: admitted input origin missing or mismatched.")
+    request = {"tool": "message_agent", "destination": label,
+               "content_sha256": da.content_sha256(content), "input_event_id": parent.event_id,
+               "profile": da._active_profile()}
+    scope = str(_hermes_root(Path(_agent_home(agent))))
+    key = _canonical_sha256(["hermes.enforced-delivery.v1", scope, origin, request])
+    with _delivery_ledger_lock(key):
+        existing = _read_delivery_ledger(_delivery_ledger_path(key), key)
+        if existing is not None:
+            return json.dumps({"status": existing["state"], "to": label,
+                "delivery": _public_delivery_receipt(existing),
+                "detail": "Exact effect already recorded; no resend or authority call."})
+        outcome = da.admit_execution(session_id=origin, request=request,
+                                     event_id=da.execution_event_id(origin, request))
+        if outcome.state != da.STATE_ADMITTED or not outcome.model_may_run:
+            return _err("Delivery authority refused: " + str(outcome.reason_code))
+        with da.admitted_turn_scope(outcome):
+            prepared = _start_delivery_inner(argv, content, label, stdin_file=stdin_file,
+                task_id=task_id, agent=agent, origin_session_id=origin, route_reason=route_reason, profile_home=profile_home, author=author,
+                _idempotency=key, _defer_spawn=True, _enforced=True)
+    if isinstance(prepared, str):
+        return prepared
+    command, dm_file, receipt = prepared
+    return _spawn_delivery(command, label, dm_file=dm_file, receipt=receipt, task_id=task_id, agent=agent)
+
+
+def _start_delivery_inner(
+    argv: list[str],
+    content: str,
+    label: str,
+    *,
+    stdin_file: bool,
+    task_id: Optional[str],
+    agent: Any,
+    origin_session_id: Optional[str] = None,
+    route_reason: str = "canonical_title_fallback",
+    profile_home: Path | None = None, author: Optional[dict] = None,
+    _observation=None, _identity=None, _fence=None, _idempotency=None, _defer_spawn=False, _enforced=False,
+) -> str:
     """Create a DM file and transfer its cleanup ownership to the runner."""
+    turn_identity = _identity
+    fence = _fence
+    try:
+        from agent.durable_admission import (
+            admission_enabled,
+            revalidate_current_turn_identity,
+        )
+
+        if admission_enabled():
+            turn_identity, fence = revalidate_current_turn_identity()
+    except Exception as exc:
+        return _err(f"Delivery authority refused: {type(exc).__name__}: {exc}")
+    origin = str(origin_session_id or getattr(agent, "session_id", "") or "")
+    if not origin:
+        return _err("Delivery requires origin_session_id; no fallback session is available.")
     dm_file = _write_dm_file(content)
-    if profile_home is not None:
+    from tools import bot_delivery_queue as queue
+    # The live-owner protocol has a different receipt seam. It cannot bypass the
+    # fork's durable worker, effect ledger or explicit destination-session binding.
+    live_eligible = (turn_identity is None and _observation is None and not _enforced
+                     and not origin_session_id and not queue.enabled(Path(_agent_home(agent))))
+    if profile_home is not None and live_eligible:
         try:
             record = _admit_live_dm(profile_home, dm_file, author)
         except LiveTargetUnavailableError as exc:
@@ -716,21 +1635,119 @@ def _start_delivery(argv: list[str], content: str, label: str, *, stdin_file: bo
                     result["detail"] = f"Durably queued for the live Bot Chat owner. Do NOT resend. {notification['detail']}"
             return json.dumps(result)
     try:
+        origin = str(origin_session_id or getattr(agent, "session_id", "") or "")
+        origin_reason = "explicit" if origin_session_id else "agent_session_fallback"
+        if not origin:
+            _unlink_dm_file(dm_file)
+            return _err("Delivery requires origin_session_id; no fallback session is available.")
+        if turn_identity is not None and origin != turn_identity.get("origin_session_id"):
+            _unlink_dm_file(dm_file)
+            return _err("Delivery authority refused: origin session rebind.")
+        # The durable ledger is shared by all profile processes on one Hermes
+        # install.  Scope idempotency to that install so unrelated test or
+        # tenant homes that happen to reuse a session id never suppress a send.
+        ledger_scope = str(_hermes_root(Path(_agent_home(agent))))
+        authority_request = str((turn_identity or {}).get("request_key") or "")
+        idempotency_key = hashlib.sha256(
+            (ledger_scope + "\0" + origin + "\0" + authority_request + "\0" + label + "\0" + content).encode("utf-8")
+        ).hexdigest()
+        idempotency_key = _idempotency or idempotency_key
+        receipt = _write_delivery_receipt(
+            dm_file,
+            origin_session_id=origin,
+            origin_reason=origin_reason,
+            route_reason=route_reason,
+            label=label,
+            idempotency_key=idempotency_key,
+            turn_identity=turn_identity,
+            fence=fence,
+            observation=_observation,
+            ledger_locked=_idempotency is not None, enforced_effect=_enforced,
+            author=author, profile_home=profile_home,
+        )
+        if receipt.get("duplicate") and receipt.get("state") == "delivered":
+            _unlink_dm_file(dm_file)
+            _unlink_dm_file(dm_file + ".receipt.json")
+            _unlink_dm_file(str(_delivery_envelope_path(dm_file)))
+            return json.dumps({"status": "delivered", "to": label,
+                               "delivery": _public_delivery_receipt(receipt),
+                               "detail": "Delivery already persisted for this exact request; no duplicate spawn."})
         command = _delivery_command(argv, dm_file, stdin_file=stdin_file, profile_home=profile_home, author=author)
     except BaseException:
         _unlink_dm_file(dm_file)
+        _unlink_dm_file(dm_file + ".receipt.json")
         raise
-    return _spawn_delivery(command, label, dm_file=dm_file, task_id=task_id, agent=agent)
+    # Preserve the existing transport and completion listener, but put a
+    # durable queue between acceptance and local dispatch. Peer/relay routes
+    # retain their own protocol. A failed listener never deletes queued work.
+    if not stdin_file:
+        from tools import bot_delivery_queue as queue
+        source_home = Path(_agent_home(agent))
+        if queue.local_target(argv) and queue.enabled(source_home):
+            try:
+                store = queue.Queue(_hermes_root(source_home))
+                job = store.enqueue(argv, content, receipt, source_home)
+                if _idempotency is not None:
+                    # Enforced/observed callers already own this exact ledger
+                    # lock until the deferred spawn tuple has been prepared.
+                    _update_delivery_receipt_inner(dm_file, job["state"])
+                else:
+                    _update_delivery_receipt(dm_file, job["state"])
+                receipt = {**receipt, "state": job["state"], "queue_id": job["id"]}
+                command = queue.wait_command(store.root, job["id"])
+                _unlink_dm_file(dm_file)
+                _unlink_dm_file(dm_file + ".receipt.json")
+                _unlink_dm_file(str(_delivery_envelope_path(dm_file)))
+                dm_file = None  # the queue now owns its private payload copy
+            except Exception as exc:
+                return _err(f"Durable delivery could not be queued: {type(exc).__name__}: {exc}")
+    if _defer_spawn:
+        return command, dm_file, receipt
+    return _spawn_delivery(
+        command,
+        label,
+        dm_file=dm_file,
+        receipt=receipt,
+        task_id=task_id,
+        agent=agent,
+    )
 
 
-def _spawn_delivery(command: str, label: str, *, dm_file: Optional[str] = None, delivery_id: Optional[str] = None,
-                    task_id: Optional[str], agent: Any) -> str:
-    """Launch the cleanup-owning runner and transfer file ownership on ack. ``dm_file``
-    is None for relay deliveries (the waiter watches a reply file; envelope artifacts
-    are owned/swept by ``tools/bot_relay.py``), which pass the envelope id as ``delivery_id``
-    instead. The ack is ``queued`` + ``delivery_id`` like the live-owner branch: hand-off
-    to a background process, never a delivery receipt."""
+def _spawn_delivery(
+    command: str,
+    label: str,
+    *,
+    dm_file: Optional[str] = None,
+    receipt: Optional[dict[str, str]] = None,
+    task_id: Optional[str],
+    agent: Any,
+    delivery_id: Optional[str] = None,
+) -> str:
+    """Launch the cleanup-owning runner and transfer file ownership on ack.
+
+    ``dm_file`` is None for relay deliveries: the waiter command watches a
+    reply file, and the envelope artifacts are owned and swept by
+    ``tools/bot_relay.py`` — there is no plaintext DM tempfile to reclaim.
+    """
     transferred = False
+    queued = bool(receipt and receipt.get("queue_id"))
+    def queued_without_listener(detail):
+        return json.dumps({"status": receipt.get("state", "queued"), "to": label,
+                           "delivery_id": receipt.get("delivery_id") or receipt["queue_id"],
+                           "delivery": _public_delivery_receipt(receipt),
+                           "detail": "Request saved; destination has not received it yet. " + detail})
+    if queued:
+        # The durable worker owns both execution and completion notification.
+        # A sender-owned notify_on_complete waiter would make one-shot exit
+        # hold the source turn lock while waiting for a reply to that same
+        # source: Chief -> Staff -> Chief then stalls until the linger expires.
+        # The no-listener response is already supported; the queue/inbox is
+        # the receipt, not a transient process in this interpreter.
+        return queued_without_listener(
+            "The durable worker owns delivery. Finish this turn; completion "
+            "status will arrive in the updates inbox and the result is retained "
+            "in the delivery receipt. Do not resend or poll."
+        )
     try:
         from tools.terminal_tool import terminal_tool
 
@@ -743,14 +1760,21 @@ def _spawn_delivery(command: str, label: str, *, dm_file: Optional[str] = None, 
             parsed = {}
         proc_id = parsed.get("session_id") or ""
         if parsed.get("error"):
+            if queued:
+                return queued_without_listener("Completion listener unavailable; inspect the updates inbox.")
+            _release_unspawned_delivery(dm_file)
             return _err(f"Delivery to {label} failed to start: {parsed['error']}")
         if parsed.get("status") == "pending_approval":
             # terminal_tool's approval gate answers with an EMPTY error and no session_id: the runner
             # never launched because nobody in this turn could approve its command.
+            _release_unspawned_delivery(dm_file)
             return _err(f"Delivery to {label} failed to start: its command needs terminal approval that nobody "
                         "in this turn can grant" + (", so nothing was sent. Approve it (or add it to "
                                                     "command_allowlist) and send again." if dm_file else "."))
         if not proc_id:
+            if queued:
+                return queued_without_listener("Completion listener unavailable; inspect the updates inbox.")
+            _release_unspawned_delivery(dm_file)
             return _err(f"Delivery to {label} failed to start: no process id returned")
         # From here the background runner owns the file (removed after the consumer finishes).
         transferred = True
@@ -781,8 +1805,12 @@ def _spawn_delivery(command: str, label: str, *, dm_file: Optional[str] = None, 
             "detail": detail,
             "process_id": proc_id,
             "queued_at": int(time.time()),
+            **({"delivery": _public_delivery_receipt(receipt)} if receipt else {}),
         })
     except Exception as exc:
+        if queued:
+            return queued_without_listener("Completion listener unavailable; inspect the updates inbox.")
+        _release_unspawned_delivery(dm_file)
         logger.error("message_agent delivery spawn failed: %s", exc, exc_info=True)
         return _err(f"Delivery to {label} could not be started: {exc}")
     finally:

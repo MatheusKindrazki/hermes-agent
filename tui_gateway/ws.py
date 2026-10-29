@@ -135,7 +135,7 @@ class WSTransport:
     deadlock, so it detects that and fires-and-forgets. Loop-thread callers needing completion use ``write_async``."""
 
     def __init__(self, ws: Any, loop: asyncio.AbstractEventLoop, *, peer: str = "unknown",
-                 auth_identity: dict | None = None) -> None:
+                 auth_identity: dict | None = None, auth_method: str | None = None) -> None:
         self._ws = ws
         self._loop = loop
         self._peer = peer
@@ -146,6 +146,7 @@ class WSTransport:
         self.desktop_local = False
         #: The served profile home whose skin this peer follows (None = the launch home); see change_watcher.
         self.skin_home: str | None = None
+        self._native_prompt_authenticated = auth_method in {"token", "ticket", "ticket-subprotocol"}
         self._closed = False
         # Token-coalescing buffer. The lock guards the buffer + "armed" flag against worker threads
         # calling write(); the timer handle is only ever touched on the loop thread.
@@ -219,6 +220,11 @@ class WSTransport:
             batch, self._pending_tokens = self._pending_tokens, []
             if batch and not self._closed:
                 self._loop.create_task(self._safe_send_many(batch))
+
+    @property
+    def native_prompt_authenticated(self) -> bool:
+        """Upgrade proof only; RPC params never populate this property."""
+        return self._native_prompt_authenticated
 
     @property
     def closed(self) -> bool:
@@ -404,7 +410,7 @@ class _SendFailed(Exception):
 
 
 async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: str | None = None,
-                    operator: bool = False) -> None:
+                    operator: bool = False, auth_method: str | None = None) -> None:
     """Run one WebSocket session. Wire-compatible with ``tui_gateway.entry``. *auth_identity* is the server-minted
     ``{user_id, provider}`` recorded at WS-upgrade auth, stored as ``WSTransport.auth_identity`` (the only identity
     authority for browser-controller registration); callers that omit it (harnesses, embedded TUI child) get None."""
@@ -538,7 +544,7 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
         _note_dashboard_client_activity(force=True)
         _disable_nagle(ws)
         _log.info("ws accepted peer=%s", peer)
-        transport = WSTransport(ws, asyncio.get_running_loop(), peer=peer, auth_identity=auth_identity)
+        transport = WSTransport(ws, asyncio.get_running_loop(), peer=peer, auth_identity=auth_identity, auth_method=auth_method)
         authority_connection = _authority_connection(ws, transport, auth_identity, operator)
         # resolve_skin() is sync I/O + CPU; pooled so the read loop can drain the frontend's initial RPC burst.
         skin_payload = await asyncio.to_thread(server.resolve_skin)

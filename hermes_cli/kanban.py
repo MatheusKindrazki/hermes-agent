@@ -333,6 +333,13 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
 
 
 def _cmd_create(args: argparse.Namespace) -> int:
+    # Reject an empty card before parsing can reach any board lookup, DB
+    # initialization, or idempotency reservation. This mirrors the structured
+    # tool's pre-connect validation and keeps every create surface side-effect
+    # free for empty/whitespace payloads.
+    if not getattr(args, "title", None) or not str(args.title).strip():
+        print("kanban: title is required", file=sys.stderr)
+        return 2
     from agent.delegation_context import is_dispatcher_owned_worker_context
 
     body = args.body
