@@ -14,6 +14,8 @@ import type { RosterRow } from '@/plugins/hermes-bots/types'
 import { $sessionToolsById, $sessionWorkById } from '@/sdk/session-activity'
 import { $sessionDotStateById } from '@/store/session-dot-state'
 
+import { ParallelActivity } from './parallel-activity'
+
 /** Resolve the exact canonical conversation, never the profile's latest activity. */
 export function conversationBot(roster: RosterRow[], storedId: string | null): RosterRow | null {
   if (!storedId) {
@@ -92,6 +94,7 @@ export function ChatPersonaHeader({ persona }: { persona: NonNullable<ReturnType
           </p>
         </div>
       </div>
+      <ParallelActivity />
     </header>
   )
 }
