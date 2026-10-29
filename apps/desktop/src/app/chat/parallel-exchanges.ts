@@ -3,6 +3,8 @@ import { dispatchedTo } from '@/components/assistant-ui/thread/agent-delivery'
 import { chatMessageText, type ChatMessage } from '@/lib/chat-messages'
 
 export interface AgentExchange {
+  peer: string
+  name: string
   id: string
   label: string
   text: string
@@ -11,6 +13,7 @@ export interface AgentExchange {
 export function agentExchanges(messages: ChatMessage[]): AgentExchange[] {
   const rows: AgentExchange[] = []
   let replyTo: string | null = null
+  let replyPeer = ''
   for (let index = 0; index < messages.length; index++) {
     const message = messages[index]
     if (message.hidden) continue
@@ -20,20 +23,27 @@ export function agentExchanges(messages: ChatMessage[]): AgentExchange[] {
       replyTo = null
       if (match) {
         const sender = (match[1] || match[3] || 'Agente').trim()
-        rows.push({ id: message.id, label: 'De ' + sender, text: match[4] })
+        replyPeer = match[2] || sender
+        rows.push({ peer: replyPeer, name: sender, id: message.id, label: 'De ' + sender, text: match[4] })
         const earlier = messages.slice(0, index).map(row => ({ role: row.role, content: row.parts }))
         if (!dispatchedTo(earlier, [match[1], match[2], match[3]])) replyTo = sender
       }
     } else if (message.role === 'assistant') {
       if (replyTo && text) {
-        rows.push({ id: message.id, label: 'Resposta a ' + replyTo, text })
+        rows.push({ peer: replyPeer, name: replyTo, id: message.id, label: 'Resposta a ' + replyTo, text })
         replyTo = null
       }
       for (const [partIndex, part] of message.parts.entries()) {
         if (part.type !== 'tool-call' || part.toolName !== 'message_agent') continue
         const args = part.args as { target?: unknown; message?: unknown }
         if (typeof args?.target === 'string' && typeof args.message === 'string') {
-          rows.push({ id: message.id + ':' + partIndex, label: 'Pedido para ' + args.target, text: args.message })
+          rows.push({
+            peer: args.target,
+            name: args.target,
+            id: message.id + ':' + partIndex,
+            label: 'Pedido para ' + args.target,
+            text: args.message
+          })
         }
       }
     }

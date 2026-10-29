@@ -72,104 +72,181 @@ function ParallelContent({ sessionId }: { sessionId: string | null }) {
     }
   }, [sessionId, visible, retry])
 
+  const [tab, setTab] = useState<'conversations' | 'tasks'>('conversations')
+  const [peer, setPeer] = useState<string | null>(null)
+  const [expanded, setExpanded] = useState<string | null>(null)
+  const [more, setMore] = useState(false)
+  const groups = useMemo(() => {
+    const map = new Map<string, { key: string; name: string; rows: typeof exchanges }>()
+    for (const entry of exchanges) {
+      const key = entry.peer.toLowerCase().replace(/^@/, '')
+      const group = map.get(key) ?? { key, name: entry.name, rows: [] }
+      if (entry.label.startsWith('De ')) group.name = entry.name
+      group.rows.push(entry)
+      map.set(key, group)
+    }
+    return [...map.values()]
+  }, [exchanges])
+  const conversation = groups.find(group => group.key === peer)
+
   return (
-    <div className="min-h-0 flex-1 space-y-6 overflow-y-auto px-5 pb-6 text-sm">
-      <section aria-label="Agentes desta conversa" className="space-y-3">
-        <h3 className="font-medium">Agentes desta conversa</h3>
-        {!sessionId ? (
-          <p className="text-muted-foreground">Abra a conversa para consultar os agentes.</p>
-        ) : load === 'loading' ? (
-          <p role="status" className="text-muted-foreground">
-            Consultando atividade…
-          </p>
-        ) : load === 'error' ? (
-          <div role="status" className="space-y-2 text-muted-foreground">
-            <p>Não foi possível atualizar os agentes. Os registros abaixo podem estar desatualizados.</p>
-            <Button variant="ghost" size="sm" onClick={() => setRetry(value => value + 1)}>
-              Tentar novamente
-            </Button>
-          </div>
-        ) : agents.length === 0 ? (
-          <p className="text-muted-foreground">Nenhum subagente informado nesta conversa.</p>
-        ) : null}
-        {agents.map(agent => (
-          <div key={agent.id} className="rounded-lg border border-(--ui-stroke-tertiary)">
-            <button
-              type="button"
-              aria-expanded={selected === agent.id}
-              className="w-full space-y-1 p-3 text-left hover:bg-(--chrome-action-hover)"
-              onClick={() => setSelected(selected === agent.id ? null : agent.id)}
-            >
-              <span className="block text-xs text-muted-foreground">{statuses[agent.status]}</span>
-              <span className="block font-medium">{agent.goal || 'Tarefa do agente'}</span>
-              <span className="block truncate text-xs text-muted-foreground">
-                {agent.summary || agent.stream.at(-1)?.text || 'Aguardando mensagens'}
-              </span>
-              <span className="block text-xs text-(--ui-text-secondary)">
-                {selected === agent.id ? 'Recolher conversa' : 'Ver conversa'}
-              </span>
-            </button>
-            {selected === agent.id && sessionId && (
-              <div className="border-t border-(--ui-stroke-tertiary) px-3 pb-3">
-                {agent.stream.length > 0 && (
-                  <div className="my-3 space-y-2 text-xs">
-                    {agent.stream.map((entry, index) => (
-                      <p key={index} className="whitespace-pre-wrap break-words">
+    <>
+      <div className="flex gap-6 border-b border-white/8 px-6" role="tablist" aria-label="Em paralelo">
+        {(
+          [
+            ['conversations', 'Conversas'],
+            ['tasks', 'Tarefas']
+          ] as const
+        ).map(([value, label]) => (
+          <button
+            key={value}
+            type="button"
+            role="tab"
+            aria-selected={tab === value}
+            onClick={() => setTab(value)}
+            className={
+              'border-b-2 pb-3 text-sm transition-colors ' +
+              (tab === value ? 'border-white/75 text-white' : 'border-transparent text-white/40 hover:text-white/70')
+            }
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+      <div
+        className="min-h-0 flex-1 overflow-y-auto px-6 pb-6"
+        role="tabpanel"
+        aria-label={tab === 'conversations' ? 'Conversas' : 'Tarefas'}
+      >
+        {tab === 'conversations' ? (
+          conversation ? (
+            <div>
+              <button
+                type="button"
+                className="my-4 text-xs text-white/45 hover:text-white"
+                onClick={() => setPeer(null)}
+              >
+                ← Todas as conversas
+              </button>
+              <h3 className="mb-5 text-sm font-medium text-white/85">{conversation.name}</h3>
+              <div className="space-y-5">
+                {conversation.rows.map(entry => (
+                  <div key={entry.id} className="space-y-1.5">
+                    <p className="text-[11px] text-white/40">
+                      {entry.label.startsWith('De ') ? conversation.name : 'Este personagem'}
+                    </p>
+                    <button
+                      type="button"
+                      aria-expanded={expanded === entry.id}
+                      className="block w-full text-left"
+                      onClick={() => setExpanded(expanded === entry.id ? null : entry.id)}
+                    >
+                      <p
+                        className={
+                          'whitespace-pre-wrap break-words text-[13px] leading-relaxed text-white/75 ' +
+                          (expanded === entry.id ? '' : 'line-clamp-3')
+                        }
+                      >
                         {entry.text}
                       </p>
-                    ))}
+                      <span className="mt-1 block text-[11px] text-white/35">
+                        {expanded === entry.id ? 'Recolher' : 'Ler mensagem'}
+                      </span>
+                    </button>
                   </div>
-                )}
-                <SubagentTranscript key={sessionId + ':' + agent.id} sessionId={sessionId} subagentId={agent.id} />
+                ))}
+              </div>
+            </div>
+          ) : (
+            <div className="divide-y divide-white/6">
+              {groups.length === 0 ? (
+                <p className="py-8 text-sm text-white/40">Ainda não há trocas entre personagens neste trecho.</p>
+              ) : (
+                groups.map(group => (
+                  <button
+                    key={group.key}
+                    type="button"
+                    className="flex w-full items-center gap-3 py-5 text-left"
+                    onClick={() => {
+                      setPeer(group.key)
+                      setExpanded(null)
+                    }}
+                  >
+                    <span className="min-w-0 flex-1">
+                      <span className="block text-sm font-medium text-white/85">{group.name}</span>
+                      <span className="mt-1 block truncate text-xs text-white/40">{group.rows[0].text}</span>
+                    </span>
+                    <span aria-hidden className="text-white/30">
+                      ›
+                    </span>
+                  </button>
+                ))
+              )}
+            </div>
+          )
+        ) : (
+          <div className="py-4">
+            {load === 'error' && (
+              <div role="status" className="mb-4 text-xs text-white/45">
+                <p>Não foi possível atualizar. Os registros podem estar desatualizados.</p>
+                <button type="button" onClick={() => setRetry(value => value + 1)} className="mt-2 underline">
+                  Tentar novamente
+                </button>
               </div>
             )}
+            {load === 'loading' && (
+              <p role="status" className="mb-4 text-xs text-white/40">
+                Atualizando…
+              </p>
+            )}
+            {agents.map(agent => (
+              <div key={agent.id} className="border-b border-white/6 py-3">
+                <button
+                  type="button"
+                  aria-expanded={selected === agent.id}
+                  className="w-full text-left"
+                  onClick={() => setSelected(selected === agent.id ? null : agent.id)}
+                >
+                  <span className="block text-sm text-white/85">{agent.goal || 'Tarefa do agente'}</span>
+                  <span className="mt-1 block text-xs text-white/40">{statuses[agent.status]} · Ver conversa</span>
+                </button>
+                {selected === agent.id && sessionId && (
+                  <SubagentTranscript key={sessionId + ':' + agent.id} sessionId={sessionId} subagentId={agent.id} />
+                )}
+              </div>
+            ))}
+            {links.length > 0 && <p className="mt-5 mb-1 text-[11px] text-white/35">Links do histórico</p>}
+            {(more ? links : links.slice(0, 8)).map(link => (
+              <a
+                key={link.url}
+                href={link.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-3 border-b border-white/6 py-3"
+              >
+                <span className="min-w-0 flex-1">
+                  <span className="line-clamp-2 text-sm text-white/75">{link.title}</span>
+                  <span className="mt-1 block text-[11px] text-white/35">
+                    {link.kind === 'task' ? 'Acompanhar tarefa' : 'Abrir no executor'}
+                  </span>
+                </span>
+                <span aria-hidden className="text-white/30">
+                  ↗
+                </span>
+              </a>
+            ))}
+            {!more && links.length > 8 && (
+              <button type="button" className="mt-4 text-xs text-white/45" onClick={() => setMore(true)}>
+                Ver mais
+              </button>
+            )}
+            {load === 'ready' && agents.length === 0 && links.length === 0 && (
+              <p className="py-4 text-sm text-white/40">Nenhuma tarefa disponível neste trecho.</p>
+            )}
           </div>
-        ))}
-      </section>
-      <section aria-label="Trocas entre personagens" className="space-y-3">
-        <h3 className="font-medium">Trocas entre personagens</h3>
-        <p className="text-xs text-muted-foreground">
-          Mensagens registradas no trecho carregado, das mais recentes para as anteriores.
-        </p>
-        {exchanges.length === 0 ? (
-          <p className="text-muted-foreground">Nenhuma troca entre personagens neste trecho.</p>
-        ) : (
-          exchanges.map(exchange => (
-            <details key={exchange.id} className="rounded-lg border border-(--ui-stroke-tertiary) p-3">
-              <summary className="cursor-pointer space-y-1">
-                <span className="font-medium">{exchange.label}</span>
-                <span className="block truncate text-xs text-muted-foreground">{exchange.text.slice(0, 140)}</span>
-              </summary>
-              <p className="mt-3 whitespace-pre-wrap break-words text-xs leading-relaxed">{exchange.text}</p>
-            </details>
-          ))
         )}
-      </section>
-      <section aria-label="Entregas externas" className="space-y-3">
-        <h3 className="font-medium">Entregas externas</h3>
-        <p className="text-xs text-muted-foreground">
-          Links recebidos no trecho carregado desta conversa. Abra para ver o andamento e as mensagens no executor.
-        </p>
-        {links.length === 0 ? (
-          <p className="text-muted-foreground">Nenhum link de acompanhamento neste trecho.</p>
-        ) : (
-          links.map(link => (
-            <a
-              key={link.url}
-              href={link.url}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="block space-y-1 rounded-lg border border-(--ui-stroke-tertiary) p-3 hover:bg-(--chrome-action-hover)"
-            >
-              <span className="block font-medium">{link.title}</span>
-              <span className="block text-xs text-muted-foreground">
-                {link.kind === 'task' ? 'Acompanhar tarefa ↗' : 'Abrir conversa dos agentes ↗'}
-              </span>
-            </a>
-          ))
-        )}
-      </section>
-    </div>
+      </div>
+    </>
   )
 }
 
@@ -185,10 +262,15 @@ export function ParallelActivity() {
           Em paralelo
         </Button>
       </SheetTrigger>
-      <SheetContent className="w-[min(92vw,34rem)] sm:max-w-[34rem]">
-        <SheetHeader className="px-5 pt-6 pr-12">
+      <SheetContent
+        className="w-[min(92vw,27rem)] sm:max-w-[27rem]"
+        style={{ backgroundColor: '#171719', color: '#eee' }}
+      >
+        <SheetHeader className="px-6 pt-7 pb-3 pr-12">
           <SheetTitle>Em paralelo</SheetTitle>
-          <SheetDescription>Tarefas e conversas dos agentes, sem sair da conversa principal.</SheetDescription>
+          <SheetDescription className="sr-only">
+            Tarefas e conversas dos agentes, sem sair da conversa principal.
+          </SheetDescription>
         </SheetHeader>
         {open && <ParallelContent key={sessionId ?? 'unopened'} sessionId={sessionId} />}
       </SheetContent>

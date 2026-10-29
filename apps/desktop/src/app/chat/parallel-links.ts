@@ -39,7 +39,11 @@ export function parallelLinks(messages: ChatMessage[]): ParallelLink[] {
                 .find(Boolean)
             : plain || heading || match[1]) || match[1]
         found.delete(url.href)
-        found.set(url.href, { url: url.href, title: title.slice(0, 180), kind })
+        found.set(url.href, {
+          url: url.href,
+          title: kind === 'conversation' ? 'Conversa no executor' : title.slice(0, 180),
+          kind
+        })
       }
       if (line.trim() && !matches.length && !line.startsWith('|')) {
         heading = line.replace(/[*#]/g, '').trim()

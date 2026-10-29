@@ -28,6 +28,6 @@ describe('parallel task references', () => {
         message('[x](https://mini.example/conversations/user)', { role: 'user' }),
         message('[x](https://user:password@mini.example/conversations/secret)')
       ])
-    ).toEqual([{ url, title: '[Pessoal] PR pronto: Busca global', kind: 'conversation' }])
+    ).toEqual([{ url, title: 'Conversa no executor', kind: 'conversation' }])
   })
 })

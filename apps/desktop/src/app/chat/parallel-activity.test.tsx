@@ -41,6 +41,7 @@ it('does not query while closed, scopes tasks and transcript to this chat, and c
     ]
   })
   fireEvent.click(screen.getByRole('button', { name: 'Em paralelo' }))
+  fireEvent.click(screen.getByRole('tab', { name: 'Tarefas' }))
   await screen.findByText('Check build')
   expect(mocked.request.mock.calls[0][0]).toBe('one')
   expect(mocked.request.mock.calls[0][3]).toEqual({ session_id: 'one' })
@@ -54,6 +55,33 @@ it('shows a read error instead of claiming there are no tasks', async () => {
   mocked.request.mockRejectedValue(new Error('offline'))
   render(<ParallelActivity />)
   fireEvent.click(screen.getByRole('button', { name: 'Em paralelo' }))
+  fireEvent.click(screen.getByRole('tab', { name: 'Tarefas' }))
   await screen.findByText(/Não foi possível atualizar/)
   expect(screen.queryByText('Nenhum subagente informado nesta conversa.')).toBeNull()
+})
+
+it('groups incoming and outgoing messages into one compact conversation before opening details', async () => {
+  mocked.view.$messages.set([
+    {
+      id: 'out',
+      role: 'assistant',
+      parts: [
+        {
+          type: 'tool-call',
+          toolCallId: 'call',
+          toolName: 'message_agent',
+          args: { target: 'inbox', message: 'Verifique o escopo' },
+          argsText: '{}'
+        }
+      ]
+    },
+    { id: 'in', role: 'user', parts: [{ type: 'text', text: 'Message from 🤖 Inbox (@inbox): Escopo verificado' }] }
+  ])
+  render(<ParallelActivity />)
+  fireEvent.click(screen.getByRole('button', { name: 'Em paralelo' }))
+  expect(screen.getAllByRole('button', { name: /Inbox.*Escopo verificado/ })).toHaveLength(1)
+  expect(screen.queryByText('Verifique o escopo')).toBeNull()
+  fireEvent.click(screen.getByRole('button', { name: /Inbox.*Escopo verificado/ }))
+  expect(screen.getByText('Verifique o escopo')).toBeTruthy()
+  expect(screen.getByRole('button', { name: /Todas as conversas/ })).toBeTruthy()
 })
