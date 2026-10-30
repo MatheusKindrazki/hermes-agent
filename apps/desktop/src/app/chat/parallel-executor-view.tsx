@@ -1,7 +1,9 @@
 import { useEffect, useState } from 'react'
+
 import { usePaneVisible } from '@/components/pane-shell/pane-visibility'
-import type { ParallelLink } from './parallel-links'
+
 import { ExecutorComposer } from './parallel-executor-compose'
+import type { ParallelLink } from './parallel-links'
 
 type Conversation = {
   id: string
@@ -33,16 +35,20 @@ export function useExecutorRead(url: string, enabled = true, poll = true) {
     setData(null)
   }, [url])
   useEffect(() => {
-    if (!enabled || !visible) return
+    if (!enabled || !visible) {return}
+
     let cancelled = false,
       pending = false,
       failures = 0
+
     const refresh = async () => {
-      if (cancelled || pending || failures >= 3 || document.visibilityState === 'hidden') return
+      if (cancelled || pending || failures >= 3 || document.visibilityState === 'hidden') {return}
       pending = true
+
       try {
-        if (!window.hermesDesktop?.readParallelExecutor) throw new Error('Unavailable bridge')
+        if (!window.hermesDesktop?.readParallelExecutor) {throw new Error('Unavailable bridge')}
         const next = (await window.hermesDesktop.readParallelExecutor(url)) as Result
+
         if (!cancelled) {
           setData(next)
           setError(false)
@@ -57,46 +63,55 @@ export function useExecutorRead(url: string, enabled = true, poll = true) {
         pending = false
       }
     }
+
     void refresh()
     const timer = poll ? window.setInterval(() => void refresh(), 5000) : undefined
     document.addEventListener('visibilitychange', refresh)
+
     return () => {
       cancelled = true
       window.clearInterval(timer)
       document.removeEventListener('visibilitychange', refresh)
     }
   }, [url, enabled, visible, retry, poll])
+
   return { data, error, retry: () => setRetry(n => n + 1) }
 }
+
 function ReadStatus({ read }: { read: ReturnType<typeof useExecutorRead> }) {
   const { data, error } = read
+
   if (error)
-    return (
-      <div role="status" className="my-3 text-xs text-amber-200/70">
+    {return (
+      <div className="my-3 text-xs text-amber-200/70" role="status">
         Sem conexão com o executor. {data ? 'Exibindo a última leitura.' : 'Não foi possível carregar.'}{' '}
         <button className="underline" onClick={read.retry}>
           Tentar novamente
         </button>
       </div>
-    )
+    )}
+
   if (!data)
-    return (
-      <p role="status" className={'my-3 ' + text}>
+    {return (
+      <p className={'my-3 ' + text} role="status">
         Carregando…
       </p>
-    )
+    )}
+
   if (data.kind === 'task' && !data.live)
-    return (
+    {return (
       <p className={'my-3 ' + text}>
         Resumo publicado {data.publishedAt || 'em horário não informado'} · consulta automática
       </p>
-    )
+    )}
+
   return (
-    <p role="status" className={'my-3 ' + text}>
+    <p className={'my-3 ' + text} role="status">
       Atualização a cada 5 s · última leitura {new Date(data.fetchedAt).toLocaleTimeString('pt-BR')}
     </p>
   )
 }
+
 const states: Record<string, string> = {
   RUNNING: 'Em andamento',
   IDLE: 'Em espera',
@@ -106,9 +121,11 @@ const states: Record<string, string> = {
   PAUSED: 'Pausada',
   AWAITING_USER_INPUT: 'Aguardando resposta'
 }
-function ExecutorConversation({ url }: { url: string }) {
+
+export function ExecutorConversation({ url }: { url: string }) {
   const read = useExecutorRead(url)
   const conversation = read.data?.kind === 'conversation' ? read.data : null
+
   return (
     <div>
       <h3 className="text-sm font-medium text-white/85">{conversation?.title || 'Conversa do agente'}</h3>
@@ -151,24 +168,27 @@ function ExecutorConversation({ url }: { url: string }) {
           ))}
       </div>
       {conversation && (
-        <ExecutorComposer url={url} recipient={conversation.title || 'Agente desta conversa'} onSent={read.retry} />
+        <ExecutorComposer onSent={read.retry} recipient={conversation.title || 'Agente desta conversa'} url={url} />
       )}
     </div>
   )
 }
+
 function ExecutorTask({ link }: { link: ParallelLink }) {
   const read = useExecutorRead(link.url)
   const task = read.data?.kind === 'task' ? read.data.task : null
   const [conversation, setConversation] = useState<{ url: string; label: string } | null>(null)
+
   if (conversation)
-    return (
+    {return (
       <div>
         <button className={back} onClick={() => setConversation(null)}>
           ← Voltar à tarefa
         </button>
         <ExecutorConversation key={conversation.url} url={conversation.url} />
       </div>
-    )
+    )}
+
   return (
     <div>
       <h3 className="text-sm font-medium text-white/85">{task?.title || link.title}</h3>
@@ -182,8 +202,8 @@ function ExecutorTask({ link }: { link: ParallelLink }) {
         <div className="divide-y divide-white/6">
           {task.convs.map(conv => (
             <button
-              key={conv.id}
               className="flex w-full items-center justify-between py-4 text-left text-sm text-white/80"
+              key={conv.id}
               onClick={() => setConversation(conv)}
             >
               {conv.label}
@@ -209,11 +229,13 @@ function ExecutorTask({ link }: { link: ParallelLink }) {
     </div>
   )
 }
+
 function TaskRow({ link, onOpen }: { link: ParallelLink; onOpen: () => void }) {
   const read = useExecutorRead(link.url)
   const task = read.data?.kind === 'task' ? read.data.task : null
+
   return (
-    <button onClick={onOpen} className="flex w-full items-center gap-3 border-b border-white/6 py-4 text-left">
+    <button className="flex w-full items-center gap-3 border-b border-white/6 py-4 text-left" onClick={onOpen}>
       <span className="min-w-0 flex-1">
         <span className="line-clamp-2 text-sm text-white/80">{task?.title || link.title}</span>
         <span className="mt-1 block text-xs text-white/40">
@@ -227,12 +249,14 @@ function TaskRow({ link, onOpen }: { link: ParallelLink; onOpen: () => void }) {
     </button>
   )
 }
+
 function ConversationRow({ link, onOpen }: { link: ParallelLink; onOpen: () => void }) {
   const read = useExecutorRead(link.url, true, false)
   const conversation = read.data?.kind === 'conversation' ? read.data : null
   const latest = conversation?.items.filter(item => item.text).at(-1)?.text
+
   return (
-    <button onClick={onOpen} className="flex w-full items-center gap-3 border-b border-white/6 py-4 text-left">
+    <button className="flex w-full items-center gap-3 border-b border-white/6 py-4 text-left" onClick={onOpen}>
       <span className="min-w-0 flex-1">
         <span className="line-clamp-2 text-sm text-white/80">{conversation?.title || 'Conversa do agente'}</span>
         <span className="mt-1 block truncate text-xs text-white/40">
@@ -245,12 +269,15 @@ function ConversationRow({ link, onOpen }: { link: ParallelLink; onOpen: () => v
     </button>
   )
 }
+
 export function ExecutorLinks({ links }: { links: ParallelLink[] }) {
   const [selected, setSelected] = useState<ParallelLink | null>(null)
   const [more, setMore] = useState(false)
-  if (!links.length) return null
+
+  if (!links.length) {return null}
+
   if (selected)
-    return (
+    {return (
       <section className="pb-4">
         <button className={back} onClick={() => setSelected(null)}>
           ← Voltar à lista
@@ -261,7 +288,8 @@ export function ExecutorLinks({ links }: { links: ParallelLink[] }) {
           <ExecutorConversation key={selected.url} url={selected.url} />
         )}
       </section>
-    )
+    )}
+
   return (
     <section className="pb-3">
       <p className="mt-5 mb-1 text-[11px] text-white/35">No executor · referências desta conversa</p>

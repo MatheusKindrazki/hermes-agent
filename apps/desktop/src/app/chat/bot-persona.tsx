@@ -16,6 +16,7 @@ import { $sessionDotStateById } from '@/store/session-dot-state'
 
 import { primaryRouteSelectedSessionId } from '../routes'
 
+import { KindraPanel } from './kindra-panel'
 import { ParallelActivity } from './parallel-activity'
 
 /** Resolve the exact canonical conversation, never the profile's latest activity. */
@@ -101,7 +102,10 @@ export function ChatPersonaHeader({ persona }: { persona: NonNullable<ReturnType
           </p>
         </div>
       </div>
-      <ParallelActivity />
+      <div className="flex items-center gap-1">
+        <KindraPanel />
+        <ParallelActivity />
+      </div>
     </header>
   )
 }
