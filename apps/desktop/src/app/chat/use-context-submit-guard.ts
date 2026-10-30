@@ -1,15 +1,19 @@
 import { useQuery } from '@tanstack/react-query'
 import { useCallback, useMemo } from 'react'
+
 import { getApiCapabilities } from '@/api/capabilities'
 import type { SubmitTextOptions } from '@/app/session/hooks/use-prompt-actions/utils'
 import { resolveNewChatOwnerRoute } from '@/store/profile'
-import { $sessions, knownSessionOwner, sessionMatchesStoredId } from '@/store/session'
+import type { $sessions} from '@/store/session';
+import { idsShareLineage, knownSessionOwner, sessionMatchesStoredId } from '@/store/session'
+
 import { activeContextCanSubmit, activeContextCapabilityDecision, activeContextCorrelationFromReceipt, resolveActiveContext } from './active-context'
 
 interface ContextSubmitGuardOptions {
   activeSessionId: string | null
   routedSessionId: string | null
   selectedSessionId: string | null
+  runtimeStoredSessionId: string | null
   sessions: ReturnType<typeof $sessions.get>
   activeConnectionId: string | null
   activeGatewayProfile: string
@@ -41,7 +45,7 @@ function contextOwnerRoute(
   return { ownerConnectionId, ownerProfile }
 }
 
-export function useContextSubmitGuard({ activeSessionId, routedSessionId, selectedSessionId, sessions,
+export function useContextSubmitGuard({ activeSessionId, routedSessionId, selectedSessionId, runtimeStoredSessionId, sessions,
   activeConnectionId, activeGatewayProfile, gatewayOpen, identityV2Override, onSubmit, onSteer
 }: ContextSubmitGuardOptions) {
   const targetStoredSessionId = routedSessionId ?? selectedSessionId
@@ -118,7 +122,15 @@ export function useContextSubmitGuard({ activeSessionId, routedSessionId, select
     targetStoredSessionId
   ])
 
-  const contextAllowsSubmit =
+  // A destination's metadata can be ready before the view has switched its
+  // runtime. Fail closed in legacy mode too; compression aliases remain valid.
+  const destinationReady = !targetStoredSessionId || Boolean(
+    activeSessionId && selectedSessionId && runtimeStoredSessionId &&
+    idsShareLineage(targetStoredSessionId, selectedSessionId, sessions) &&
+    idsShareLineage(targetStoredSessionId, runtimeStoredSessionId, sessions)
+  )
+
+  const contextAllowsSubmit = destinationReady &&
     activeContextCapabilityDecisionResult.known && activeContextCanSubmit(activeContext, identityV2Enabled)
 
   const submitWithContextGuard = useCallback(
