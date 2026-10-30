@@ -1,4 +1,3 @@
-import { useContextSubmitGuard } from './use-context-submit-guard'
 import { type AppendMessage, AssistantRuntimeProvider, type ThreadMessage } from '@assistant-ui/react'
 import { useStore } from '@nanostores/react'
 import type { ReadableAtom } from 'nanostores'
@@ -28,9 +27,9 @@ import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
 import { migrateSessionDraft } from '@/store/composer'
 import { migrateQueuedPrompts, parkQueuedPrompts } from '@/store/composer-queue'
-import { $hudMode } from '@/store/hud'
 import { $connectionsRegistry } from '@/store/connection-registry-state'
 import { $activeConnectionId } from '@/store/connections'
+import { $hudMode } from '@/store/hud'
 import { $introSplash } from '@/store/intro-splash'
 import { $pinnedSessionIds } from '@/store/layout'
 import { $introView } from '@/store/onboarding-intro'
@@ -68,12 +67,12 @@ import { isAuxiliaryWindow, isMainWindow } from '@/store/windows'
 import { primaryRouteSelectedSessionId, routeSessionId } from '../routes'
 import { titlebarHeaderBaseClass, titlebarHeaderShadowClass, titlebarHeaderTitleClass } from '../shell/titlebar'
 
-import { ChatPersonaHeader, useRoutedChatPersona } from './bot-persona'
 import {
   type ActiveContext,
   resolveActiveContext
 } from './active-context'
 import { ActiveContextChip } from './active-context-chip'
+import { ChatPersonaHeader, useRoutedChatPersona } from './bot-persona'
 import { ChatDropOverlay } from './chat-drop-overlay'
 import { dropOverlayKind, useShowChatBar } from './chat-surface-state'
 import { ChatSwapOverlay, ChatSyncBadge } from './chat-swap-overlay'
@@ -106,6 +105,7 @@ import {
 } from './transcript-backfill'
 import { advanceSessionTranscriptWindow, type SessionWindowMemo } from './transcript-window'
 import { useChatBarState } from './use-chat-bar-state'
+import { useContextSubmitGuard } from './use-context-submit-guard'
 import { useTranscriptRetention } from './use-transcript-retention'
 
 // The pane tree suppresses old titlebar bands by matching this legacy height
@@ -675,6 +675,7 @@ function useConversationFileDrop(
     },
     [composerScope.target, currentCwd, onAttachDroppedItems]
   )
+
   return onDropFiles
 }
 
@@ -826,6 +827,7 @@ const ChatViewContent = memo(function ChatViewContent({
   // A tile IS its session — no route involved, never "mismatched".
   const routedSessionId = isPrimary ? routeSessionId(location.pathname) : selectedSessionId
   const isRoutedSessionView = Boolean(routedSessionId)
+
   const { composerDisabled, allowDraftingWhileDisabled, activeContext, contextAllowsSubmit, submitWithContextGuard, steerWithContextGuard, identityV2Enabled, capabilityState } = useContextSubmitGuard({
     activeSessionId, routedSessionId, selectedSessionId, runtimeStoredSessionId: transcriptStoredSessionId, sessions, activeConnectionId,
     activeGatewayProfile, gatewayOpen, identityV2Override, onSubmit, onSteer
@@ -891,10 +893,10 @@ const ChatViewContent = memo(function ChatViewContent({
         'relative isolate flex h-full min-w-0 flex-col overflow-hidden bg-(--ui-chat-surface-background)',
         className
       )}
-      data-chat-persona={chatPersona?.bot.name}
       data-active-context-capability={capabilityState}
       data-active-context-submit={contextAllowsSubmit ? 'allowed' : 'blocked'}
       data-active-context-v2={identityV2Enabled ? 'enabled' : 'legacy'}
+      data-chat-persona={chatPersona?.bot.name}
       data-chat-surface=""
       data-chat-unfocused={surfaceFocused || surfaceHovered ? undefined : ''}
       data-composer-surface-id={composerSurfaceId}
@@ -986,7 +988,6 @@ const ChatViewContent = memo(function ChatViewContent({
             <Suspense fallback={<ChatBarFallback />}>
               <ChatBar
                 allowDraftingWhileDisabled={allowDraftingWhileDisabled}
-                recipientName={resolvedPersona?.title}
                 busy={busy}
                 cwd={currentCwd}
                 disabled={composerDisabled}
@@ -1011,6 +1012,7 @@ const ChatViewContent = memo(function ChatViewContent({
                 onTranscribeAudio={onTranscribeAudio}
                 profile={effectiveModelProfile}
                 queueSessionKey={queueSessionKey}
+                recipientName={resolvedPersona?.title}
                 sessionId={activeSessionId}
                 state={chatBarState}
               />

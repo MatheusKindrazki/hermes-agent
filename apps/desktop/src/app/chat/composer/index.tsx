@@ -50,8 +50,8 @@ import { ComposerDockGlow, QueuedEditBanner } from './chat-bar-parts'
 import {
   acceptsTriggerCompletion,
   COMPOSER_FADE_BACKGROUND,
-  composerInputWidthClass,
   composerEditorIsDisabled,
+  composerInputWidthClass,
   implicitSlashAcceptIndex,
   liveComposerDraft,
   type QueueEditState,

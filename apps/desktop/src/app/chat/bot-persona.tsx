@@ -92,10 +92,10 @@ export function ChatPersonaHeader({ persona }: { persona: NonNullable<ReturnType
         <div className="min-w-0">
           <h1 className="truncate text-[0.9375rem] font-semibold text-(--ui-text-primary)">{title}</h1>
           <p
-            hidden={status === 'idle'}
             aria-atomic="true"
             aria-live="polite"
             className="mt-1 text-[0.6875rem] text-(--ui-text-tertiary)"
+            hidden={status === 'idle'}
           >
             {label}
           </p>

@@ -76,9 +76,11 @@ it('changes recipient identity synchronously without a roster refresh', () => {
     { name: 'default', title: 'Chief', canonical_session: { id: 'chief' } },
     { name: 'writer', title: 'Writer', canonical_session: { id: 'writer' } }
   ])
+
   function Recipient({ id }: { id: string }) {
     return <span>{useChatPersona(id)?.title}</span>
   }
+
   const { rerender } = render(<Recipient id="chief" />)
   expect(screen.getByText('Chief')).toBeTruthy()
   rerender(<Recipient id="writer" />)
@@ -95,13 +97,15 @@ it('uses the primary route immediately, keeps tile ownership, and clears new-cha
     { name: 'default', title: 'Chief', canonical_session: { id: 'chief' } },
     { name: 'writer', title: 'Writer', canonical_session: { id: 'writer' } }
   ])
+
   function Recipient({ primary, pathname }: { primary: boolean; pathname: string }) {
     return <span>{useRoutedChatPersona(primary, pathname, 'chief')?.title ?? 'New chat'}</span>
   }
-  const { rerender } = render(<Recipient primary pathname="/writer" />)
+
+  const { rerender } = render(<Recipient pathname="/writer" primary />)
   expect(screen.getByText('Writer')).toBeTruthy()
-  rerender(<Recipient primary={false} pathname="/writer" />)
+  rerender(<Recipient pathname="/writer" primary={false} />)
   expect(screen.getByText('Chief')).toBeTruthy()
-  rerender(<Recipient primary pathname="/" />)
+  rerender(<Recipient pathname="/" primary />)
   expect(screen.getByText('New chat')).toBeTruthy()
 })

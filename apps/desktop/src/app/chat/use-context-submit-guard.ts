@@ -1,9 +1,12 @@
 import { useQuery } from '@tanstack/react-query'
 import { useCallback, useMemo } from 'react'
+
 import { getApiCapabilities } from '@/api/capabilities'
 import type { SubmitTextOptions } from '@/app/session/hooks/use-prompt-actions/utils'
 import { resolveNewChatOwnerRoute } from '@/store/profile'
-import { $sessions, idsShareLineage, knownSessionOwner, sessionMatchesStoredId } from '@/store/session'
+import type { $sessions} from '@/store/session';
+import { idsShareLineage, knownSessionOwner, sessionMatchesStoredId } from '@/store/session'
+
 import { activeContextCanSubmit, activeContextCapabilityDecision, activeContextCorrelationFromReceipt, resolveActiveContext } from './active-context'
 
 interface ContextSubmitGuardOptions {
@@ -126,6 +129,7 @@ export function useContextSubmitGuard({ activeSessionId, routedSessionId, select
     idsShareLineage(targetStoredSessionId, selectedSessionId, sessions) &&
     idsShareLineage(targetStoredSessionId, runtimeStoredSessionId, sessions)
   )
+
   const contextAllowsSubmit = destinationReady &&
     activeContextCapabilityDecisionResult.known && activeContextCanSubmit(activeContext, identityV2Enabled)
 

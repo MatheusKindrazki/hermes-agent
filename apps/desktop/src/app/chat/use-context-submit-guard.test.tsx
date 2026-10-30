@@ -14,6 +14,7 @@ it('blocks submit and steer until route, view and runtime agree, including rapid
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   const wrapper = ({ children }: { children: ReactNode }) => <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
   const rowDefaults = { ended_at: null, input_tokens: 0, is_active: true, last_active: 1, model: null, output_tokens: 0, source: 'desktop', started_at: 1, tool_call_count: 0, title: 'Bot Chat', preview: null }
+
   const props: Parameters<typeof useContextSubmitGuard>[0] = {
     activeSessionId: 'runtime-a', routedSessionId: 'a', selectedSessionId: 'a', runtimeStoredSessionId: 'a',
     sessions: [{ ...rowDefaults, id: 'a', title: 'Bot Chat', profile: 'chief', connection_id: 'mini', message_count: 1 },
@@ -21,6 +22,7 @@ it('blocks submit and steer until route, view and runtime agree, including rapid
     activeConnectionId: 'mini', activeGatewayProfile: 'chief', gatewayOpen: true,
     identityV2Override: false, onSubmit, onSteer
   }
+
   const { result, rerender } = renderHook(useContextSubmitGuard, { initialProps: props, wrapper })
   expect(result.current.contextAllowsSubmit).toBe(true)
   rerender({ ...props, routedSessionId: 'b' })
