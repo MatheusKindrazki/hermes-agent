@@ -60,6 +60,7 @@ test('opens the embedded panel and its conversation without losing the principal
     expect(await panel.locator('body').evaluate(() => 'hermesDesktop' in window)).toBe(false)
     await panel.getByRole('button', { name: 'Abrir conversa' }).click()
     await expect(page.getByRole('heading', { name: 'Em paralelo', exact: true })).toBeVisible()
+    await expect(page.locator('[data-slot="sheet-content"]')).toHaveCSS('background-color', 'rgb(23, 23, 25)')
     await expect(page.getByText('Conversa integrada em tempo real.')).toBeVisible()
     await expect(page.getByText('Para: Engenharia · teste')).toBeVisible()
     await expect(page.getByRole('button', { name: 'Enviar ao agente' })).toBeDisabled()

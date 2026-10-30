@@ -105,7 +105,7 @@ export function KindraPanel() {
         </DialogHeader>
         <PanelFrame onConversation={setConversation} onFocus={setFocused} />
         <Sheet onOpenChange={value => { if (!value) { setConversation(null) } }} open={conversation !== null}>
-          <SheetContent className="w-[min(92vw,30rem)] sm:max-w-[30rem] z-[calc(var(--z-modal)+2)]">
+          <SheetContent className="w-[min(92vw,30rem)] sm:max-w-[30rem] z-[calc(var(--z-modal)+2)]" style={{ backgroundColor: #171719, color: #eee }}>
             <SheetHeader className="px-6 pt-7 pb-3 pr-12">
               <SheetTitle>Em paralelo</SheetTitle>
               <SheetDescription className="sr-only">Conversa selecionada no Painel. Feche para voltar à tarefa.</SheetDescription>
