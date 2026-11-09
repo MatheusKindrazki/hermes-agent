@@ -1,6 +1,10 @@
+// `host.state.viewport`: window geometry + the app's responsive posture.
+
 import { atom } from 'nanostores'
+
 import { $narrowViewport } from '@/components/pane-shell/tree/store'
 
+/** Window geometry + the app's responsive posture, one readonly rect. */
 export interface ViewportRect {
   width: number
   height: number

@@ -40,7 +40,7 @@ import {
   focusedRosterOwner,
   saveSelectedRosterBot
 } from './bot-state'
-import { ensureBotMetadata } from './canonical-chat'
+import { ensureBotMetadata, ensureBotProfile } from './canonical-chat'
 import {
   $botAttention,
   $botMeta,
@@ -161,7 +161,7 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, onNewSection, showHandl
   // resolved the pinned canonical chat, preview THAT session — not the
   // profile's most recent (but unrelated) activity. Liveness checks above
   // keep last_session semantics: any recent activity means the bot is alive.
-  const { fromBot } = previewKind(previewSession?.preview)
+  const { fromBot } = previewKind(previewSession?.preview, $lastRoster.get(), bot.connectionId)
 
   // DM previews read like DMs: strip the delivery prefix, keep the message.
   const displayPreview = botDisplayPreview(previewSession?.preview, Boolean(fromBot))
@@ -211,8 +211,11 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, onNewSection, showHandl
   }
 
   // Rows and Active Now share the exact-owner open path; only that path may
-  // activate a source and resolve the canonical Bot Chat.
-  const open = () => void openRosterBot(bot)
+  // activate a source and resolve the canonical Bot Chat. ⌘/⌃-click opens
+  // the Bot Chat as a stacked tab beside the current one (same modifier the
+  // Sessions rows honour) instead of replacing whatever main holds.
+  const open = (event?: { ctrlKey?: boolean; metaKey?: boolean }) =>
+    void openRosterBot(bot, { intent: event?.metaKey || event?.ctrlKey ? 'tab' : 'in-place' })
 
   // DRAG lives on the row button itself: it already takes pointer events, so
   // the click that opens the bot and the drag that files it are one element's
@@ -319,6 +322,7 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, onNewSection, showHandl
       <ContextMenuTrigger asChild>{row}</ContextMenuTrigger>
       <ContextMenuContent>
         <ContextMenuItem onSelect={() => void openRosterBot(bot)}>{b.bot.openBotChat}</ContextMenuItem>
+        <ContextMenuItem onSelect={() => void openRosterBot(bot, { intent: 'tab' })}>{b.bot.openBotChatInNewTab}</ContextMenuItem>
         <ContextMenuItem onSelect={() => openBotScreen(bot, meta)}>{b.screen.menu}</ContextMenuItem>
         <ContextMenuCheckboxItem
           checked={Boolean(meta?.screenAutoOpen)}
@@ -388,8 +392,8 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, onNewSection, showHandl
         <ContextMenuSeparator />
         <ContextMenuItem
           onSelect={() =>
-            void ensureBotMetadata(bot)
-              .then(() => onEdit(bot))
+            void ensureBotProfile(bot)
+              .then(onEdit)
               .catch(error => host.notifyError?.(error, b.bot.loadFailed))
           }
         >

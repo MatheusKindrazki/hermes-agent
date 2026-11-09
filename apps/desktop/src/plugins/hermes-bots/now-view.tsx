@@ -16,7 +16,7 @@ interface NowRoom {
 }
 
 /** A calm triage view: requests first, live work second, recent updates last. */
-export function NowView({
+export function NowView<Room extends NowRoom>({
   bots,
   rooms,
   renderBot,
@@ -26,9 +26,9 @@ export function NowView({
   stale
 }: {
   bots: RosterRow[]
-  rooms: NowRoom[]
+  rooms: Room[]
   renderBot: (bot: RosterRow, prefix?: string) => ReactNode
-  renderRoom: (room: NowRoom) => ReactNode
+  renderRoom: (room: Room) => ReactNode
   onShowAll: () => void
   loading: boolean
   stale?: boolean

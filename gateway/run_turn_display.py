@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 class GatewayTurnDisplayMixin:
     def _run_agent_display_settings(self, source: SessionSource) -> GatewayRunner._RunAgentDisplay:
         """Resolve per-platform display, progress, status and streaming-surface settings for a turn."""
-        from gateway.run_turn import (Platform, logger, queue, suppress, t)
+        from gateway.run_turn import (Platform, logger, queue, suppress, t, automatic_notices_allowed)
         from gateway.run import (
             _gateway_platform_value, _has_platform_display_override, _load_gateway_config,
             _platform_config_key,
@@ -82,24 +82,24 @@ class GatewayTurnDisplayMixin:
                         else t("gateway.progress.status_fallback_short"))
 
         # Webhooks can't edit messages, so tool progress / log mode are off there.
-        is_webhook = source.platform == Platform.WEBHOOK
-        tool_progress_enabled = progress_mode not in {"off", "log"} and not is_webhook
+        is_webhook, bot_peer = source.platform == Platform.WEBHOOK, not automatic_notices_allowed(source)
+        tool_progress_enabled = progress_mode not in {"off", "log"} and not is_webhook and not bot_peer
         # Live status for text-rendering typing indicators (Slack); independent of tool_progress.
         _live_status_mode = resolve_display_setting(user_config, platform_key, "live_status", "full")
         _live_status_adapter = (
             adapter if getattr(adapter, "supports_status_text", False) and _live_status_mode != "off" else None
         )
         # "log" mode: tool calls go to ~/.hermes/logs/tool_calls.log instead of the chat. Gateway-only.
-        log_mode_enabled = progress_mode == "log" and not is_webhook
+        log_mode_enabled = progress_mode == "log" and not is_webhook and not bot_peer
         # Interim assistant messages and thinking_progress are independent of tool progress (same
         # queue). Mattermost requires a per-platform opt-in: scratch text leaks into public threads.
         interim_assistant_messages_mode = _display_surface_mode(
             "interim_assistant_messages", default=True, require_platform_override_for={Platform.MATTERMOST},
         )
-        interim_assistant_messages_enabled = not is_webhook and interim_assistant_messages_mode != "off"
+        interim_assistant_messages_enabled = not is_webhook and not bot_peer and interim_assistant_messages_mode != "off"
         _thinking_enabled = _display_surface_mode(
             "thinking_progress", default=False, require_platform_override_for={Platform.MATTERMOST},
-        ) != "off"
+        ) != "off" and not bot_peer
         # Slack-native task cards need the progress queue even with text tool_progress off.
         # Slack-native task cards (#29483): when the Slack adapter's opt-in is set, tool progress renders as
         # native plan/task cards via chat.startStream — the progress queue is needed even though Slack keeps
@@ -113,7 +113,7 @@ class GatewayTurnDisplayMixin:
         if (
             source.platform == Platform.SLACK
             and hasattr(adapter, "native_task_cards_enabled")
-            and not (_tool_progress_explicit and progress_mode == "off")
+            and not (_tool_progress_explicit and progress_mode == "off") and not bot_peer
         ):
             try:
                 _native_slack_task_cards = bool(adapter.native_task_cards_enabled())
