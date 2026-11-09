@@ -22,7 +22,7 @@ from pathlib import Path
 from agent.i18n import t
 from gateway.config import Platform
 from gateway.platforms.base import EphemeralReply
-from gateway.platforms.event import MessageEvent, MessageType
+from gateway.platforms.event import MessageEvent, MessageType, clean_attachment_filename
 from gateway.run_busy import approval_input_words
 from gateway.run_inbound_media import rehome_inbound_media
 from gateway.run_inbound_hooks import GatewayInboundHooksMixin
@@ -37,6 +37,8 @@ from gateway.session import (
     neutralize_untrusted_inline_text,
 )
 from gateway.turn_lease import TurnLeaseTimeoutError
+from hermes_cli.observability.shared_metrics_busy import (
+    note_busy_admitting, note_busy_outcome, settle_busy_arrival, stamp_busy_arrival)
 from typing import Any, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
@@ -45,6 +47,10 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+
+# ``RelayMediaClient.download`` temp-file prefix: the rest of such a basename is random, not a name.
+_RELAY_MEDIA_PREFIX = "relay_media_"
+_UNKNOWN_ATTACHMENT_NAME = "(original filename unknown)"
 
 
 def discord_triggering_note(message_id: Any) -> str:
@@ -68,7 +74,10 @@ def strip_discord_triggering_note(event: Any, message_text: Any) -> Any:
     return message_text.removeprefix(prefix)
 
 
-class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionMixin, GatewayPluginInjectionMixin):
+from gateway.run_inbound_admission import GatewayInboundAdmissionMixin
+
+
+class GatewayInboundMixin(GatewayInboundAdmissionMixin, GatewayInboundHooksMixin, GatewayInboundTranscriptionMixin, GatewayPluginInjectionMixin):
     """Inbound message pipeline (_handle_message, text/media preparation, durable-turn markers, plugin injection) for GatewayRunner."""
 
     async def _hm_offer_pairing_code(self, source: SessionSource) -> None:
@@ -239,7 +248,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
                 logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
             return None
         # The busy path charged this event on arrival; a drained follow-up must not pay twice.
-        if not getattr(event, "_bot_loop_admitted", False) and not self._admit_bot_message_for_source(source):
+        if not getattr(event, "_bot_loop_admitted", False) and not (
+                self._admit_bot_message_for_source(source) and self._admit_bot_chain(event)):
             return None
         return event, source, False
 
@@ -624,10 +634,10 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
                 # The chat's first input, and a command's turn, not committed yet never commit.
                 authority.fence_route(_quick_key)
             return
-        from gateway.session_contract import Principal, SessionRef
+        from gateway.session_contract import SessionActor, SessionRef
         from hermes_state_runtime import RuntimeStoreError, list_session_admissions
         ref = SessionRef(authority.profile_id, sid)
-        actor = Principal('messaging-control', authority.profile_id,
+        actor = SessionActor('messaging-control', authority.profile_id,
                           frozenset({'session:submit', 'session:control'}), 'busy-command')
         rows = await asyncio.to_thread(list_session_admissions, authority.db, session_id=sid)
         # A FIFO paused on a lost (``unknown``) turn is the operator's to resume: its pause notice
@@ -735,6 +745,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
                     and self._effective_busy_text_mode(source) == "queue")):
             return False
         outcome = await self._resolve_busy_steer_or_redirect(event, _quick_key, mode, running_agent)
+        note_busy_outcome(event, outcome)
         await self._busy_interrupt_and_ack(event, _quick_key, adapter, state, running_agent, outcome)
         return bool(outcome.steered or outcome.redirected)
 
@@ -1211,27 +1222,17 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         from gateway.session_authorities import active_authority
         authority = active_authority(self)
         if authority is not None and not event.get_command() and not is_internal:
-            from gateway.session_ingress import admit_message, executing_admission
+            from gateway.session_ingress import executing_admission
             if not executing_admission.get():
-                # The durable FIFO only orders turns; busy_input_mode still decides what a follow-up
-                # does to the RUNNING one (steer into it, redirect it, or end it so the FIFO advances).
-                # Without this, ``interrupt`` degrades to ``queue`` behind a turn that may hang for
-                # its whole request timeout.
-                # A bare "yes"/"no" to a blocking dangerous-command approval answers it (#46866):
-                # never an interrupt (read as deny) nor a queued turn (auto-deny deadlock).
-                # A turn a slash command produced (``/queue yes``) is never live typing.
-                if self._is_session_running(_quick_key) and not getattr(event, "_fifo_only", False) and (
-                        await self._route_plaintext_approval_while_busy(event, _quick_key)
-                        or await self._hm_busy_preempt(event, source, _quick_key)):
-                    return True, None
-                _consumed, _consumer_reply = await self._hm_post_admission_consume(event, source, _quick_key)
-                if _consumed:
-                    return True, _consumer_reply
-                if getattr(event, "_fifo_only", False) and event._stop_epoch != self._route_stop_epoch(_quick_key):
-                    return True, None  # a /stop or /new came after its command, as it clears the slot
-                # A failed admit stays the authority's answer (refusal notice or turn error), never a
-                # pending legacy turn: that would run unadmitted, outside the FIFO's order.
-                return True, await admit_message(authority, event)
+                # A message the adapter saw as idle still waits when an earlier queued turn runs
+                # outside its session guard: the running-turn check is the busy test that counts.
+                busy = self._is_session_running(_quick_key) and not getattr(event, "_fifo_only", False)
+                if busy:
+                    stamp_busy_arrival(self._delivery_adapter_for(source), event)
+                try:
+                    return await self._hm_admit_to_fifo(authority, event, source, _quick_key, busy)
+                finally:
+                    settle_busy_arrival(event)  # never admitted, refused or dropped: its fate is known
         if (authority is None and not is_internal and not event.get_command()
                 and getattr(self, 'session_authority', None) is not None):
             # Scoped to a home this process does not serve: never fall back to the launch ledger.
@@ -1239,49 +1240,32 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             raise RuntimeStoreError('profile_mismatch')
         return False, None
 
-    def _record_admitted_inbound_origin(self, event, source, is_internal):
-        """Publish ingress provenance only after its durable admission succeeded."""
-        if not is_internal:
-            from agent.durable_admission import capture_effect_origin, platform_event_id, publish_effect_origin
 
-            _raw_event = getattr(event, "message_id", None)
-            if _raw_event in (None, ""):
-                _raw_event = getattr(event, "platform_update_id", None)
-            _platform = getattr(getattr(source, "platform", None), "value", "") or "hermes"
-            publish_effect_origin(capture_effect_origin(
-                self._session_key_for_source(source), platform_event_id(_platform, _raw_event),
-            ))
-        if not is_internal:
-            from hermes_cli.observability.shared_metrics_events import record_gateway_slash_command
-            record_gateway_slash_command(event)
 
-    def _admit_durable_inbound(self, event, source, is_internal):
-        """Return a refusal before any input rewrites or model execution."""
-        try:
-            from agent.durable_admission import ModeError as _K8ModeError
-            from agent.durable_admission import resolve_mode as _k8_resolve_mode
-
-            _k8_on = _k8_resolve_mode()
-        except _K8ModeError as _k8_mode_exc:
-            # A misconfigured mode is not "off". An operator who typo'd the
-            # arming value asked for enforcement and must not silently get
-            # none, so the turn stops here — before any config, subprocess or
-            # model — with a stable refusal.
-            logger.error("durable admission mode refused: %s", _k8_mode_exc)
-            return (
-                "This message was not processed: the durable-admission mode "
-                "setting is not recognised, so the work ledger could not be "
-                "consulted. Nothing has run."
-            )
-        except Exception:
-            logger.debug("durable admission probe failed", exc_info=True)
-            _k8_on = False
-        if _k8_on and not is_internal:
-            _k8_blocked = self._k8_admit_inbound(event, source)
-            if _k8_blocked is not None:
-                return _k8_blocked
-
-        return None
+    async def _hm_admit_to_fifo(
+        self, authority: Any, event: MessageEvent, source: SessionSource, _quick_key: str, busy: bool,
+    ) -> tuple[bool, Optional[str]]:
+        """The authority-owned path of ``_hm_authority_admission`` (not inside a FIFO execution)."""
+        from gateway.session_ingress import admit_message
+        # The durable FIFO only orders turns; busy_input_mode still decides what a follow-up
+        # does to the RUNNING one (steer into it, redirect it, or end it so the FIFO advances).
+        # Without this, ``interrupt`` degrades to ``queue`` behind a turn that may hang for
+        # its whole request timeout.
+        # A bare "yes"/"no" to a blocking dangerous-command approval answers it (#46866):
+        # never an interrupt (read as deny) nor a queued turn (auto-deny deadlock).
+        # A turn a slash command produced (``/queue yes``) is never live typing.
+        if busy and (await self._route_plaintext_approval_while_busy(event, _quick_key)
+                     or await self._hm_busy_preempt(event, source, _quick_key)):
+            return True, None
+        _consumed, _consumer_reply = await self._hm_post_admission_consume(event, source, _quick_key)
+        if _consumed:
+            return True, _consumer_reply
+        if getattr(event, "_fifo_only", False) and event._stop_epoch != self._route_stop_epoch(_quick_key):
+            return True, None  # a /stop or /new came after its command, as it clears the slot
+        # A failed admit stays the authority's answer (refusal notice or turn error), never a
+        # pending legacy turn: that would run unadmitted, outside the FIFO's order.
+        note_busy_admitting(event)
+        return True, await admit_message(authority, event)
 
     async def _handle_message_with_effect_scope(self, event: MessageEvent) -> Optional[str]:
         """Handle an incoming message from any platform: auth → command check → running-agent
@@ -1533,7 +1517,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         self, adapter, source: SessionSource, transcripts: list[str], *, metadata=None, log_context: str = "Transcript"
     ) -> None:
         """Send each transcript back as ``🎙️ "…"`` (best-effort; failures are logged, never raised)."""
-        for tx in transcripts:
+        from gateway.bot_peer_notices import automatic_notices_allowed
+        for tx in transcripts if automatic_notices_allowed(source) else ():
             try:
                 await adapter.send(source.chat_id, t("gateway.voice.transcript_echo_short", text=tx), metadata=metadata)
             except Exception as echo_exc:
@@ -1556,23 +1541,41 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         return message_text
 
     @staticmethod
-    def _inbound_attachment_display_name(path: str) -> tuple[str, str]:
-        """``(display_name, agent_visible_path)``: cache filename is ``<id>_<id>_<original>``; the
-        path is translated to the in-container mount under a Docker backend."""
+    def _inbound_attachment_display_name(path: str, original_name: str = "") -> tuple[str, str]:
+        """``(display_name, agent_visible_path)``. The display name is the adapter-supplied
+        original name when known (``MessageEvent.media_filenames``), else parsed from the native
+        cache filename ``<id>_<id>_<original>``. A relay temp file (``relay_media_<random>``)
+        carries no name, so it is labelled unknown rather than shown as the random basename.
+        The path is translated to the in-container mount under a Docker backend."""
         from tools.credential_files import to_agent_visible_cache_path
         basename = os.path.basename(path)
-        parts = basename.split("_", 2)
-        return re.sub(r'[^\w.\- ]', '_', parts[2] if len(parts) >= 3 else basename), to_agent_visible_cache_path(path)
+        name = clean_attachment_filename(original_name)
+        if not name and basename.startswith(_RELAY_MEDIA_PREFIX):
+            return _UNKNOWN_ATTACHMENT_NAME, to_agent_visible_cache_path(path)
+        if not name:
+            parts = basename.split("_", 2)
+            name = parts[2] if len(parts) >= 3 else basename
+        return re.sub(r'[^\w.\- ]', '_', name), to_agent_visible_cache_path(path)
+
+    @staticmethod
+    def _inbound_original_names(event: MessageEvent) -> dict[str, str]:
+        """``{path: original_name}`` for the attachments whose original name the adapter kept."""
+        names = getattr(event, "media_filenames", None) or []
+        return {p: n for p, n in zip(event.media_urls or [], names) if n}
 
     @classmethod
-    def _prepend_inbound_media_file_notes(cls, message_text: str, audio_file_paths: list[str], video_paths: list[str]) -> str:
+    def _prepend_inbound_media_file_notes(
+        cls, message_text: str, audio_file_paths: list[str], video_paths: list[str],
+        original_names: Optional[dict[str, str]] = None,
+    ) -> str:
         """Prepend a path-pointing note per audio-file / video attachment (content is not inlined)."""
+        names = original_names or {}
         for kind, noun, verb, tool, paths in (
             ("an audio file attachment", "audio", "transcribe or process", "a transcription or media tool", audio_file_paths),
             ("a video attachment", "video", "inspect or process", "a video analysis or media tool", video_paths),
         ):
             for _path in paths:
-                _display, _agent_path = cls._inbound_attachment_display_name(_path)
+                _display, _agent_path = cls._inbound_attachment_display_name(_path, names.get(_path, ""))
                 message_text = (
                     f"[The user sent {kind}: '{_display}'. "
                     f"It is saved at: {_agent_path}. "
@@ -1598,6 +1601,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
 
         _TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".log", ".json", ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg"}
         inline_flags = getattr(event, "media_text_inlined", None) or []
+        names = getattr(event, "media_filenames", None) or []
         for i, path in enumerate(event.media_urls):
             # A document mixed into a PHOTO/VOICE message (message-level type != DOCUMENT) still
             # reaches the agent; only genuine non-media files get a note.
@@ -1609,7 +1613,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
                 mtype = "text/plain" if _is_text else (_mimetypes.guess_type(path)[0] or "application/octet-stream")
             # Every accepted file gets a note — a non-text/non-application MIME (font/*, model/*)
             # must still tell the agent the file exists.
-            display_name, agent_path = cls._inbound_attachment_display_name(path)
+            display_name, agent_path = cls._inbound_attachment_display_name(
+                path, names[i] if i < len(names) else "")
             inline_flag = inline_flags[i] if i < len(inline_flags) else None
             context_note = _build_document_context_note(
                 display_name, agent_path, mtype, content_inlined=inline_flag is not False,
@@ -1710,7 +1715,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         expanded, refusal = await inbound_references(self, source, session_key, message_text)
         if refusal is None:
             return expanded
-        _adapter = self._delivery_adapter_for(source)
+        from gateway.bot_peer_notices import automatic_notices_allowed
+        _adapter = self._delivery_adapter_for(source) if automatic_notices_allowed(source) else None
         if _adapter:
             await _adapter.send(source.chat_id, refusal)
         return None
@@ -1738,7 +1744,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             message_text = await self._enrich_inbound_images(source, session_key, message_text, image_paths)
         if audio_paths:
             message_text = await self._enrich_inbound_voice(event, source, message_text, audio_paths)
-        message_text = self._prepend_inbound_media_file_notes(message_text, audio_file_paths, video_paths)
+        message_text = self._prepend_inbound_media_file_notes(
+            message_text, audio_file_paths, video_paths, self._inbound_original_names(event))
         message_text = self._prepend_inbound_document_notes(event, message_text)
         from gateway.session_context_refs import turn_references
         message_text = await turn_references(self, event, source, session_key, message_text)
@@ -1913,60 +1920,3 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             return await self._handle_message_with_effect_scope(event)
 
 
-    def _k8_admit_inbound(self, event: MessageEvent, source) -> Optional[str]:
-        """Record the K8 Signal for one inbound message, before anything reads it.
-
-        Returns None to continue, or the user-facing text to reply with when
-        admission failed — in which case the gateway must not run the turn.
-
-        Identity comes from the platform, never from the text. ``message_id``
-        (or Telegram's ``platform_update_id``) is what makes a redelivery of the
-        same message one Signal and two same-text messages two Signals. Armed
-        with no stable identity, this fails closed: minting an id would turn
-        every replay into a fresh input, which is the duplicate-Work bug.
-
-        The observation timestamp is left at ``OBSERVED_AT_UNKNOWN``. Only an
-        immutable upstream time may go there, and ``MessageEvent.timestamp``
-        defaults to ``datetime.now()`` at construction — so on a redelivery it
-        is a NEW value, which would fork the Signal. Passing the sentinel is the
-        truthful answer until a per-adapter platform time is plumbed through.
-        """
-        from agent.durable_admission import (
-            admit_input,
-            blocked_turn_result,
-            platform_event_id,
-            publish_pre_admission,
-        )
-
-        platform = getattr(getattr(source, "platform", None), "value", "") or "hermes"
-        raw_identity = getattr(event, "message_id", None)
-        if raw_identity in (None, ""):
-            raw_identity = getattr(event, "platform_update_id", None)
-        event_id = platform_event_id(platform, raw_identity)
-        session_id = self._session_key_for_source(source)
-
-        if not event_id:
-            logger.error(
-                "K8 armed but %s gave no stable message identity; refusing the "
-                "turn rather than minting one",
-                platform,
-            )
-            return (
-                "This message could not be recorded in the work ledger because "
-                "the platform did not supply a stable message identity. Nothing "
-                "has run."
-            )
-
-        outcome = admit_input(
-            session_id=session_id,
-            request_text=getattr(event, "text", "") or "",
-            event_id=event_id,
-        )
-        publish_pre_admission(outcome)
-        if outcome.mode_off or outcome.model_may_run:
-            return None
-        logger.warning(
-            "K8 refused inbound message (%s); the turn will not run",
-            outcome.reason_code,
-        )
-        return blocked_turn_result(self, outcome, None)["final_response"]

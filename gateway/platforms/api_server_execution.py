@@ -34,7 +34,7 @@ class APIServerExecutionMixin:
         already persisted: the transcript's unanswered tail row is adopted from ``conversation_history``
         as THIS turn's user message instead of being appended a second time
         (``agent.session_persistence.adopt_unanswered_turn``; #115325)."""
-        from gateway.platforms.api_server import (_ProviderAuthResolutionError, _api_request_browser_control_principal, _api_request_browser_control_transport_family, _api_request_profile, _api_runs, _clear_turn_process_ownership, _publish_turn_process_ownership, asyncio, logger, suppress, time, uuid)
+        from gateway.platforms.api_server import (_ProviderAuthResolutionError, _api_request_profile, _api_runs, _clear_turn_process_ownership, _publish_turn_process_ownership, asyncio, logger, suppress, time, uuid)
         if getattr(self.gateway_runner, "session_authority", None) is not None:
             from gateway.session_api_turn import run_api_turn
             return await run_api_turn(self, user_message=user_message, conversation_history=conversation_history,
@@ -54,8 +54,6 @@ class APIServerExecutionMixin:
         loop = asyncio.get_running_loop()
         # ContextVars do not follow run_in_executor threads: capture here, re-enter in _run().
         request_profile = _api_request_profile.get()
-        request_browser_control_principal = _api_request_browser_control_principal.get()
-        request_browser_control_transport_family = _api_request_browser_control_transport_family.get()
 
         def _run():
             from gateway.session_context import clear_session_vars
@@ -63,8 +61,6 @@ class APIServerExecutionMixin:
                 tokens = self._bind_api_server_session(
                     chat_id=session_id or "", session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "", profile=request_profile or "",
-                    browser_control_principal=request_browser_control_principal,
-                    browser_control_transport_family=request_browser_control_transport_family,
                     session_history_delivery=session_history_delivery)
                 agent = None
                 from agent.notification_presentation import notification_turn

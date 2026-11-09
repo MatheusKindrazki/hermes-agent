@@ -221,7 +221,7 @@ function handleToolComplete(ctx: GatewayEventContext): boolean {
     // Read before the upsert seals the part: only a completion that resolves
     // a still-pending call is a fresh production; a duplicate or replayed
     // completion may never re-offer a dismissed target.
-    const pendingProduction = !event.replayed && Boolean(toolCallOwnerMessageId(state?.messages ?? [], payload))
+    const pendingProduction = !event.replayed && Boolean(toolCallOwnerMessageId(state?.messages ?? [], payload, 'complete'))
 
     upsertToolCall(sessionId, toTodoPayload(payload) ?? payload, 'complete', event.type, occurredAt)
 

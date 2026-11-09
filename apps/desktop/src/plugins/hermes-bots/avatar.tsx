@@ -191,6 +191,11 @@ export function blobShapeString(seedPart: string, kind: string) {
   return seedPart ? `blobatar:${seedPart}` : 'blobatar'
 }
 
+/** *text* as an HTML attribute value: no quote or angle bracket in it ends the attribute or the tag. */
+function attributeText(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
 /** Inline blob face, preserving the tag used by the roster's PNG backfill. */
 function blobMarkup(shape: null | string | undefined, name: string, size: number, materialId: string, mood: FaceMood) {
   if (!blobatarSvg) {
@@ -230,7 +235,7 @@ function blobMarkup(shape: null | string | undefined, name: string, size: number
 
     return markup.replace(
       '<svg ',
-      `<svg data-hb-blob="1" data-hb-mood="${mood}" data-bot-face=` + JSON.stringify(name) + ' '
+      () => `<svg data-hb-blob="1" data-hb-mood="${mood}" data-bot-face="${attributeText(name)}" `
     )
   } catch {
     return null

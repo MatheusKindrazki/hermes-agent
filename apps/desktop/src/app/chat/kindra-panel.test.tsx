@@ -1,12 +1,14 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { afterEach, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 
 import { KindraPanel } from './kindra-panel'
-import { PANEL_ORIGIN, panelMessage } from './kindra-panel-protocol'
+import { PANEL_ORIGIN, PANEL_URL, panelMessage } from './kindra-panel-protocol'
+import { PANEL_ROUTE_KEY, readPanelRoute } from './kindra-panel-state'
 
 vi.mock('@/components/pane-shell/pane-visibility', () => ({ usePaneVisible: () => true }))
 const id = '11111111-2222-4333-8444-555555555555'
 const url = `https://mac-mini-de-matheus.tail0673c.ts.net:8520/conversations/${id}`
+beforeEach(() => { window.localStorage.removeItem(PANEL_ROUTE_KEY) })
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); vi.useRealTimers() })
 
 it('accepts only the embedded panel and canonical conversation paths', () => {
@@ -69,4 +71,40 @@ it('offers a retry when the panel cannot handshake and discards messages from th
   expect(screen.getByLabelText('Abrindo o Painel…')).toBeTruthy()
   act(() => window.dispatchEvent(new MessageEvent('message', { source: frame.contentWindow, origin: PANEL_ORIGIN, data: { type: 'kd-hello' } })))
   expect(screen.queryByLabelText('Abrindo o Painel…')).toBeNull()
+})
+
+it('remembers navigation across closing and a fresh mount without reloading the active frame', async () => {
+  const first = render(<KindraPanel />)
+  fireEvent.click(screen.getByRole('button', { name: /^Painel$/ }))
+  const frame = screen.getByTitle('Kindra Painel') as HTMLIFrameElement
+
+  const navigate = (hash: string, origin = PANEL_ORIGIN) => act(() => window.dispatchEvent(new MessageEvent('message', {
+    source: frame.contentWindow, origin, data: { type: 'kd-route', hash }
+  })))
+
+  navigate('#/tarefas')
+  expect(window.localStorage.getItem(PANEL_ROUTE_KEY)).toBe('#/tarefas')
+  expect(frame.getAttribute('src')).toBe(PANEL_URL + '#/plataforma')
+  navigate('#/untrusted', 'https://example.com')
+  navigate('https://example.com')
+  expect(readPanelRoute()).toBe('#/tarefas')
+  fireEvent.keyDown(frame, { key: 'Escape' })
+  await waitFor(() => expect(screen.queryByTitle('Kindra Painel')).toBeNull())
+  fireEvent.click(screen.getByRole('button', { name: /^Painel$/ }))
+  expect(screen.getByTitle('Kindra Painel').getAttribute('src')).toBe(PANEL_URL + '#/tarefas')
+  first.unmount()
+  render(<KindraPanel />)
+  fireEvent.click(screen.getByRole('button', { name: /^Painel$/ }))
+  expect(screen.getByTitle('Kindra Painel').getAttribute('src')).toBe(PANEL_URL + '#/tarefas')
+})
+
+it('uses the default for missing or invalid saved routes without overwriting storage on mount', () => {
+  for (const value of ['https://example.com', '#/bad?redirect=x', '#/' + 'x'.repeat(201)]) {
+    window.localStorage.setItem(PANEL_ROUTE_KEY, value)
+    const view = render(<KindraPanel />)
+    fireEvent.click(screen.getByRole('button', { name: /^Painel$/ }))
+    expect(screen.getByTitle('Kindra Painel').getAttribute('src')).toBe(PANEL_URL + '#/plataforma')
+    expect(window.localStorage.getItem(PANEL_ROUTE_KEY)).toBe(value)
+    view.unmount()
+  }
 })

@@ -7,6 +7,7 @@ import { Loader } from '@/components/ui/loader'
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 
 import { PANEL_HOST_URL, PANEL_ORIGIN, PANEL_URL, panelMessage } from './kindra-panel-protocol'
+import { readPanelRoute, rememberPanelRoute } from './kindra-panel-state'
 import { ExecutorConversation } from './parallel-executor-view'
 
 interface PanelFrameProps {
@@ -16,10 +17,10 @@ interface PanelFrameProps {
 
 function PanelFrame({ onConversation, onFocus }: PanelFrameProps) {
   const frame = useRef<HTMLIFrameElement>(null)
-  const [route, setRoute] = useState('#/plataforma')
+  const [route, setRoute] = useState(readPanelRoute)
   const [attempt, setAttempt] = useState(0)
   const [state, setState] = useState<'loading' | 'ready' | 'error'>('loading')
-  const [src, setSrc] = useState(PANEL_URL + '#/plataforma')
+  const [src, setSrc] = useState(() => PANEL_URL + route)
   useEffect(() => {
     let ready = false
 
@@ -36,10 +37,11 @@ function PanelFrame({ onConversation, onFocus }: PanelFrameProps) {
         setState('ready')
         guest?.postMessage({ type: 'kd-host', url: PANEL_HOST_URL }, PANEL_ORIGIN)
       } else if (message.type === 'conversation') {
-        if (message.hash) { setRoute(message.hash) }
+        if (message.hash) { setRoute(message.hash); rememberPanelRoute(message.hash) }
         onConversation(message.url)
       } else if (message.type === 'route') {
         setRoute(message.hash)
+        rememberPanelRoute(message.hash)
       } else {
         onFocus(message.on)
         guest?.postMessage({ type: 'kd-focus-state', on: message.on }, PANEL_ORIGIN)

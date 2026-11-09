@@ -18,6 +18,7 @@ test('opens the embedded panel and its conversation without losing the principal
   const sandbox = createSandbox('kindra-panel')
   const mock = await startMockServer()
   let app: MockBackendFixture['app'] | undefined
+
   try {
     writeMockProviderConfig(sandbox.hermesHome, mock.url)
     writeEnvFile(sandbox.hermesHome, 'e2e-key', mock.url)
@@ -26,11 +27,13 @@ test('opens the embedded panel and its conversation without losing the principal
     writeMockProviderConfig(profile, mock.url)
     writeEnvFile(profile, 'e2e-key', mock.url)
     const builder = await RealSessionBuilder.start(profile)
+
     try {
       await builder.createSession({ title: 'Bot Chat', turns: ['Hello alpha'] })
     } finally {
       await builder.close()
     }
+
     const launched = await launchDesktop(buildAppEnv(sandbox))
     app = launched.app
     const { page } = launched
@@ -40,6 +43,7 @@ test('opens the embedded panel and its conversation without losing the principal
         if (!url.endsWith('/conversations/' + conversationId)) {
           throw new Error('Unexpected fixture conversation')
         }
+
         return { kind: 'conversation', id: conversationId, title: 'Engenharia · teste', status: 'RUNNING', items: [{ role: 'agent', text: 'Conversa integrada em tempo real.', at: new Date().toISOString() }], fetchedAt: new Date().toISOString() }
       })
       ipcMain.removeHandler('hermes:parallel:send')
@@ -71,6 +75,13 @@ test('opens the embedded panel and its conversation without losing the principal
     await page.keyboard.press('Escape')
     await expect(page.getByRole('button', { name: 'Painel', exact: true })).toBeVisible()
     expect(page.url()).toBe(principal)
+    await page.getByRole('button', { name: 'Painel', exact: true }).click()
+    await expect(page.locator('iframe[title="Kindra Painel"]')).toHaveAttribute('src', origin + '/painel/#/conversa/' + id)
+    await page.keyboard.press('Escape')
+    await page.reload()
+    await expect(page.getByRole('button', { name: 'Painel', exact: true })).toBeVisible({ timeout: 60000 })
+    await page.getByRole('button', { name: 'Painel', exact: true }).click()
+    await expect(page.locator('iframe[title="Kindra Painel"]')).toHaveAttribute('src', origin + '/painel/#/conversa/' + id)
   } finally {
     await app?.close().catch(() => undefined)
     await mock.close()

@@ -1,4 +1,4 @@
-"""Cron delivery: target resolution (origin/home/explicit/bot-chat), transcript mirroring and
+"""Cron delivery: target resolution (origin/home/explicit/bot-chat/room), transcript mirroring and
 session seeding, live-adapter / relay / standalone send lanes, and ``_deliver_result``.
 
 Split out of ``cron.scheduler``. Import names from this module directly (``cron.scheduler`` only
@@ -612,6 +612,9 @@ def _resolve_single_delivery_target(
     origin = _resolve_origin(job)
     if deliver_value == "local":
         return None
+    room_address = parse_room_deliver_token(deliver_value)
+    if room_address is not None:
+        return resolve_room_target(job, room_address)
     # Must precede the generic platform:chat_id split so the profile name isn't parsed as chat_id.
     notify_profile = parse_bot_chat_notify_deliver_token(deliver_value)
     if notify_profile is not None:
@@ -962,8 +965,12 @@ def _send_media_via_adapter(
                 method, path_kw = "send_image_file", "image_path"
             else:
                 method, path_kw = "send_document", "file_path"
+            # The voice sender decides bubble vs music-file from ``is_voice`` (Telegram
+            # transcodes non-Opus only when it is set), matching the gateway dispatch
+            # in BasePlatformAdapter._send_one.
+            extra = {"is_voice": _is_voice} if method == "send_voice" else {}
             coro = getattr(adapter, method)(
-                chat_id=chat_id, metadata=metadata, **{path_kw: media_path})
+                chat_id=chat_id, metadata=metadata, **{path_kw: media_path}, **extra)
             future = safe_schedule_threadsafe(coro, loop)
             if future is None:
                 _note_target_error(
@@ -975,7 +982,12 @@ def _send_media_via_adapter(
             except TimeoutError:
                 future.cancel()
                 raise
-            if result and not getattr(result, "success", True):
+            raw = getattr(result, "raw_response", None)
+            if result and getattr(result, "success", False) and isinstance(raw, dict) and raw.get("ambiguous"):
+                # Sent but the ack was lost: possibly delivered, so never an error (a re-run
+                # would duplicate it); _live_send_media records the target as unverified.
+                job["_media_ack_lost"] = True
+            elif result and not getattr(result, "success", True):
                 _note_target_error(
                     job_ref,
                     f"media send failed for {media_path}: {getattr(result, 'error', 'unknown')}",
@@ -1379,7 +1391,8 @@ def _live_send_text(
 
 
 def _live_send_media(
-    t: _TargetDelivery, media_metadata: dict, media_files: list, delivery_errors: list) -> None:
+    t: _TargetDelivery, media_metadata: dict, media_files: list, delivery_errors: list,
+    unverified_targets: list) -> None:
     """Send extracted media as native attachments with the same routing as the text send."""
     routed_media_metadata = dict(media_metadata or {})
     if t.is_relay:
@@ -1394,6 +1407,8 @@ def _live_send_media(
         t.runtime_adapter, t.chat_id, media_files, routed_media_metadata or None, t.loop, t.job,
         platform=t.platform,
     )
+    if t.job.pop("_media_ack_lost", False) and t.where not in unverified_targets:
+        unverified_targets.append(t.where)
     # Surface per-file failures into run status: text delivered but attachment lost is not ok.
     for _me in _media_errors:
         delivery_errors.append(f"{_me} (target {t.where})")
@@ -1485,7 +1500,7 @@ def _deliver_via_live_adapter(
         # payload is already assumed delivered (#38922). Record the skipped attachments so the drop is
         # visible rather than silently lost.
         if adapter_ok and not timed_out and media_files:
-            _live_send_media(t, media_metadata, media_files, delivery_errors)
+            _live_send_media(t, media_metadata, media_files, delivery_errors, unverified_targets)
         elif timed_out and media_files:
             _note_target_error(
                 job,
@@ -1838,26 +1853,9 @@ def _deliver_result(
         _record_delivery_verification(job, [])
         return _unresolved_delivery_outcome(job, for_failure)
 
-    # Restart-safe workers have no live gateway adapters: hand the send back through a durable
-    # queue so the current or replacement gateway performs it with relay/E2EE parity. The execution
-    # id is the idempotency key (the queue never retries an uncertain claimed send). Match on THIS
-    # job's own attempt: a worker's script may dispatch another job in-process (`hermes cron run`),
-    # and that nested delivery must not be keyed under the outer execution id.
-    external_execution = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER", "")
-    if (external_execution and adapters is None
-            and external_execution == str(job.get("execution_id") or "")
-            and any(target["platform"] != BOT_CHAT_PLATFORM for target in targets)):
-        from cron.delivery_queue import enqueue_and_wait
-
-        _record_delivery_verification(job, [])
-        error = enqueue_and_wait(external_execution, job, content, for_failure=for_failure)
-        from cron.delivery_queue import get_status
-        delivery_status = get_status(external_execution)
-        if delivery_status and delivery_status["status"] == "suppressed":
-            job["_notification_all_targets_suppressed"] = True
-        from cron.jobs import get_job
-        refreshed = get_job(job["id"]) or {}
-        job["last_delivery_queued"] = refreshed.get("last_delivery_queued")
+    from cron.scheduler_delivery_external import maybe_queue_external_delivery
+    queued, error = maybe_queue_external_delivery(job, content, targets, adapters, for_failure)
+    if queued:
         return error
 
     from gateway.config import load_gateway_config
@@ -1925,21 +1923,11 @@ def _deliver_result(
             suppressed_targets += 1
             continue
         # Bot Chat owns admission; never concurrently resume a live owner's transcript.
-        if target["platform"] == BOT_CHAT_NOTIFY_PLATFORM:
-            error = _deliver_to_bot_chat_notify(job, content, target["chat_id"])
-            if error:
-                delivery_errors.append(error)
-            continue
-        if target["platform"] == BOT_CHAT_PLATFORM:
-            bot_chat_error = _deliver_to_bot_chat(job, content, target["chat_id"], for_failure=for_failure)
-            suppressed_targets += job.pop("_notification_all_targets_suppressed", False)
-            if bot_chat_error:
-                receipt_target = f"bot-chat:{target['chat_id'] or '(own)'}"
-                receipt = job.get("_bot_chat_delivery_receipts", {}).get(receipt_target)
-                if not receipt or receipt["status"] not in ("queued", "claimed"):
-                    delivery_errors.append(bot_chat_error)
-                if receipt and receipt["status"] == "ambiguous":
-                    unverified_targets.append(bot_chat_error)
+        from cron.scheduler_delivery_local import deliver_nonplatform_target
+        handled, suppressed = deliver_nonplatform_target(
+            job, content, cleaned_delivery_content, target, for_failure, delivery_errors, unverified_targets)
+        suppressed_targets += suppressed
+        if handled:
             continue
 
         if config is None and config_error is None:
@@ -1981,6 +1969,8 @@ def _deliver_result(
 # Late-bound origin namespace (see module docstring). Imported LAST so this module is fully
 # populated before ``scheduler`` re-exports from it.
 from cron import scheduler as _sched
+from cron.scheduler_delivery_room import (
+    ROOM_PLATFORM, deliver_to_room, parse_room_deliver_token, resolve_room_target)
 from cron import scheduler_delivery_origin as _origin
 from cron import scheduler_preflight as _preflight
 from cron import scheduler_script as _script
