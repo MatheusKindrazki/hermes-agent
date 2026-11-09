@@ -284,5 +284,5 @@ class GatewayWatchNotificationsMixin:
                 raise
             return False
         except Exception as e:
-            logger.error("Watch notification injection error: %s", e, exc_info=True)
+            logging.getLogger(__name__).error("Watch notification injection error: %s", e, exc_info=True)
             return False

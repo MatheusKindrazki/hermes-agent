@@ -4,7 +4,7 @@ Pure-data leaf module — must not import from hermes_cli.config. Comments are t
 docs of config.yaml.
 """
 
-from hermes_cli.config_defaults_auxiliary import _aux
+from hermes_cli.config_defaults_auxiliary import _aux, _operations_defaults, _session_defaults
 
 #: Image every container terminal backend (docker/modal/daytona, the singularity plugin) uses unless the
 #: user pins one. LEGACY_SANDBOX_IMAGES are the plain defaults that preceded the desktop stack
@@ -19,15 +19,7 @@ LEGACY_VERCEL_RUNTIME = "node24"  # the seeded pre-49 default, never a user choi
 
 
 DEFAULT_CONFIG = {
-    # Fork operational integrations are opt-in and scoped to the owning profile.
-    "operations": {
-        "shadow_receipt_dir": "",
-        "shadow_producer_enabled": False,
-        "tone_gate_bin": "",
-        "tone_schema_sha256": "",
-        "work_control_projection_enabled": False,
-        "work_control_projection_url": "",
-    },
+    **_operations_defaults(),
     "model": "",
     "providers": {},
     "fallback_providers": [],
@@ -53,12 +45,7 @@ DEFAULT_CONFIG = {
     # least-recently-active DETACHED sessions (no live client); reopening re-resumes from disk.
     # 0/null disables.
     "max_live_sessions": 16,
-    "session": {
-        # Per-terminal `hermes -c`: each CLI session writes a breadcrumb under
-        # $HERMES_HOME/terminal-sessions/<terminal-id>, so bare -c/--continue resumes THIS
-        # terminal's session (tmux/kitty/wezterm pane, tty). false = resume globally most-recent.
-        "terminal_continue": True,
-    },
+    "session": _session_defaults(),
     # Where the TUI/desktop gateway stages session file attachments (uploads, pasted
     # text). "hermes-home" (default) keeps <profile home>/attachments — the dir
     # container backends bind-mount, so @file: refs resolve in the sandbox (#76577).

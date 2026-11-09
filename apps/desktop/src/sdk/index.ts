@@ -26,7 +26,6 @@ import { mutateSessionFenced } from '@/api/sessions'
 import { PRIMARY_SESSION_VIEW } from '@/app/chat/session-view'
 import { openSession, type OpenSessionIntent } from '@/app/open-session'
 import { syncWorkspaceRoute } from '@/app/routes'
-import type { ClientSessionState } from '@/app/types'
 import {
   $newSessionTabAction,
   $paneVisible,
@@ -110,6 +109,7 @@ import type { SessionMutationSnapshot } from '../../../shared/src/session-http-m
 
 import { pluginDecisions, profiles, skills, toolsets } from './bridge'
 import { composerHost } from './composer'
+import { focusedTurnFlag } from './focused-turn-flag'
 import { i18nHost } from './i18n'
 import { planPluginOpenSession } from './plugin-open-session-plan'
 import { dropLeftoverProfilePrefs, warmProfile } from './profile-local'
@@ -142,16 +142,6 @@ const readonlyAtom = <T>(atomLike: ReadableAtom<T>): ReadableAtom<T> => atomLike
  * to the global draft atoms. Once a session TILE holds focus, the tile's own
  * state slice is authoritative — a background session can never leak in.
  */
-const focusedTurnFlag = (
-  select: (state: ClientSessionState) => boolean,
-  $primary: ReadableAtom<boolean>
-): ReadableAtom<boolean> =>
-  computed(
-    [$focusedStoredSessionId, $selectedStoredSessionId, $focusedSessionState, $primary],
-    (focused, selected, state, primary) =>
-      !focused || focused === selected ? primary : Boolean(state && select(state))
-  )
-
 const $focusedBusy = focusedTurnFlag(state => state.busy, PRIMARY_SESSION_VIEW.$busy)
 
 const $focusedAwaitingResponse = focusedTurnFlag(

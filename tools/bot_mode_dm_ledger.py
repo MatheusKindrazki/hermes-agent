@@ -1,6 +1,7 @@
 """Extracted bot mode dm ledger helpers."""
 from __future__ import annotations
 import contextlib
+import logging
 from pathlib import Path
 from typing import Any, Optional, Mapping
 
@@ -11,7 +12,6 @@ def _delivery_ledger_lock(idempotency_key: str):
     from tools.bot_mode_dm import (
         _delivery_ledger_path,
         fcntl,
-        logging,
         os,
         stat,
         time,

@@ -1,5 +1,6 @@
 """Extracted conversation failed turn helpers."""
 from __future__ import annotations
+import logging
 from typing import Any
 
 
@@ -11,7 +12,6 @@ def _failed_turn_display_metadata(agent, result: dict) -> dict:
     from agent.conversation_loop import (
         _FAILED_TURN_ERROR_MAX_CHARS,
         _redact_display_metadata,
-        logger,
     )
     from agent.error_surface import build_error_surface_from_result
 
@@ -20,7 +20,7 @@ def _failed_turn_display_metadata(agent, result: dict) -> dict:
             result, provider=agent.provider or "", model=agent.model or ""
         )
     except Exception:
-        logger.debug("failed-turn error surface unavailable", exc_info=True)
+        logging.getLogger(__name__).debug("failed-turn error surface unavailable", exc_info=True)
         surface = None
     error = str(result.get("error") or "").strip()[:_FAILED_TURN_ERROR_MAX_CHARS]
     metadata = {k: v for k, v in (("error", error), ("error_surface", surface)) if v}
@@ -75,7 +75,6 @@ def _close_durable_failed_turn(agent, result: Any) -> None:
         _failed_turn_display_metadata,
         append_message,
         failed_turn_notice,
-        logger,
     )
     try:
         if not isinstance(result, dict) or result.get("completed") is True:
@@ -103,5 +102,5 @@ def _close_durable_failed_turn(agent, result: Any) -> None:
         append_message(messages, boundary)
         agent._flush_messages_to_session_db(messages)
     except Exception:
-        logger.debug("failed-turn boundary not written", exc_info=True)
+        logging.getLogger(__name__).debug("failed-turn boundary not written", exc_info=True)
 

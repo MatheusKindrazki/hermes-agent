@@ -1923,34 +1923,11 @@ def _deliver_result(
             suppressed_targets += 1
             continue
         # Bot Chat owns admission; never concurrently resume a live owner's transcript.
-        if target["platform"] == BOT_CHAT_NOTIFY_PLATFORM:
-            error = _deliver_to_bot_chat_notify(job, content, target["chat_id"])
-            if error:
-                delivery_errors.append(error)
-            continue
-        if target["platform"] == BOT_CHAT_PLATFORM:
-            bot_chat_error = _deliver_to_bot_chat(job, content, target["chat_id"], for_failure=for_failure)
-            suppressed_targets += job.pop("_notification_all_targets_suppressed", False)
-            if bot_chat_error:
-                receipt_target = f"bot-chat:{target['chat_id'] or '(own)'}"
-                receipt = job.get("_bot_chat_delivery_receipts", {}).get(receipt_target)
-                if not receipt or receipt["status"] not in ("queued", "claimed"):
-                    delivery_errors.append(bot_chat_error)
-                if receipt and receipt["status"] == "ambiguous":
-                    unverified_targets.append(bot_chat_error)
-            continue
-        if target["platform"] == ROOM_PLATFORM:
-            room_error = deliver_to_room(job, content, target["chat_id"], for_failure=for_failure)
-            if room_error:
-                delivery_errors.append(room_error)
-            continue
-        if target["platform"] == "local":
-            from gateway.session_cron import deliver_to_local_chat
-            from hermes_constants import get_hermes_home
-            local_error = deliver_to_local_chat(get_hermes_home(), target["chat_id"],
-                                                cleaned_delivery_content, diagnostic=for_failure)
-            if local_error:
-                delivery_errors.append(local_error)
+        from cron.scheduler_delivery_local import deliver_nonplatform_target
+        handled, suppressed = deliver_nonplatform_target(
+            job, content, cleaned_delivery_content, target, for_failure, delivery_errors, unverified_targets)
+        suppressed_targets += suppressed
+        if handled:
             continue
 
         if config is None and config_error is None:

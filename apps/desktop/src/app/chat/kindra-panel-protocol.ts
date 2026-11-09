@@ -11,6 +11,10 @@ export type PanelMessage =
   | { type: 'route'; hash: string }
   | { type: 'focus'; on: boolean }
 
+export function isPanelRoute(value: unknown): value is string {
+  return typeof value === 'string' && /^#\/[\w/-]{0,200}$/.test(value)
+}
+
 export function panelMessage(event: Pick<MessageEvent, 'origin' | 'source' | 'data'>, guest: Window | null): PanelMessage | null {
   if (!guest || event.origin !== PANEL_ORIGIN || event.source !== guest) {
     return null
@@ -32,7 +36,7 @@ export function panelMessage(event: Pick<MessageEvent, 'origin' | 'source' | 'da
     return match ? { type: 'conversation', url: `${CONVERSATION_ORIGIN}/conversations/${match[1]}` } : null
   }
 
-  if (data.type === 'kd-route' && 'hash' in data && typeof data.hash === 'string' && /^#\/[\w/-]{0,200}$/.test(data.hash)) {
+  if (data.type === 'kd-route' && 'hash' in data && isPanelRoute(data.hash)) {
     const path = data.hash.replace(/^#\/(conversa|estudio)\//, '/conversations/')
     const conversation = CONVERSATION_PATH.exec(path)
 

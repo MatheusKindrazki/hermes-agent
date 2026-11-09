@@ -31,6 +31,7 @@ from typing import Dict, Any, Literal, Optional, List, Tuple, Set
 import hermes_yaml as yaml
 
 from hermes_cli.cli_output import line_input
+from hermes_cli.config_key_path import _split_key_path
 from hermes_cli.colors import Colors, color
 from hermes_cli import managed_scope
 from hermes_cli.default_soul import DEFAULT_SOUL_MD, is_legacy_template_soul
@@ -641,33 +642,6 @@ def get_missing_env_vars(required_only: bool = False) -> list[dict[str, Any]]:
         for table, is_required in groups
         for var_name, info in table.items()
         if not get_env_value(var_name)]
-
-
-def _split_key_path(key: str) -> list[str]:
-    """Split a dotted config-key path, honoring backslash-escaped dots (``a\\.b`` -> ``a.b``).
-    Backslashes before any other character are preserved verbatim.
-
-    ``hermes config set`` uses ``.`` as the nesting separator, so a key that itself contains a literal dot
-    (e.g. provider names like ``qwen3.5-397b-wafer``) was silently split into bogus nested segments
-    (#84064).
-    """
-    parts: list[str] = []
-    current: list[str] = []
-    i = 0
-    while i < len(key):
-        ch = key[i]
-        if ch == "\\" and key[i + 1:i + 2] == ".":
-            current.append(".")
-            i += 2
-            continue
-        if ch == ".":
-            parts.append("".join(current))
-            current = []
-        else:
-            current.append(ch)
-        i += 1
-    parts.append("".join(current))
-    return parts
 
 
 def _greedy_literal_match(container: dict, parts: list) -> Optional[tuple[str, int]]:
