@@ -39,15 +39,15 @@ export type InterfaceMode = 'advanced' | 'simple'
 /** Picker order — the quiet option first. */
 export const INTERFACE_MODES: readonly InterfaceMode[] = ['simple', 'advanced']
 
-export const DEFAULT_INTERFACE_MODE: InterfaceMode = 'advanced'
+export const DEFAULT_INTERFACE_MODE: InterfaceMode = 'simple'
 
 const INTERFACE_MODE_STORAGE_KEY = 'hermes.desktop.interfaceMode.v1'
 
-// Advanced is the ABSENCE of a mode: encoded as "no key" so a user who never
-// touched the picker never gains a record, and clearing the key means Advanced.
+// Kindra starts with conversations, not developer panes. Persist both choices
+// explicitly so a later default change cannot reinterpret a user selection.
 const modeCodec: Codec<InterfaceMode> = {
-  decode: raw => (raw === 'simple' ? 'simple' : DEFAULT_INTERFACE_MODE),
-  encode: mode => (mode === DEFAULT_INTERFACE_MODE ? null : mode)
+  decode: raw => (raw === 'advanced' || raw === 'simple' ? raw : DEFAULT_INTERFACE_MODE),
+  encode: mode => mode
 }
 
 export const $interfaceMode = persistentAtom<InterfaceMode>(
@@ -116,9 +116,9 @@ const SIMPLE_POLICY: PolicyTable = {
   reviewOpen: false,
   // What was said and when — cost, tokens, PR and profile chips are readouts.
   sidebarRowMeta: ['preview', 'updated'],
-  // The bar carries the free tier's Sign in chip, the one standing way in to a
-  // sign-in, and onboarding's account progress. It rests hidden otherwise.
-  statusbarVisible: context => context.freeTierSignInOpen || context.onboardingOpen,
+  // Account state must not bring technical chrome back into Kindra's simple
+  // layout. Account and onboarding controls remain available in Settings.
+  statusbarVisible: false,
   terminalOpen: false,
   // Product summaries; the technical payload view is the instrumentation itself.
   toolViewMode: 'product'
