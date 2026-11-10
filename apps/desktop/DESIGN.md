@@ -630,3 +630,12 @@ The detailed state contract lives in the scoped
 - [ ] `cursor-pointer`, focus ring, and `Esc`-to-close behave?
 - [ ] Touched a primitive, token, or variant? Its named-contract entry in this
       file is updated in the same change.
+
+## Kindra conversation layout
+
+Kindra defaults to Simple mode. Both mode choices are persisted explicitly, so
+updates must not reinterpret an existing selection. Simple mode keeps the status
+bar hidden even when account or onboarding state changes; those flows retain
+their controls in Settings. Preserve legacy whole-bar visibility preferences
+when upgrading storage keys. Cover upgrades and reloads before changing this
+contract.

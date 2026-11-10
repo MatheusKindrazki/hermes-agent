@@ -7,15 +7,16 @@ const loadStore = () => import('./statusbar-prefs')
 describe('statusbar whole-bar visibility', () => {
   beforeEach(() => {
     window.localStorage.clear()
+    window.localStorage.setItem('hermes.desktop.interfaceMode.v1', 'advanced')
     vi.resetModules()
   })
 
-  it('shows the bar on a fresh install and for installs that hid it under the v1 key', async () => {
+  it('preserves a hidden footer from the previous version', async () => {
     window.localStorage.setItem(LEGACY_VISIBLE_KEY, 'false')
 
     const { $statusbarVisible } = await loadStore()
 
-    expect($statusbarVisible.get()).toBe(true)
+    expect($statusbarVisible.get()).toBe(false)
   })
 
   it('still honours a hide made after the update', async () => {
@@ -34,6 +35,7 @@ describe('statusbar whole-bar visibility', () => {
 describe('statusbar hidden items', () => {
   beforeEach(() => {
     window.localStorage.clear()
+    window.localStorage.setItem('hermes.desktop.interfaceMode.v1', 'advanced')
     vi.resetModules()
   })
 
