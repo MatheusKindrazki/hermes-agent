@@ -44,12 +44,18 @@ def swap_fixture(tmp_path, monkeypatch):
     )
     # The child opens its cwd handle during its own startup: wait for it before asserting the lock.
     assert helper.stdout.readline().strip() == "ready"
+    # Windows venv launchers leave their interpreter child running when only
+    # the launcher is killed. Reap both so later PID reuse cannot attach an
+    # orphan from an earlier test to a new helper's process tree.
+    helper_tree = [psutil.Process(helper.pid), *psutil.Process(helper.pid).children(recursive=True)]
     try:
         yield desktop_dir, staging, live_root, helper
     finally:
-        if helper.poll() is None:
-            helper.kill()
-            helper.wait(10)
+        for proc in reversed(helper_tree):
+            with contextlib.suppress(psutil.NoSuchProcess):
+                proc.kill()
+        psutil.wait_procs(helper_tree, timeout=10)
+        helper.wait(10)
 
 
 def _promote(desktop_dir: Path, staging: Path) -> tuple[Path | None, str]:
