@@ -1,7 +1,9 @@
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { MemoryRouter } from 'react-router'
+import { beforeEach as configureAdvancedMode } from 'vitest'
 import { afterEach, expect, it, vi } from 'vitest'
 
+import { setInterfaceMode as selectTestMode } from '@/store/interface-mode'
 import { $subagentsBySession, upsertSubagent } from '@/store/subagents'
 
 import { ComposerStatusStack } from './index'
@@ -96,3 +98,6 @@ it('retires the live frame only after every child settles, without depending on 
   act(() => upsertSubagent('owner', { subagent_id: 'child', status: 'completed' }, false, 'subagent.complete'))
   expect(screen.queryByText('Live task')).toBeNull()
 })
+
+// This suite exercises controls available in Advanced mode.
+configureAdvancedMode(() => selectTestMode('advanced'))

@@ -1,7 +1,9 @@
 import type { ThreadMessage } from '@assistant-ui/react'
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { beforeEach as configureAdvancedMode } from 'vitest'
 import { afterEach, beforeEach, expect, it } from 'vitest'
 
+import { setInterfaceMode as selectTestMode } from '@/store/interface-mode'
 import { $hideCodeDiffs, $toolDisclosureStates, setHideCodeDiffs, setToolViewMode } from '@/store/tool-view'
 
 import { assistantMessage, stubThreadEnvironment, stubThreadViewportSize, ThreadRuntime } from '../test-utils'
@@ -95,3 +97,6 @@ it('still discloses failed edits when code diffs are hidden', async () => {
   expect(await screen.findByText('File is read-only')).toBeTruthy()
   expect(container.textContent).not.toContain('afterEdit')
 })
+
+// This suite exercises controls available in Advanced mode.
+configureAdvancedMode(() => selectTestMode('advanced'))

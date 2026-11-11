@@ -453,7 +453,9 @@ class GatewayTurnPersistenceMixin:
             if queued:
                 self._session_state(session_key).conversation.queued_events.extend(queued)
             if new_entry is not None:
-                if event is not None:
+                # Canonical local admissions already retain the failed input durably.
+                # Replaying it into the fresh transcript can overflow every later DM.
+                if event is not None and getattr(source, "platform", None) != Platform.LOCAL:
                     await self._persist_compression_handoff(
                         new_entry, event=event,
                         content=handoff_content if handoff_content is not None else event.text,

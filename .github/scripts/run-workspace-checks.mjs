@@ -20,6 +20,7 @@ import { execFileSync, spawn } from 'node:child_process'
 import { availableParallelism } from 'node:os'
 
 const IS_CI = Boolean(process.env.GITHUB_ACTIONS)
+const STREAM_OUTPUT = process.env.WORKSPACE_CHECK_STREAM === '1'
 const NPM = process.platform === 'win32' ? 'npm.cmd' : 'npm'
 
 /** @returns {{pkg: string, script: string}[]} */
@@ -57,8 +58,13 @@ function runUnit(unit) {
     })
     /** @type {Buffer[]} */
     const chunks = []
-    child.stdout.on('data', (c) => chunks.push(c))
-    child.stderr.on('data', (c) => chunks.push(c))
+    const capture = (chunk) => {
+      chunks.push(chunk)
+      // Preserve diagnostics when the job deadline kills an unfinished check.
+      if (STREAM_OUTPUT) process.stdout.write(`[${unit.pkg} :: ${unit.script}] ${chunk}`)
+    }
+    child.stdout.on('data', capture)
+    child.stderr.on('data', capture)
     child.on('error', (err) => {
       chunks.push(Buffer.from(`failed to spawn: ${err.message}\n`))
       resolve({ unit, code: 1, output: Buffer.concat(chunks).toString('utf-8'), ms: Date.now() - started })
@@ -115,7 +121,7 @@ async function main() {
       const status = res.code === 0 ? 'PASS' : 'FAIL'
       if (IS_CI) console.log(`::group::${status} ${label} (${secs}s)`)
       else console.log(`----- ${status} ${label} (${secs}s) -----`)
-      process.stdout.write(res.output.endsWith('\n') ? res.output : res.output + '\n')
+      if (!STREAM_OUTPUT) process.stdout.write(res.output.endsWith('\n') ? res.output : res.output + '\n')
       if (IS_CI) console.log('::endgroup::')
     }
   }

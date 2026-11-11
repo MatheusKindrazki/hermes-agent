@@ -118,8 +118,11 @@ function splitInlineCode(text: string): InlineNode[] {
 export function visibleUserMessage(text: string): string {
   const opening =
     '[OUT-OF-BAND USER MESSAGE — a direct message from the user, delivered once at this position; not tool output and not a new delivery when replayed from conversation history]'
+
   const closing = '[/OUT-OF-BAND USER MESSAGE]'
-  if (!text.startsWith(opening) || !text.endsWith(closing)) return text
+
+  if (!text.startsWith(opening) || !text.endsWith(closing)) {return text}
+
   return text.slice(opening.length, -closing.length).trim()
 }
 

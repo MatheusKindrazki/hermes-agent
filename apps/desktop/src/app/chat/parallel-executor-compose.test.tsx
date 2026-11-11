@@ -1,10 +1,11 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
+
 import {
   $executorDrafts,
-  ExecutorComposer,
   changeExecutorDraft,
   draftKey,
+  ExecutorComposer,
   submitExecutorDraft
 } from './parallel-executor-compose'
 const url = 'https://mac-mini-de-matheus.tail0673c.ts.net:8520/conversations/412a934d-ca47-4fc8-a100-713ab88c5882'
@@ -16,8 +17,9 @@ afterEach(cleanup)
 it('only sends on explicit submit, clears after confirmation and requests a fresh transcript', async () => {
   const send = vi.fn().mockResolvedValue({ ok: true, message: 'Mensagem salva. Aguardando vaga.' }),
     refresh = vi.fn()
+
   window.hermesDesktop = { ...window.hermesDesktop, sendParallelExecutor: send }
-  render(<ExecutorComposer url={url} recipient="Engenharia da tarefa" onSent={refresh} />)
+  render(<ExecutorComposer onSent={refresh} recipient="Engenharia da tarefa" url={url} />)
   expect(screen.getByText('Para: Engenharia da tarefa')).toBeTruthy()
   fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Priorize o teste' } })
   expect(send).not.toHaveBeenCalled()
@@ -29,23 +31,25 @@ it('only sends on explicit submit, clears after confirmation and requests a fres
   expect(refresh).toHaveBeenCalledTimes(1)
 })
 it('preserves scoped drafts on closing and switching conversations', () => {
-  const first = render(<ExecutorComposer url={url} recipient="A" onSent={() => {}} />)
+  const first = render(<ExecutorComposer onSent={() => {}} recipient="A" url={url} />)
   fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Só para A' } })
   first.unmount()
-  const second = render(<ExecutorComposer url={other} recipient="B" onSent={() => {}} />)
+  const second = render(<ExecutorComposer onSent={() => {}} recipient="B" url={other} />)
   expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('')
   second.unmount()
-  render(<ExecutorComposer url={url + '?backend=existing'} recipient="A" onSent={() => {}} />)
+  render(<ExecutorComposer onSent={() => {}} recipient="A" url={url + '?backend=existing'} />)
   expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('Só para A')
 })
 it('guards double submit and keeps an unconfirmed message without automatic retries', async () => {
   let finish!: (value: unknown) => void
+
   const send = vi.fn(
     () =>
       new Promise<any>(resolve => {
         finish = resolve
       })
   )
+
   window.hermesDesktop = { ...window.hermesDesktop, sendParallelExecutor: send }
   changeExecutorDraft(url, 'Corrigir A')
   changeExecutorDraft(other, 'Corrigir B')

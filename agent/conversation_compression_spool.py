@@ -341,7 +341,7 @@ class DurableCompressionTurnSpool:
                 import subprocess
 
                 boot = subprocess.check_output(
-                    ["sysctl", "-n", "kern.boottime"], text=True, timeout=5
+                    ["sysctl", "-n", "kern.boottime"], text=True, timeout=5, stdin=subprocess.DEVNULL
                 ).strip()
             except Exception:
                 logging.getLogger(__name__).debug('DurableCompressionTurnSpool._process_liveness: optional operation failed', exc_info=True)
@@ -357,7 +357,7 @@ class DurableCompressionTurnSpool:
                 import subprocess
 
                 start = subprocess.check_output(
-                    ["ps", "-o", "lstart=", "-p", str(pid_int)], text=True, timeout=5
+                    ["ps", "-o", "lstart=", "-p", str(pid_int)], text=True, timeout=5, stdin=subprocess.DEVNULL
                 ).strip()
             except Exception:
                 logging.getLogger(__name__).debug('DurableCompressionTurnSpool._process_liveness: optional operation failed', exc_info=True)
@@ -801,13 +801,12 @@ def drain_compression_turns_into_agent(
         ) or already_live
         if not already_durable:
             persisted_id = next(iter(sorted(original_ids)), spool_dedupe_id)
-            session_db.append_message(
-                live_tip,
-                str(message.get("role") or "user"),
-                message.get("content"),
-                platform_message_id=persisted_id,
-                timestamp=message.get("timestamp"),
-            )
+            session_db.append_messages_batch(live_tip, [{
+                "role": str(message.get("role") or "user"),
+                "content": message.get("content"),
+                "platform_message_id": persisted_id,
+                "timestamp": message.get("timestamp"),
+            }])
         if not already_live:
             message["_compression_spool_turn_id"] = turn_id
             message["_db_persisted"] = True

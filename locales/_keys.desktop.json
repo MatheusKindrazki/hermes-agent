@@ -1,6 +1,16 @@
 {
   "surface": "desktop",
   "keys": [
+    "activeContext.chat",
+    "activeContext.detail",
+    "activeContext.newChat",
+    "activeContext.ownerKnown",
+    "activeContext.ownerUnknown",
+    "activeContext.text",
+    "activeContext.thisChat",
+    "activeContext.unknownDevice",
+    "activeContext.unknownProfile",
+    "activeContext.unknownTenant",
     "agents.activeCount",
     "agents.ageDays",
     "agents.ageHours",

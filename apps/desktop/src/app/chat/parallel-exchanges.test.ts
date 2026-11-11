@@ -1,11 +1,15 @@
 import { expect, it } from 'vitest'
+
 import type { ChatMessage } from '@/lib/chat-messages'
+
 import { agentExchanges } from './parallel-exchanges'
+
 const msg = (id: string, role: 'user' | 'assistant', text: string): ChatMessage => ({
   id,
   role,
   parts: [{ type: 'text', text }]
 })
+
 it('shows incoming messages and their replies but does not classify a human answer as an agent exchange', () => {
   expect(
     agentExchanges([
@@ -30,6 +34,7 @@ it('keeps an answer to our dispatch separate from the report back to the user', 
       }
     ]
   }
+
   expect(
     agentExchanges([
       dispatch,

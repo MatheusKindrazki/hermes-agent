@@ -209,7 +209,7 @@ class TestMediaExtraction:
 
     def test_gateway_auto_append_ignores_media_examples_in_skill_docs(self):
         """Skill/documentation examples must not be appended as real attachments."""
-        from gateway.run import _collect_auto_append_media_tags
+        from gateway.run_media_history import _collect_auto_append_media_tags
 
         messages = [
             {"role": "user", "content": "How should I format gateway media?"},
@@ -248,7 +248,7 @@ caption
         fallback rescans full history, finds the generated path absent from
         the dedup set, and re-emits the same MEDIA tag every turn.
         """
-        from gateway.run import _collect_history_media_paths
+        from gateway.run_media_history import _collect_history_media_paths
 
         history = [
             {"role": "user", "content": "make a cat"},
@@ -344,7 +344,7 @@ caption
         """End-to-end of the #46627 fix: collect history paths, then the
         compression-fallback rescan (history_offset stale) must dedup the
         generated image against them — no re-emission."""
-        from gateway.run import (
+        from gateway.run_media_history import (
             _collect_auto_append_media_tags,
             _collect_history_media_paths,
         )

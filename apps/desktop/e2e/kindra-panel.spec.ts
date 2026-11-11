@@ -9,6 +9,7 @@ import { RealSessionBuilder } from './real-session-builder'
 import { expect, test } from './test'
 
 const origin = 'https://mac-mini-de-matheus.tail0673c.ts.net:8525'
+const panelLink = 'https://mac-mini-de-matheus.tail0673c.ts.net:8520/extensions/kindra-painel/painel#/producao'
 const id = '11111111-2222-4333-8444-555555555555'
 
 // Actual renderer and isolated gateway; the panel and executor content are fixtures.
@@ -16,7 +17,7 @@ const id = '11111111-2222-4333-8444-555555555555'
 test('opens the embedded panel and its conversation without losing the principal chat', async () => {
   test.setTimeout(180_000)
   const sandbox = createSandbox('kindra-panel')
-  const mock = await startMockServer()
+  const mock = await startMockServer({ replyForPrompt: () => '[Ver produção](' + panelLink + ')' })
   let app: MockBackendFixture['app'] | undefined
 
   try {
@@ -29,7 +30,7 @@ test('opens the embedded panel and its conversation without losing the principal
     const builder = await RealSessionBuilder.start(profile)
 
     try {
-      await builder.createSession({ title: 'Bot Chat', turns: ['Hello alpha'] })
+      await builder.createSession({ title: 'Bot Chat', turns: ['Confira a produção: ' + panelLink] })
     } finally {
       await builder.close()
     }
@@ -59,7 +60,9 @@ test('opens the embedded panel and its conversation without losing the principal
     await row.click()
     await expect(page.getByRole('button', { name: 'Painel', exact: true })).toBeVisible({ timeout: 60000 })
     const principal = page.url()
-    await page.getByRole('button', { name: 'Painel', exact: true }).click()
+    await page.getByRole('link', { name: /Ver produção/ }).click()
+    await expect(page.locator('iframe[title="Kindra Painel"]')).toHaveAttribute('src', origin + '/painel/#/producao')
+    expect(page.url()).toBe(principal)
     const panel = page.frameLocator('iframe[title="Kindra Painel"]')
     await expect(panel.getByRole('heading', { name: 'Plataforma de teste' })).toBeVisible()
     expect(await panel.locator('body').evaluate(() => 'hermesDesktop' in window)).toBe(false)

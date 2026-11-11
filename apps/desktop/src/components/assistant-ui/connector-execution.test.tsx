@@ -1,6 +1,7 @@
+import type { ToolCallMessagePartProps } from '@assistant-ui/react'
 import { cleanup, render } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { ToolCallMessagePartProps } from '@assistant-ui/react'
+
 import { ConnectorExecution } from './connector-tool'
 
 vi.mock('@/components/assistant-ui/tool/fallback', () => ({
@@ -8,6 +9,7 @@ vi.mock('@/components/assistant-ui/tool/fallback', () => ({
 }))
 afterEach(cleanup)
 const args = { hermes_tool_labels: [{ app: 'delivery', text: 'Delivery', name: 'ask', kind: 'tool' }] }
+
 function props(result: unknown, isError = false): ToolCallMessagePartProps {
   return {
     args,
@@ -23,6 +25,7 @@ function props(result: unknown, isError = false): ToolCallMessagePartProps {
     respondToApproval: vi.fn()
   } as ToolCallMessagePartProps
 }
+
 describe('execution disclosure', () => {
   it('collapses successful calls with details available', () => {
     const { container } = render(<ConnectorExecution {...props({ ok: true })} />)

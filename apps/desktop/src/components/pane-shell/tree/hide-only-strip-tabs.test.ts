@@ -1,6 +1,8 @@
+import { beforeEach as configureAdvancedMode } from 'vitest'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { registry } from '@/contrib/registry'
+import { setInterfaceMode as selectTestMode } from '@/store/interface-mode'
 
 import { allPaneIds, group, split } from './model'
 import {
@@ -132,3 +134,6 @@ describe('hide-only strip tabs', () => {
     expect(allPaneIds($layoutTree.get()!)).not.toContain('session-tile:x')
   })
 })
+
+// This suite exercises controls available in Advanced mode.
+configureAdvancedMode(() => selectTestMode('advanced'))

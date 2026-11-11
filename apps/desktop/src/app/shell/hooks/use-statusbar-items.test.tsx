@@ -416,17 +416,17 @@ describe('free-tier Sign in in every interface mode', () => {
     setInterfaceMode('advanced')
   })
 
-  it.each(INTERFACE_MODES)('shows the Sign in chip to a signed-out free-tier user in %s mode', mode => {
+  it.each(INTERFACE_MODES)('keeps account chrome behind the selected interface mode (%s)', mode => {
     setInterfaceMode(mode)
     $freeTierStatus.set(freeTier(true))
 
-    expect(signInChipVisible()).toBe(true)
+    expect(signInChipVisible()).toBe(mode === 'advanced')
   })
 
-  it('lets Simple rest the bar again once the user has signed in', () => {
+  it('keeps the Simple bar hidden before and after sign-in', () => {
     setInterfaceMode('simple')
     $freeTierStatus.set(freeTier(true))
-    expect($statusbarVisible.get()).toBe(true)
+    expect($statusbarVisible.get()).toBe(false)
 
     $freeTierStatus.set(freeTier(false))
     expect($statusbarVisible.get()).toBe(false)

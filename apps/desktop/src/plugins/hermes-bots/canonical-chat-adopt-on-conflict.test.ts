@@ -1,3 +1,4 @@
+import type * as HermesSdk from '@hermes/plugin-sdk'
 /**
  * ADOPT-BEFORE-MINT (#92473 part 2).
  *
@@ -11,7 +12,6 @@
  *
  * Ported from tests/canonical-chat-adopt-on-conflict.test.mjs.
  */
-
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { RosterRow } from './types'
@@ -23,7 +23,8 @@ const { hostMock, persistMock, requestForBotMock, saveBotMetaMock } = vi.hoisted
   saveBotMetaMock: vi.fn()
 }))
 
-vi.mock('@hermes/plugin-sdk', () => ({
+vi.mock('@hermes/plugin-sdk', async importOriginal => ({
+  ...await importOriginal<typeof HermesSdk>(),
   BOT_CHAT_SESSION_HYDRATION_TIMEOUT_MS: 15_000,
   host: hostMock
 }))

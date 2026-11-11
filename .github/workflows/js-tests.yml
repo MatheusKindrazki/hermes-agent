@@ -15,7 +15,9 @@ jobs:
     # One standard hosted job installs once. vitest, tsc and eslint each size
     # their own worker pool from the core count.
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # The full UI suite is still progressing after 30 minutes on hosted runners.
+    # Keep every check and allow time for the complete suite plus setup.
+    timeout-minutes: 60
     steps:
       - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
         with:
@@ -111,6 +113,8 @@ jobs:
       # not an empty run, because an empty run reports green after it checks
       # nothing.
       - name: Run all workspace checks
+        env:
+          WORKSPACE_CHECK_STREAM: '1'
         run: node .github/scripts/run-workspace-checks.mjs
       - name: Check the checkout is clean
         # Last step of every job (tests/ci/test_clean_worktree_check.py): a test or CI step that

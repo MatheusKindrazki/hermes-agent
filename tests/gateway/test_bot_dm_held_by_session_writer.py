@@ -102,7 +102,7 @@ async def _send(held, text):
     """``message_agent``'s local send: pin the intent, then call the owner's door."""
     from tools import bot_mode_dm
     raw = await asyncio.to_thread(bot_mode_dm._start_delivery, ['hermes', '-p', 'default'], text, '@default',
-                                  stdin_file=False, task_id=None, agent=None, profile_home=held.home)
+                                  stdin_file=False, task_id=None, agent=SimpleNamespace(session_id="source-chat", _session_db=held.db), profile_home=held.home)
     return json.loads(raw)
 
 

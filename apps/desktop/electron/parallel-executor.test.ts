@@ -1,9 +1,11 @@
 import { expect, it, vi } from 'vitest'
+
 import { createExecutorReader, createExecutorSender, executorReference } from './parallel-executor'
 const base = 'https://mac-mini-de-matheus.tail0673c.ts.net'
 it('refuses arbitrary hosts, credentials, ports, paths and invalid IDs before fetching', async () => {
   const fetcher = vi.fn()
   const read = createExecutorReader(fetcher)
+
   for (const url of [
     'https://evil.test/acompanhar/personal/kd-abcdef',
     base + ':8525/api/panel/resolve',
@@ -11,7 +13,8 @@ it('refuses arbitrary hosts, credentials, ports, paths and invalid IDs before fe
     base + ':8526/acompanhar/personal/kd-abcdef',
     'https://x@mac-mini-de-matheus.tail0673c.ts.net:8525/acompanhar/personal/kd-abcdef'
   ])
-    await expect(read(url)).rejects.toThrow()
+    {await expect(read(url)).rejects.toThrow()}
+
   expect(fetcher).not.toHaveBeenCalled()
 })
 it('filters both task ID and front and coalesces snapshots', async () => {
@@ -28,6 +31,7 @@ it('filters both task ID and front and coalesces snapshots', async () => {
         { headers: { 'content-type': 'application/json', 'last-modified': 'Thu, 29 Oct 2026 18:00:00 GMT' } }
       )
   )
+
   const read = createExecutorReader(fetcher)
   const result = await read(base + ':8525/acompanhar/personal/kd-abcdef')
   expect(result.task.title).toBe('This task')
@@ -60,6 +64,7 @@ it('sends exactly the chosen conversation and text once and preserves a queued r
         headers: { 'content-type': 'application/json' }
       })
   )
+
   const receipt = await createExecutorSender(fetcher)(conversationUrl, '  Corrija o rumo: primeiro validar o escopo.  ')
   expect(receipt).toEqual({ ok: true, message: 'Mensagem salva. Aguardando vaga.' })
   expect(fetcher).toHaveBeenCalledTimes(1)
@@ -79,13 +84,15 @@ it('sends exactly the chosen conversation and text once and preserves a queued r
 it('rejects tasks, arbitrary hosts, blank or oversized messages without any request', async () => {
   const fetcher = vi.fn()
   const send = createExecutorSender(fetcher)
+
   for (const [url, text] of [
     [base + ':8525/acompanhar/personal/kd-abcdef', 'message'],
     ['https://evil.test/conversations/412a934d-ca47-4fc8-a100-713ab88c5882', 'message'],
     [conversationUrl, '  '],
     [conversationUrl, 'a'.repeat(20001)]
   ])
-    await expect(send(url, text)).rejects.toThrow()
+    {await expect(send(url, text)).rejects.toThrow()}
+
   expect(fetcher).not.toHaveBeenCalled()
 })
 it('never retries an ambiguous send or claims success from a failed response', async () => {

@@ -17,6 +17,7 @@ vi.mock('./composer/status-stack/subagent-transcript', () => ({
   )
 }))
 import { $subagentsBySession } from '@/store/subagents'
+
 import { ParallelActivity } from './parallel-activity'
 
 beforeEach(() => {

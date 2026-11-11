@@ -44,6 +44,7 @@ describe('enforced dock (stacked Bots pane → sessions-zone tab, every boot)', 
 
   beforeEach(() => {
     window.localStorage.clear()
+    window.localStorage.setItem('hermes.desktop.interfaceMode.v1', 'advanced')
     vi.resetModules()
   })
 

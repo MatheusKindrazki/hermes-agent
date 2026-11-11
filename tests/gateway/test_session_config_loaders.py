@@ -44,7 +44,7 @@ def test_in_process_turn_routes_with_the_sessions_own_provider_routing(tmp_path,
         raise _Built(pr)
     turn._resolve_turn_agent = built
     with pytest.raises(_Built) as caught:
-        turn._run_sync_scoped()
+        turn._run_sync_inner()
     assert caught.value.args[0] == {'only': ['Fresh'], 'sort': 'price'}
 
 
@@ -83,7 +83,7 @@ def test_a_local_turn_reloads_the_profiles_env_file_and_keeps_its_own_turn_budge
         raise _Built(max_iterations, os.environ.get('SIDE_TASK_ROTATED_KEY'))
     turn._resolve_turn_agent = built
     with pytest.raises(_Built) as caught:
-        turn._run_sync_scoped()
+        turn._run_sync_inner()
     expected = 'value-the-gateway-started-with' if bypass else 'rotated-in-env-file'
     assert caught.value.args == (7, expected)
 

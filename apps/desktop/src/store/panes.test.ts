@@ -1,4 +1,7 @@
+import { beforeEach as configureAdvancedMode } from 'vitest'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+
+import { setInterfaceMode as selectTestMode } from '@/store/interface-mode'
 
 import {
   $paneOpen,
@@ -120,3 +123,6 @@ describe('panes store', () => {
     })
   })
 })
+
+// This suite exercises controls available in Advanced mode.
+configureAdvancedMode(() => selectTestMode('advanced'))

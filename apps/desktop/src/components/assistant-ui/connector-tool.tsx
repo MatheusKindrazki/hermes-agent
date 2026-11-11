@@ -539,6 +539,7 @@ export function ConnectorExecution(props: ToolCallMessagePartProps) {
       })}
     </>
   )
+
   // Never collapse failures or unfinished execution.
   const settled =
     props.status?.type === 'complete' &&
@@ -547,7 +548,9 @@ export function ConnectorExecution(props: ToolCallMessagePartProps) {
     !output.error &&
     !results.some(item => Boolean(recordOf(item).error)) &&
     (results.length === 0 || results.length >= labels.length)
-  if (!settled) return rows
+
+  if (!settled) {return rows}
+
   return (
     <details className="connector-execution-details" data-conversation-scaffold="">
       <summary className={SCAFFOLD_LABEL_CLASS}>{[...new Set(labels.map(label => label.text))].join(' · ')}</summary>

@@ -45,6 +45,7 @@ async function boot() {
 describe('side visibility survives a page refresh independently of Files', () => {
   beforeEach(() => {
     window.localStorage.clear()
+    window.localStorage.setItem('hermes.desktop.interfaceMode.v1', 'advanced')
     window.history.replaceState(null, '', '/')
     vi.resetModules()
   })

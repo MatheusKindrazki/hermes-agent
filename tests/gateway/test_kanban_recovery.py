@@ -1,4 +1,5 @@
 """Real dispatch preserves custom board identity and unknown attempts."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,11 @@ import pytest
 def test_owner_board_recovery(tmp_path, mode):
     repo = Path(__file__).resolve().parents[2]
     env = {k: os.environ[k] for k in ('PATH', 'LANG', 'TZ', 'TIRITH_ENABLED') if k in os.environ}
+    launcher = tmp_path / 'worker-path.sh'
+    launcher.write_text('export HERMES_PYTEST_WORKER_PATH=1\n')
+    launcher.chmod(0o700)
+    env.update(HERMES_WORKER_PATH_LIB=str(launcher),
+               K5_WORKER_PATH_SHA256=hashlib.sha256(launcher.read_bytes()).hexdigest())
     env.update(HOME=str(tmp_path / 'user'), HERMES_HOME=str(tmp_path / 'state'),
                PYTHONPATH=str(repo), KANBAN_RECOVERY_MODE=mode)
     result = subprocess.run([sys.executable, str(repo / 'tests/gateway/fixtures/kanban_recovery_probe.py')],

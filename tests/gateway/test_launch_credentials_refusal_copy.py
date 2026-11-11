@@ -17,7 +17,7 @@ def test_turn_on_a_chat_whose_route_key_changed_names_new_chat_not_retry(tmp_pat
     policy, owner, config_path = _bound_session(tmp_path, monkeypatch, cfg)
     cfg['model']['api_key'] = 'rotated-token'
     config_path.write_text(json.dumps(cfg))
-    turn = TurnRunner(SimpleNamespace(), SimpleNamespace(source=None, session_id='session', session_key=None))
+    turn = TurnRunner(SimpleNamespace(), SimpleNamespace(source=None, session_id='session', session_key=None, effect_origin=None))
     monkeypatch.setattr(session_policy, 'policy_for_source', lambda runner, source: policy)
     monkeypatch.setattr(authorities, 'active_authority', lambda runner: owner())  # a restarted owner
 

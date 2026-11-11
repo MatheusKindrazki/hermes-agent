@@ -72,19 +72,19 @@ it('a steer in transfer hides its card without retiring it, so a return to the q
 })
 
 it('reconciles server queue by identity without replaying or duplicating local entries', () => {
-  enqueueQueuedPrompt('chat', { id: 'one', text: 'same', attachments: [] })
-  enqueueQueuedPrompt('chat', { id: 'local', text: 'same', attachments: [] })
-  const snapshot = [{ admission_id: 'one', status: 'queued', user: 'same' }]
+  enqueueQueuedPrompt('chat', { id: '11111111-1111-4111-8111-111111111111', text: 'same', attachments: [] })
+  enqueueQueuedPrompt('chat', { id: '22222222-2222-4222-8222-222222222222', text: 'same', attachments: [] })
+  const snapshot = [{ admission_id: '11111111-1111-4111-8111-111111111111', status: 'queued', user: 'same' }]
   reconcilePendingSubmissions('chat', snapshot)
   reconcilePendingSubmissions('chat', snapshot)
-  expect(getQueuedPrompts('chat').map(entry => entry.id)).toEqual(['one', 'local'])
+  expect(getQueuedPrompts('chat').map(entry => entry.id)).toEqual(['11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222'])
   expect(getQueuedPrompts('chat')[0]?.serverStatus).toBe('queued')
   reconcilePendingSubmissions('chat', [{ ...snapshot[0], status: 'started' }])
-  expect(getQueuedPrompts('chat').map(entry => entry.id)).toEqual(['local'])
+  expect(getQueuedPrompts('chat').map(entry => entry.id)).toEqual(['22222222-2222-4222-8222-222222222222'])
   reconcilePendingSubmissions('chat', [{ admission_id: 'unknown', status: 'unknown', user: 'interrupted' }])
   expect(getQueuedPrompts('chat').find(entry => entry.id === 'unknown')?.serverStatus).toBe('unknown')
   reconcilePendingSubmissions('chat', [])
-  expect(getQueuedPrompts('chat').map(entry => entry.id)).toEqual(['local'])
+  expect(getQueuedPrompts('chat').map(entry => entry.id)).toEqual(['22222222-2222-4222-8222-222222222222'])
 })
 
 it('recovers remote pending text into the queue and journal without a local submission', () => {

@@ -27,11 +27,14 @@ def test_refused_notification_retains_result_without_spending_attempts(tmp_path,
         _session_turn_admission=_session_turn_admission,
         _ensure_active_session_slot=lambda *args: None,
         _notif_log_failure=lambda *args: None)
-    for module, names in [(prompt_turn, ('_admit_prompt_turn', '_run_prompt_submit')),
+    for module, names in [(prompt_turn, ('_admit_prompt_turn', '_run_prompt_submit_inner')),
                           (session_notifications, ('_notif_submit', '_notif_claim_turn', '_notif_release_turn',
                            '_notif_dispatch_event', '_notif_dispatch_completions', '_async_delegation_display_metadata'))]:
         for name in names:
             namespace[name] = rebind(getattr(module, name), namespace)
+    # Exercise the admission body; durable-origin wrapping is covered by native-input tests.
+    namespace['_run_prompt_submit'] = namespace['_run_prompt_submit_inner']
+    namespace['_notif_refusal_backoff'] = lambda _session: None
     # Also bind the retry helper when present; old code must fail on the receipt, not an absent test import.
     if hasattr(session_notifications, '_notif_defer_event'):
         namespace['_notif_defer_event'] = rebind(session_notifications._notif_defer_event, namespace)

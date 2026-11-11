@@ -16,8 +16,10 @@ from gateway.hosted_room_execution_policy import POLICY_VERSION, _policy_digest
 from tests.gateway.test_api_server_runs import (
     _create_runs_app,
     _make_adapter,
-    _use_idempotency_db,
 )
+
+
+from tests.gateway.test_api_server_runs_idempotency import _use_idempotency_db
 
 
 def _forged_policy():

@@ -1,9 +1,11 @@
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { MemoryRouter } from 'react-router'
+import { beforeEach as configureAdvancedMode } from 'vitest'
 import { afterEach, expect, it } from 'vitest'
 
 import { $backgroundStatusBySession } from '@/store/composer-status'
 import { $goalsBySession } from '@/store/goals'
+import { setInterfaceMode as selectTestMode } from '@/store/interface-mode'
 import { $sessionControlBySession } from '@/store/session-control'
 import { $subagentsBySession, upsertSubagent } from '@/store/subagents'
 import { $todosBySession, clearSessionTodos, restoreSessionTodosFromSnapshot } from '@/store/todos'
@@ -130,3 +132,6 @@ it('starts structured goals collapsed and preserves manual queue expansion when 
   view.rerender(stack(true))
   expect(screen.getByText('Queued request')).toBeTruthy()
 })
+
+// This suite exercises controls available in Advanced mode.
+configureAdvancedMode(() => selectTestMode('advanced'))

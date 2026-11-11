@@ -9,6 +9,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 describe('$layoutEditRevealsHidden', () => {
   beforeEach(() => {
     window.localStorage.clear()
+    window.localStorage.setItem('hermes.desktop.interfaceMode.v1', 'advanced')
     vi.resetModules()
   })
 

@@ -1,6 +1,8 @@
+import { randomUuid } from '@hermes/shared'
+
 /** Allocate once per logical input, outside every transport retry closure. */
 export function createPromptSourceEventId(): string {
-  return crypto.randomUUID()
+  return randomUuid()
 }
 
 export function isPromptSourceEventId(value: unknown): value is string {
