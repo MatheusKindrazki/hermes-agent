@@ -20,6 +20,7 @@ const reload = () => vi.resetModules() // fresh modules; localStorage is the car
 describe('sidebar collapse persistence', () => {
   beforeEach(() => {
     window.localStorage.clear()
+    window.localStorage.setItem('hermes.desktop.interfaceMode.v1', 'advanced')
     vi.resetModules()
   })
 
@@ -65,6 +66,7 @@ describe('sidebar collapse persistence', () => {
   it('explicit open restores hidden strip tabs and minimized groups only on that physical side', async () => {
     for (const flipped of [false, true]) {
       window.localStorage.clear()
+    window.localStorage.setItem('hermes.desktop.interfaceMode.v1', 'advanced')
       reload()
       const { layout, tree, bind } = await loadStores()
       const { findGroup, group, split } = await import('@/components/pane-shell/tree/model')
@@ -116,6 +118,7 @@ describe('sidebar collapse persistence', () => {
   it('recovers the minimized physical side after reload without changing its active tab', async () => {
     for (const flipped of [false, true]) {
       window.localStorage.clear()
+    window.localStorage.setItem('hermes.desktop.interfaceMode.v1', 'advanced')
       reload()
       const s1 = await loadStores()
       const { group, split } = await import('@/components/pane-shell/tree/model')

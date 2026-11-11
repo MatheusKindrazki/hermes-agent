@@ -32,6 +32,8 @@ afterEach(() => {
 })
 
 async function importHost(webapp: boolean) {
+  localStorage.setItem('hermes.desktop.interfaceMode.v1', 'advanced')
+
   if (webapp) {
     ;(window as SurfaceWindow).__HERMES_UI_SURFACE__ = 'webapp'
   }

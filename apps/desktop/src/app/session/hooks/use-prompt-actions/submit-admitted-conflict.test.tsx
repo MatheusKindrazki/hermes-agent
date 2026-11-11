@@ -82,7 +82,7 @@ it('an edited queued entry drains as a new message, not as its admitted original
 
   const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
     if (method === 'prompt.submit') {
-      if (params?.submission_id === 'X-orig') {
+      if (params?.submission_id === '33333333-3333-4333-8333-333333333333') {
         throw new JsonRpcGatewayError('admission_conflict', {
           code: 4001,
           data: { reason: 'admission_conflict', field: 'request_id' }
@@ -97,8 +97,8 @@ it('an edited queued entry drains as a new message, not as its admitted original
     return {} as never
   })
 
-  enqueueQueuedPrompt('stored-a', { id: 'X-orig', text: 'yes', attachments: [] })
-  expect(updateQueuedPrompt('stored-a', 'X-orig', { text: 'yes, and also run the tests', attachments: [] })).toBe(true)
+  enqueueQueuedPrompt('stored-a', { id: '33333333-3333-4333-8333-333333333333', text: 'yes', attachments: [] })
+  expect(updateQueuedPrompt('stored-a', '33333333-3333-4333-8333-333333333333', { text: 'yes, and also run the tests', attachments: [] })).toBe(true)
   const [entry] = getQueuedPrompts('stored-a')
 
   const deps = submitDeps(requestGateway as GatewayRequest, updater => (state = updater(state)))

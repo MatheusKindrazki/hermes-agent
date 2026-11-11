@@ -1,3 +1,4 @@
+import { beforeEach as configureAdvancedMode } from 'vitest'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { onPersistenceEvent } from '@/lib/storage'
@@ -5,6 +6,7 @@ import { host } from '@/sdk'
 import { $backdrop, setBackdrop } from '@/store/backdrop'
 import { $chatTextScale, setChatTextScale } from '@/store/chat-text-scale'
 import { $composerPopoutGesturesEnabled, setComposerPopoutGesturesEnabled } from '@/store/composer-popout'
+import { setInterfaceMode as selectTestMode } from '@/store/interface-mode'
 import { $introSplash, setIntroSplash } from '@/store/intro-splash'
 import { $reasoningCollapsedByDefault, setReasoningCollapsedByDefault } from '@/store/reasoning-disclosure'
 import { $sessionListDensity, setSessionListDensity } from '@/store/session-list-density'
@@ -151,3 +153,6 @@ describe('host.settings', () => {
     expect($backdrop.get()).toBe(false)
   })
 })
+
+// This suite exercises controls available in Advanced mode.
+configureAdvancedMode(() => selectTestMode('advanced'))

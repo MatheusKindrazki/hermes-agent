@@ -1,3 +1,4 @@
+import type * as HermesSdk from '@hermes/plugin-sdk'
 /**
  * Minting a bot's forever-chat.
  *
@@ -16,7 +17,6 @@
  * Ported from tests/canonical-chat-creation.test.mjs, which sliced the
  * creation section out of the old plugin.js bundle and ran it under `vm`.
  */
-
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { RosterRow } from './types'
@@ -31,7 +31,8 @@ const { hostMock, persistMock, pluginCtx, requestForBotMock, saveBotMetaMock } =
   saveBotMetaMock: vi.fn()
 }))
 
-vi.mock('@hermes/plugin-sdk', () => ({
+vi.mock('@hermes/plugin-sdk', async importOriginal => ({
+  ...await importOriginal<typeof HermesSdk>(),
   BOT_CHAT_SESSION_HYDRATION_TIMEOUT_MS: 15_000,
   host: hostMock
 }))

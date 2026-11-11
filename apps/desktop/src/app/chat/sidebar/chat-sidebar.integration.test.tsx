@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router'
+import { beforeEach as configureAdvancedMode } from 'vitest'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { group, split } from '@/components/pane-shell/tree/model'
@@ -8,6 +9,7 @@ import { $layoutTree, noteActiveTreeGroup } from '@/components/pane-shell/tree/s
 import { SidebarProvider } from '@/components/ui/sidebar'
 import { registry } from '@/contrib/registry'
 import { $connectionsRegistry } from '@/store/connection-registry-state'
+import { setInterfaceMode as selectTestMode } from '@/store/interface-mode'
 import {
   $pinnedSessionIds,
   $sidebarMessagingOpenIds,
@@ -590,3 +592,6 @@ describe('ChatSidebar messaging owners', () => {
     expect(within(row('default-1')).queryByRole('img', { name: /^Profile:/ })).toBeNull()
   })
 })
+
+// This suite exercises controls available in Advanced mode.
+configureAdvancedMode(() => selectTestMode('advanced'))

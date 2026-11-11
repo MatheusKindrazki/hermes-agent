@@ -1,6 +1,7 @@
 // health: allow FILE_LINES -- locale data: translated copy for the usage-window plan UI (allowance gauges, Large/Free tags, the limit card), one key per string
 import { defineFieldCopy } from '@/app/settings/field-copy'
 
+import { deActiveContext } from './active-context-locales'
 import { deBoot } from './de_boot'
 import { deClarify } from './de_clarify'
 import { deConnectorAccounts } from './de_connector_accounts'
@@ -29,6 +30,7 @@ import { defineLocale, type TranslationOverrides } from './define-locale'
 import { introDe } from './intro-de'
 
 export const deOverrides = {
+  activeContext: deActiveContext,
   sharedMetrics: deSharedMetrics,
   firstRun: deFirstRun,
   intro: introDe,

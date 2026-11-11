@@ -1,10 +1,10 @@
 // @vitest-environment jsdom
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { en } from '@/i18n/en'
-import { $interfaceMode } from '@/store/interface-mode'
+import { setInterfaceMode } from '@/store/interface-mode'
 import { $fileBrowserOpen, FILE_BROWSER_PANE_ID, setFileBrowserOpen, toggleFileBrowserOpen } from '@/store/layout'
 import { $paneStates } from '@/store/panes'
 
@@ -14,10 +14,12 @@ import { AppearanceSettings } from './appearance-settings'
 // ⌘J and a persistence chain nobody could see. Settings now states it, and it
 // is the same state the titlebar toggle writes — two views, one answer.
 
+beforeEach(() => setInterfaceMode('advanced'))
+
 afterEach(() => {
   cleanup()
   act(() => {
-    $interfaceMode.set('advanced')
+    setInterfaceMode('advanced')
     setFileBrowserOpen(false)
   })
 })
@@ -60,7 +62,7 @@ describe('File Browser setting', () => {
   it('says a flip is session-only while Simple mode decides the value', () => {
     const note = en.interfaceMode.sessionNote
 
-    act(() => $interfaceMode.set('simple'))
+    act(() => setInterfaceMode('simple'))
     const toggle = fileBrowserSwitch()
 
     expect(screen.getByText(content => content.includes(note))).toBeTruthy()
@@ -69,7 +71,7 @@ describe('File Browser setting', () => {
     fireEvent.click(toggle)
     expect(toggle.getAttribute('aria-checked')).toBe('true')
 
-    act(() => $interfaceMode.set('advanced'))
+    act(() => setInterfaceMode('advanced'))
     expect(screen.queryByText(content => content.includes(note))).toBeNull()
     expect(toggle.getAttribute('aria-checked')).toBe('false')
   })

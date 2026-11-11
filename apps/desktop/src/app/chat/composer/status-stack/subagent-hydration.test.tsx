@@ -1,8 +1,10 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router'
+import { beforeEach as configureAdvancedMode } from 'vitest'
 import { afterEach, expect, it, vi } from 'vitest'
 
 import * as gateway from '@/store/gateway'
+import { setInterfaceMode as selectTestMode } from '@/store/interface-mode'
 import { _resetSessionOwnerHintsForTests, setSessionOwnerHint } from '@/store/session'
 import { $subagentsBySession, upsertSubagent } from '@/store/subagents'
 
@@ -97,3 +99,6 @@ it('does not resurrect a child completed while the roster snapshot was in flight
   expect(screen.queryByText('Finishing work')).toBeNull()
   expect($subagentsBySession.get().parent[0].status).toBe('completed')
 })
+
+// This suite exercises controls available in Advanced mode.
+configureAdvancedMode(() => selectTestMode('advanced'))
