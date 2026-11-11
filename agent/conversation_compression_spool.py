@@ -801,13 +801,12 @@ def drain_compression_turns_into_agent(
         ) or already_live
         if not already_durable:
             persisted_id = next(iter(sorted(original_ids)), spool_dedupe_id)
-            session_db.append_message(
-                live_tip,
-                str(message.get("role") or "user"),
-                message.get("content"),
-                platform_message_id=persisted_id,
-                timestamp=message.get("timestamp"),
-            )
+            session_db.append_messages_batch(live_tip, [{
+                "role": str(message.get("role") or "user"),
+                "content": message.get("content"),
+                "platform_message_id": persisted_id,
+                "timestamp": message.get("timestamp"),
+            }])
         if not already_live:
             message["_compression_spool_turn_id"] = turn_id
             message["_db_persisted"] = True

@@ -189,7 +189,16 @@ def worker_user_content(db, conn, session_id, payload):
          _row_id(payload), session_id)).rowcount}
 
 
+def worker_has_platform_message(db, conn, session_id, payload):
+    if set(payload) != {'platform_message_id'} or not isinstance(payload['platform_message_id'], str):
+        raise RuntimeStoreError('invalid_params')
+    return {'value': conn.execute(
+        'SELECT 1 FROM messages WHERE session_id=? AND platform_message_id=? LIMIT 1',
+        (session_id, payload['platform_message_id'])).fetchone() is not None}
+
+
 WORKER_LIFECYCLE_HANDLERS = {
+    'session.has_platform_message': worker_has_platform_message,
     'session.title': worker_title,
     'session.title_source': worker_title_source,
     'session.next_title': worker_next_title,

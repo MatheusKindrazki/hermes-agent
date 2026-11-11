@@ -102,7 +102,7 @@ async def _for_each_leg(rig, owner, surface_a, path, consume):
         proc = ProcessSession(
             id=f"proc_{name}{leg_index}abcd", command="build",
             owner_task_id="parent-owner" if owner == "foreground" else "sa-child",
-            task_id="container-parent", session_key=entry.session_key,
+            task_id=f"container-parent-{name}-{leg_index}", session_key=entry.session_key,
             parent_session_id=child, notify_on_complete=True, output_buffer="READY\n", started_at=1.0,
         )
         registry._running[proc.id] = proc

@@ -45,7 +45,7 @@ async def test_turn_in_removed_workspace_names_the_folder_instead_of_failing_gen
     try:
         folder.rmdir()
         source = authority.sessions[ref.session_id].source
-        ctx = SimpleNamespace(source=source, session_id=ref.session_id, session_key=None)
+        ctx = SimpleNamespace(source=source, session_id=ref.session_id, session_key=None, effect_origin=None)
         token = execution_result.set({})
         try:
             result = TurnRunner(authority.runner, ctx).run_sync()

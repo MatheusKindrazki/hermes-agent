@@ -195,10 +195,11 @@ def test_restart_dedupes_if_db_append_won_before_spool_mark(monkeypatch, tmp_pat
         def has_platform_message_id(self, session_id, platform_message_id):
             return (session_id, platform_message_id) in self.ids
 
-        def append_message(self, session_id, role, content, **kwargs):
-            key = (session_id, kwargs["platform_message_id"])
-            self.ids.add(key)
-            self.rows.append((session_id, role, content, key[1]))
+        def append_messages_batch(self, session_id, messages):
+            for message in messages:
+                key = (session_id, message["platform_message_id"])
+                self.ids.add(key)
+                self.rows.append((session_id, message["role"], message["content"], key[1]))
 
     db = FakeDb()
     agent = SimpleNamespace(_session_db=db)

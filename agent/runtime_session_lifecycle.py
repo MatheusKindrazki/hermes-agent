@@ -80,6 +80,10 @@ class RuntimeSessionLifecycleMixin:
             payload['display_metadata'] = display_metadata
         return self._apply('session.user_content', payload)['value']
 
+    def has_platform_message_id(self, session_id, platform_message_id):
+        self._session(session_id)
+        return self._apply('session.has_platform_message', {'platform_message_id': platform_message_id})['value']
+
     def end_session(self, session_id, end_reason):
         self._session(session_id)
         self._apply('session.end', {'end_reason': end_reason})

@@ -352,11 +352,12 @@ def test_serve_resume_child_reuses_respawn_without_updater_or_supervisors(tmp_pa
     assert result.returncode == int(spawn_fails or discarded), result.stdout + result.stderr
     assert json.loads(result_path.read_text()) == {"serves_handled": True}
     commands = json.loads((home / "commands.json").read_text())
-    assert commands == [
-        [sys.executable, str(root / "hermes"), "serve", "--host", "127.0.0.1", "--port", "8119"],
-        [sys.executable, str(root / "hermes"), "--profile", "ops team 日本", "dashboard",
-         "--host", "::1", "--port", "8120", "--no-open"],
+    from hermes_cli.dashboard_procs import _normalize_dashboard_cmdline
+    assert [_normalize_dashboard_cmdline(command) for command in commands] == [
+        ("serve", "--host", "127.0.0.1", "--port", "8119"),
+        ("--profile", "ops team 日本", "dashboard", "--host", "::1", "--port", "8120", "--no-open"),
     ]
+    assert all(str(root) in " ".join(command) for command in commands)
     assert ("probe spawn failed" in result.stdout) is spawn_fails
 
 

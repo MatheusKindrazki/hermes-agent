@@ -144,21 +144,14 @@ def test_kanban_dispatch_blocked_when_engaged(hermes_home):
 # ── gateway turn-start integration ──────────────────────────────────────────
 
 
-class _FakeSource:
-    platform = None
-    chat_id = "c1"
-    user_id = "u1"
-    user_name = "user"
-    chat_type = "dm"
-    profile = None
-
-
 class _FakeEvent:
     internal = False
     text = "hello"
 
     def __init__(self):
-        self.source = _FakeSource()
+        from gateway.config import Platform
+        from gateway.session import SessionSource
+        self.source = SessionSource(platform=Platform.TELEGRAM, chat_id="c1", user_id="u1", chat_type="dm")
 
     def get_command(self) -> str | None:
         return None

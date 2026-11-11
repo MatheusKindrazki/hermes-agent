@@ -391,6 +391,12 @@ def test_dispatcher_grants_only_the_assigned_worker_scope(tmp_path, monkeypatch)
     # A dispatcher launched from an agent's shell carries the descendant fence itself; the worker it
     # grants a task to must not (an inherited marker fences the worker's own heartbeat + handoff).
     monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", str(tmp_path))
+    import hashlib
+    launcher = tmp_path / "worker_path.sh"
+    launcher.write_text("export HERMES_PYTEST_WORKER_PATH=1\n")
+    launcher.chmod(0o700)
+    monkeypatch.setenv("HERMES_WORKER_PATH_LIB", str(launcher))
+    monkeypatch.setenv("K5_WORKER_PATH_SHA256", hashlib.sha256(launcher.read_bytes()).hexdigest())
     pid = _default_spawn(task, str(tmp_path), board="default")
     assert pid is not None
     _, status = os.waitpid(pid, 0)  # windows-footgun: ok — Linux-only real dispatcher spawn

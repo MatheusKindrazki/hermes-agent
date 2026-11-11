@@ -78,7 +78,7 @@ async def test_session_chat_terminal_result_is_not_success(flag, status):
     adapter = APIServerAdapter(PlatformConfig(enabled=True))
     adapter._prepare_session_chat = AsyncMock(return_value=({'gateway_session_key': None,
         'session_id': 'owned', 'run_kwargs': {}, 'runtime_request': {}, 'user_message': 'hello',
-        'lock_active': False, 'body': {}}, None))
+        'lock_active': False, 'body': {}, 'delivery': None}, None))
     adapter._conversation_history_for_session = AsyncMock(return_value=[])
     adapter._run_agent = AsyncMock(return_value=({'final_response': 'diagnostic', flag: True,
                                                  'completed': False, 'messages': []}, {}))

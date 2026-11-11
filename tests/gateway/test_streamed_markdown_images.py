@@ -37,10 +37,10 @@ def _event():
 
 
 def _fake_runner(thread_meta):
-    return SimpleNamespace(
-        _thread_metadata_for_source=lambda source, anchor=None: thread_meta,
-        _reply_anchor_for_event=lambda event: None,
-    )
+    runner = object.__new__(GatewayRunner)
+    runner._thread_metadata_for_source = lambda source, anchor=None: thread_meta
+    runner._reply_anchor_for_event = lambda event: None
+    return runner
 
 
 def _adapter():
