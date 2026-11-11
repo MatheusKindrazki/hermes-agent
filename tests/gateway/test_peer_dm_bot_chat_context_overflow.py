@@ -25,11 +25,11 @@ from tests.gateway.fixtures.local_recovery_probe import child_env, daemon
 from tests.waiting import wait_until
 
 KEY = 'lc23-peer-dm-overflow-key-0123456789'
-CAP = 30000  # request bytes the stub's "model" accepts
+CAP = 30000  # conversation bytes; the fork's static system prompt is not the test pressure
 
 
 class WindowCappedModel(BaseHTTPRequestHandler):
-    """Main (tool-bearing or not) requests over CAP bytes get a numberless 400 context overflow."""
+    """Conversation history over CAP bytes gets a numberless 400 context overflow."""
 
     def log_message(self, *args):
         pass
@@ -37,7 +37,8 @@ class WindowCappedModel(BaseHTTPRequestHandler):
     def do_POST(self):
         raw = self.rfile.read(int(self.headers['Content-Length']))
         body = json.loads(raw)
-        if len(raw) > CAP:
+        conversation = [m for m in body.get('messages', []) if m.get('role') != 'system']
+        if len(json.dumps(conversation).encode()) > CAP:
             hold = getattr(self.server, 'hold', None)
             if hold is not None and not hold.is_set():  # the race test: park the turn mid-flight
                 self.server.held.set()

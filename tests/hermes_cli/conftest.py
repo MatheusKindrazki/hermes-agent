@@ -14,7 +14,7 @@ _K5_WORKER_PATH_SHA256 = (
 
 
 @pytest.fixture(autouse=True)
-def _signed_worker_path_env(monkeypatch, tmp_path):
+def _signed_worker_path_env(monkeypatch, tmp_path_factory):
     """Provide a hermetic signed launcher without masking explicit inputs.
 
     Production always requires HERMES_WORKER_PATH_LIB + its K5 hash. Most
@@ -31,7 +31,7 @@ def _signed_worker_path_env(monkeypatch, tmp_path):
     explicit_hash = os.environ.get("K5_WORKER_PATH_SHA256")
 
     if explicit_path is None and explicit_hash is None:
-        fallback = tmp_path / "pytest-worker_path.sh"
+        fallback = tmp_path_factory.mktemp("signed-worker") / "worker_path.sh"
         fallback.write_text(
             "export HERMES_PYTEST_WORKER_PATH=1\n",
             encoding="utf-8",
@@ -43,7 +43,7 @@ def _signed_worker_path_env(monkeypatch, tmp_path):
 
     selected_hash = os.environ.get("K5_WORKER_PATH_SHA256")
     if selected_hash == _K5_WORKER_PATH_SHA256:
-        shim_dir = tmp_path / "pytest-claude-shim"
+        shim_dir = tmp_path_factory.mktemp("signed-shim") / "bin"
         shim_dir.mkdir(mode=0o700)
         shim = shim_dir / "claude"
         shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")

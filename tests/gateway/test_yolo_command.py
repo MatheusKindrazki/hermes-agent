@@ -81,7 +81,7 @@ def test_launch_yolo_revocation_survives_the_next_turn(monkeypatch):
     runner._get_system_prompt_for_channel = lambda *a, **k: ""
 
     def turn():
-        TurnRunner(runner, TurnContext(source=source, session_key=key))._run_sync_scoped()
+        TurnRunner(runner, TurnContext(source=source, session_key=key))._run_sync_inner()
 
     try:
         turn()

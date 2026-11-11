@@ -842,7 +842,7 @@ def _native_prompt_source(params, session, text, turn_isolation):
     finally:
         if native_home_token is not None:
             reset_hermes_home_override(native_home_token)
-    return source_event_id
+    return source_event_id, observe_input
 
 
 @method("prompt.submit")
@@ -906,7 +906,7 @@ def _(rid, params: dict) -> dict:
     turn_isolation = _session_uses_compute_host(session, _load_dashboard_process_isolation_config())
     if internal_hosted_submit and turn_isolation:
         return _err(rid, 4121, "hosted room turns do not support isolated compute workers yet")
-    source_event_id = _native_prompt_source(params, session, text, turn_isolation)
+    source_event_id, observe_input = _native_prompt_source(params, session, text, turn_isolation)
     # Re-bind to the current transport: streaming must stay on the active websocket even
     # if a disconnect/fallback moved the session to stdio. Through _rebind_live_transport so a
     # socket that already closed cannot cancel the orphan reap without coming back (#116464).

@@ -1181,8 +1181,10 @@ class TestSpawnRewriteCompoundBackground:
              patch.object(registry, "_write_checkpoint"):
             registry.spawn_local("cd /app && node server.js &>/tmp/srv.log &", cwd="/tmp")
 
-        assert len(captured_cmd) == 1
-        shell_cmd = captured_cmd[0]
+        # Ownership probes can spawn their own helper; assert the requested shell launch.
+        shell_launches = [args for args in captured_cmd if args[0] == "/bin/bash"]
+        assert len(shell_launches) == 1
+        shell_cmd = shell_launches[0]
         # The command passed to Popen should be the REWRITTEN version
         assert "&& { node server.js &>/tmp/srv.log & }" in shell_cmd[2]
 
