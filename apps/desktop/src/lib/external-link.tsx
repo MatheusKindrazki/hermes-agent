@@ -1,6 +1,7 @@
 import type { ComponentProps, ReactNode } from 'react'
 import { useEffect, useMemo, useState } from 'react'
 
+import { openPanelLink } from '@/app/chat/kindra-panel-link'
 import { hostHas } from '@/lib/host-capabilities'
 import { ArrowUpRight } from '@/lib/icons'
 import { IS_MAC } from '@/lib/keybinds/combo'
@@ -265,6 +266,10 @@ export function openLink(href: string, options: { native?: boolean } = {}): void
   const target = normalizeExternalUrl(href)
 
   if (!target) {
+    return
+  }
+
+  if (!options.native && !hudForcesNativeLinks() && openPanelLink(target)) {
     return
   }
 

@@ -1,12 +1,14 @@
 import { useEffect, useRef, useState } from 'react'
 
+import { usePaneVisible } from '@/components/pane-shell/pane-visibility'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog'
 import { ErrorState } from '@/components/ui/error-state'
 import { Loader } from '@/components/ui/loader'
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 
-import { PANEL_HOST_URL, PANEL_ORIGIN, PANEL_URL, panelMessage } from './kindra-panel-protocol'
+import { PANEL_OPEN_EVENT } from './kindra-panel-link'
+import { isPanelRoute, PANEL_HOST_URL, PANEL_ORIGIN, PANEL_URL, panelMessage } from './kindra-panel-protocol'
 import { readPanelRoute, rememberPanelRoute } from './kindra-panel-state'
 import { ExecutorConversation } from './parallel-executor-view'
 
@@ -91,9 +93,31 @@ function PanelFrame({ onConversation, onFocus }: PanelFrameProps) {
 
 /** Keep the panel mounted beneath the conversation drawer, including its current route. */
 export function KindraPanel() {
+  const visible = usePaneVisible()
   const [open, setOpen] = useState(false)
+  const [navigation, setNavigation] = useState(0)
   const [focused, setFocused] = useState(false)
   const [conversation, setConversation] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!visible) { return }
+
+    const receive = (event: Event) => {
+      const route: unknown = (event as CustomEvent).detail
+
+      if (!isPanelRoute(route) || event.defaultPrevented) { return }
+      event.preventDefault()
+      rememberPanelRoute(route)
+      setConversation(null)
+      setFocused(false)
+      setNavigation(value => value + 1)
+      setOpen(true)
+    }
+
+    window.addEventListener(PANEL_OPEN_EVENT, receive)
+
+    return () => window.removeEventListener(PANEL_OPEN_EVENT, receive)
+  }, [visible])
 
   return (
     <Dialog onOpenChange={setOpen} open={open}>
@@ -105,7 +129,7 @@ export function KindraPanel() {
           <DialogTitle>Painel</DialogTitle>
           <DialogDescription className="sr-only">Entregas e plataforma do Mac mini. Abra uma conversa para acompanhar em paralelo.</DialogDescription>
         </DialogHeader>
-        <PanelFrame onConversation={setConversation} onFocus={setFocused} />
+        <PanelFrame key={navigation} onConversation={setConversation} onFocus={setFocused} />
         <Sheet onOpenChange={value => { if (!value) { setConversation(null) } }} open={conversation !== null}>
           <SheetContent className="w-[min(92vw,30rem)] sm:max-w-[30rem] z-[calc(var(--z-modal)+2)]" style={{ backgroundColor: '#171719', color: '#eee' }}>
             <SheetHeader className="px-6 pt-7 pb-3 pr-12">
