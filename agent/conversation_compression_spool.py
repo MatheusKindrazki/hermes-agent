@@ -341,7 +341,7 @@ class DurableCompressionTurnSpool:
                 import subprocess
 
                 boot = subprocess.check_output(
-                    ["sysctl", "-n", "kern.boottime"], text=True, timeout=5
+                    ["sysctl", "-n", "kern.boottime"], text=True, timeout=5, stdin=subprocess.DEVNULL
                 ).strip()
             except Exception:
                 logging.getLogger(__name__).debug('DurableCompressionTurnSpool._process_liveness: optional operation failed', exc_info=True)
@@ -357,7 +357,7 @@ class DurableCompressionTurnSpool:
                 import subprocess
 
                 start = subprocess.check_output(
-                    ["ps", "-o", "lstart=", "-p", str(pid_int)], text=True, timeout=5
+                    ["ps", "-o", "lstart=", "-p", str(pid_int)], text=True, timeout=5, stdin=subprocess.DEVNULL
                 ).strip()
             except Exception:
                 logging.getLogger(__name__).debug('DurableCompressionTurnSpool._process_liveness: optional operation failed', exc_info=True)

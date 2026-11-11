@@ -1271,6 +1271,7 @@ def _run_delivery_transport(transport_argv, dm_file, stdin_file, env):
     else:
         proc = subprocess.run(
             [*transport_argv, "--query-file", dm_file],
+            stdin=subprocess.DEVNULL,
             check=False,
             capture_output=True,
             text=True,
@@ -1289,6 +1290,7 @@ def _run_delivery_transport(transport_argv, dm_file, stdin_file, env):
         if retry_action(classify_agent_error(detail)) != RETRY_NONE:
             proc = subprocess.run(
                 [*transport_argv, "--query-file", dm_file],
+                stdin=subprocess.DEVNULL,
                 check=False,
                 capture_output=True,
                 text=True,

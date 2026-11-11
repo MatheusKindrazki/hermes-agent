@@ -29,7 +29,7 @@ CAP = 30000  # conversation bytes; the fork's static system prompt is not the te
 
 
 class WindowCappedModel(BaseHTTPRequestHandler):
-    """Conversation history over CAP bytes gets a numberless 400 context overflow."""
+    """Conversation history over CAP bytes gets a measured 400 context overflow."""
 
     def log_message(self, *args):
         pass
@@ -44,7 +44,7 @@ class WindowCappedModel(BaseHTTPRequestHandler):
                 self.server.held.set()
                 hold.wait(60)
             self.server.rejected += 1
-            payload = json.dumps({'error': {'message': "This model's maximum context length was exceeded. "
+            payload = json.dumps({'error': {'message': f"This model's maximum context length was exceeded ({CAP} bytes). "
                                                        'Please reduce the length of the messages.',
                                             'type': 'invalid_request_error',
                                             'code': 'context_length_exceeded'}}).encode()
@@ -244,15 +244,18 @@ def test_a_dm_queued_behind_the_overflowing_turn_runs_on_the_fresh_bot_chat(raci
     assert run.results['big'][0] == 502, run.results['big']
     assert run.bot_chat_end == 'session_reset', run.rows
     assert 'admission_conflict' not in run.log, [l for l in run.log.splitlines() if 'admission_conflict' in l][:5]
-    # The racing DM and the later one are both answered, on the fresh session, each stored there once.
-    # (A racing attempt that ran on the old transcript before the reset was owed failed there and kept
-    # its user row, like any failed turn; that row is the old conversation's, not a re-run.)
+    # Both DMs run once after the exhausted session. The fork's bounded retry of the
+    # oversized request may rotate again between the racing DM and the third DM;
+    # each reply must belong to its own fresh transcript, not necessarily the last one.
     fresh = {s for s, role, text in run.rows if role == 'user' and text.startswith('third DM')}
     assert len(fresh) == 1 and run.sid not in fresh, run.rows
     for name, marker in (('race', 'racing short DM'), ('third', 'third DM')):
         status, body = run.results[name]
         assert status == 200, (name, run.results[name], run.admissions)
         assert body['message']['content'].startswith('ACK ' + marker), (name, body)
-        on_fresh = [1 for s, role, text in run.rows if role == 'user' and text.startswith(marker) and s in fresh]
+        on_fresh = [s for s, role, text in run.rows if role == 'user' and text.startswith(marker) and s != run.sid]
         assert len(on_fresh) == 1, (name, run.rows)
+        replies = [1 for s, role, text in run.rows
+                   if s == on_fresh[0] and role == 'assistant' and text.startswith('ACK ' + marker)]
+        assert len(replies) == 1, (name, run.rows)
     assert not [row for row in run.admissions if row[1] == 'queued'], run.admissions
