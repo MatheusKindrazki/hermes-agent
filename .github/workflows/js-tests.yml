@@ -111,6 +111,8 @@ jobs:
       # not an empty run, because an empty run reports green after it checks
       # nothing.
       - name: Run all workspace checks
+        env:
+          WORKSPACE_CHECK_STREAM: '1'
         run: node .github/scripts/run-workspace-checks.mjs
       - name: Check the checkout is clean
         # Last step of every job (tests/ci/test_clean_worktree_check.py): a test or CI step that
