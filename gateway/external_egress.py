@@ -33,6 +33,12 @@ async def deliver_external_action(
     adapter). Tests and configured runtimes may inject policy/outbox instances;
     otherwise both resolve from the same default-off ``config.yaml`` contract.
     """
+    if getattr(adapter, "carries_no_external_transport", False) is True:
+        # The canonical local route already published this reply through its durable event
+        # stream; its ``send`` is a no-op that reaches no network, person or platform. Gating it
+        # (or shadow-enqueueing it) only turned every local final into a false
+        # ``egress_policy_rejected`` with nothing actually withheld.
+        return await deliver(dict(metadata) if metadata else None)
     policy = getattr(owner, "_egress_policy", None) or EgressPolicy.from_config()
     outbox = getattr(owner, "_reliability_outbox", None) or ReliabilityOutbox.from_config()
     destination = f"{type(adapter).__name__}:{chat_id}"
