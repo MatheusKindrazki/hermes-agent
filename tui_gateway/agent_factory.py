@@ -655,6 +655,9 @@ def _make_agent(
     ignore_rules = is_truthy_value(os.environ.get("HERMES_IGNORE_RULES"))
     with _sessions_lock:
         session = _sessions.get(sid)
+    from tui_gateway.voice_turn_policy import resolve_voice_turn_policy
+    # A rebuild may omit platform_override; the session record still carries its source.
+    voice_policy = resolve_voice_turn_policy(cfg, platform_override or (session or {}).get("source"))
     agent = AIAgent(
         model=model, max_iterations=_cfg_max_turns(cfg, 500), provider=runtime.get("provider"),
         requested_provider=runtime.get("requested_provider"),
@@ -679,7 +682,10 @@ def _make_agent(
         session_db=session_db if session_db is not None else _get_db(), ephemeral_system_prompt=system_prompt or None,
         checkpoints_enabled=_resolve_checkpoints_enabled(cfg),
         pass_session_id=is_truthy_value(os.environ.get("HERMES_TUI_PASS_SESSION_ID")),
-        skip_context_files=ignore_rules, skip_memory=ignore_rules, fallback_model=_load_fallback_model(),
+        skip_context_files=ignore_rules or voice_policy.skip_context_files, skip_memory=ignore_rules,
+        # Voice keeps SOUL.md (the persona) while dropping cwd AGENTS.md, as cron does.
+        load_soul_identity=voice_policy.skip_context_files and not ignore_rules,
+        skip_background_review=voice_policy.skip_background_review, fallback_model=_load_fallback_model(),
         # The resolved provider's request body (a custom entry's extra_body), as the CLI/cron/gateway pass it.
         request_overrides=runtime.get("request_overrides"),
         prefill_messages=_load_prefill_messages() or None, **_agent_cbs(sid))
