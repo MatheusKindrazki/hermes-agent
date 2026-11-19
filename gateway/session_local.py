@@ -21,6 +21,10 @@ logger = logging.getLogger(__name__)
 class LocalSessionAdapter(BasePlatformAdapter):
     """Delivery stays in the canonical event stream; no second local transport."""
 
+    # ``send`` below reaches nothing outside this process, so the external egress seam
+    # (gateway/external_egress.py) has nothing to gate on this adapter.
+    carries_no_external_transport = True
+
     def __init__(self, authority):
         super().__init__(PlatformConfig(enabled=True), Platform.LOCAL)
         self.authority = authority
