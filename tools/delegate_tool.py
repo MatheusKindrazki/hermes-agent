@@ -662,7 +662,6 @@ def delegate_task(
         from agent.durable_admission import (
             EXTERNAL_WORK_DISPATCHER,
             ExecutionHandoff,
-            admit_execution,
             current_admitted_turn,
             execution_event_id,
         )
@@ -686,29 +685,33 @@ def delegate_task(
         _session_id = str(getattr(parent_agent, "session_id", "") or "")
 
         if background:
-            _admission = admit_execution(
-                session_id=_session_id,
-                request=_request,
-                event_id=execution_event_id(_session_id, _request),
-            )
+            # No Work is opened here any more. Until 2026-11-19 this branch called
+            # admit_execution(), which opened a "Kernel execution" Work and handed
+            # it to EXTERNAL_WORK_DISPATCHER ("hermes-work-control"). Nothing
+            # consumes that dispatcher: the Mini kernel inboxes held 18 such
+            # handoffs, none ever ran, and every one stayed open in the ledger
+            # (RFC-001 Wave 2.8). Recording a request nobody will execute is the
+            # "logged = done" failure; the honest answer is a refusal that names
+            # where durable work actually goes.
+            _request_key = execution_event_id(_session_id, _request)
             logger.info(
-                "delegate_task: long execution handed off to %s (%s)",
+                "delegate_task: background delegation refused; no durable "
+                "dispatcher consumes %s (request %s)",
                 EXTERNAL_WORK_DISPATCHER,
-                _admission.reason_code,
+                _request_key,
             )
             _handoff = ExecutionHandoff(
-                reason_code=_admission.reason_code or "long_execution_not_local",
+                reason_code="no_durable_dispatcher",
                 detail=(
-                    "This is long-running work, so it was NOT started here. A "
-                    "session-bound background subagent dies with this process, "
-                    f"so it is handed to {EXTERNAL_WORK_DISPATCHER}, which owns "
-                    "durable execution. No subagent was spawned, no background "
-                    "task exists, and there is nothing to poll or wait for."
+                    "Nothing was started and nothing was recorded. Long-running "
+                    "background work has no durable executor in this process. "
+                    "For a code or product change, use delivery_ask_pm so the "
+                    "front PM opens and owns the delivery. For a short read-only "
+                    "task, call delegate_task again without background. Tell the "
+                    "user plainly that the background request was not queued."
                 ),
-                work_id=_admission.work_id,
-                request_key=_admission.request_key,
-                retryable=_admission.retryable,
-                authority_pin_matched=_admission.authority_pin_matched,
+                request_key=_request_key,
+                retryable=False,
             )
             _payload = _handoff.payload()
             _payload["count"] = len(task_list)
