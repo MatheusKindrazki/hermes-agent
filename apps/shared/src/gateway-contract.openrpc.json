@@ -39387,6 +39387,18 @@
               }
             ],
             "default": null
+          },
+          "compactions": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Compactions"
           }
         },
         "required": [

@@ -3263,6 +3263,7 @@ export interface SessionResumeResult {
   pending_connection?: ConnectionRequestPayload | null
   todo_state?: TodoState | null
   auto_continue?: AutoContinue | null
+  compactions?: number | null
 }
 /** ``session_auto_continue._inflight_snapshot``: the live (or retained failed) turn a reconnecting client rebuilds its bubbles from. */
 export interface InflightTurn {

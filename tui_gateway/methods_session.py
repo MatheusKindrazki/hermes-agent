@@ -286,7 +286,8 @@ def _seed_branch_row(record: dict, key: str, parent_session_id: str, history: li
             _persist_branch(db, key, parent_session_id, _branch_title(db, parent_session_id), history,
                             source=source, cwd=None if _is_remote_launch_cwd(record) else record["cwd"],
                             profile_name=profile_name_for_home(profile_home) or _current_profile_name(),
-                            model=_session_default_route(record)[0], compensate=True, title_source="derived", user_id=_session_auth_user_id(record))
+                            model=_session_default_route(record)[0], compensate=True, title_source="derived", user_id=_session_auth_user_id(record),
+                            copy_fields=("display_kind",))  # a "hidden" seed row stays hidden once stored
             record["pending_title"] = None
             # The first submit's _persist_branch_seed is the fallback for a failed seed, not a second copy.
             record["_branch_seed_persisted"] = True
@@ -884,25 +885,6 @@ def _resume_reuse_live_locked(ctx: _Resume, sid: str, session: dict) -> dict:
     if session.get("agent") is None and _child_run_active(ctx.target, ctx.profile_home):
         payload.update(running=True, status="streaming")
     return _ok(ctx.rid, payload)
-
-
-def _resume_response(
-    ctx: _Resume, sid: str, record: dict, *, info: dict, display: list = (), count_source: list | None = None,
-    messages: list | None = None, message_count: int | None = None, running: bool = False,
-    status: str = "idle", hydrating: bool | None = None, started_at=None, auto_continue=None,
-) -> dict:
-    """Common resume payload; omit_messages counts ``count_source`` (client still learns the stored size)."""
-    if messages is None:
-        messages = ctx.messages(display)
-    if message_count is None:
-        message_count = len(count_source) if ctx.omit_messages else len(messages)
-    payload = {"session_id": sid, "resumed": ctx.target, "message_count": message_count, "messages": messages,
-               **({"messages_omitted": ctx.omit_messages} if hydrating is None else {"hydrating": hydrating}),
-               "info": info, "inflight": None, "running": running, "session_key": ctx.target,
-               "started_at": record["created_at"] if started_at is None else started_at, "status": status}
-    if auto_continue is not None:
-        payload["auto_continue"] = auto_continue
-    return _ok(ctx.rid, _attach_todo_state(payload, record))
 
 
 def _resume_lazy(ctx: _Resume) -> dict:
@@ -2335,5 +2317,7 @@ def register(server) -> None:
     bind_module(globals(), server, skip=("_",))
     from . import methods_session_branch
     methods_session_branch.register(server)
+    from . import methods_session_resume_payload
+    methods_session_resume_payload.register(server)
     from . import methods_session_interrupt
     methods_session_interrupt.register(server)
