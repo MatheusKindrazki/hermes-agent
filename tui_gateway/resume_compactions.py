@@ -33,3 +33,15 @@ def stored_compactions(db: Any, session_id: Optional[str]) -> Optional[int]:
         logger.debug("compaction count unavailable for %s", session_id, exc_info=True)
         return None
     return int(row[0]) if row is not None and row[0] is not None else None
+
+
+def persisted_compactions(db: Any, session_id: Optional[str]) -> Optional[int]:
+    """``stored_compactions`` for a session whose row exists; ``None`` for one not persisted yet (a live
+    session whose row is still lazy has no stored transcript to count, which is unknown, not zero)."""
+    try:
+        if db is None or not session_id or db.get_session(session_id) is None:
+            return None
+    except Exception:
+        logger.debug("session row unavailable for %s", session_id, exc_info=True)
+        return None
+    return stored_compactions(db, session_id)

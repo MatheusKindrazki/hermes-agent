@@ -122,3 +122,46 @@ def test_parented_seed_keeps_hidden_rows_hidden(monkeypatch, tmp_path):
         assert [r.get("display_kind") for r in rows] == ["hidden", "hidden"]
     finally:
         db.close()
+
+
+def _resume(params):
+    response = server.handle_request({"id": "resume", "method": "session.resume", "params": params})
+    assert "result" in response, response
+    return response["result"]
+
+
+def test_live_reattach_reports_compactions_on_every_variant(monkeypatch, tmp_path):
+    """The reconnect path (an already-live stored session) bypasses _resume_response; it must report the
+    stored count too, including the omit_messages fast path and the deferred-history overlay."""
+    db = SessionDB(tmp_path / "state.db")
+    _quiet(monkeypatch, db, tmp_path)
+    try:
+        db.create_session("voice", source="iphone-voice")
+        db.append_message("voice", "user", "oi", timestamp=1.0)
+        for n in range(3):
+            db.append_message("voice", "user", f"{SUMMARY_PREFIX}\n\nresumo {n}", timestamp=2.0 + n)
+        db.append_message("voice", "assistant", "olá", timestamp=9.0)
+        first = _resume({"session_id": "voice", "source": "iphone-voice", "cols": 96})
+        assert first["compactions"] == 3
+        assert first["session_id"] in server._sessions  # live now: the next resumes reattach it
+        for extra in ({}, {"omit_messages": True}, {"defer_history": True}):
+            again = _resume({"session_id": "voice", "source": "iphone-voice", "cols": 96, **extra})
+            assert again["session_id"] == first["session_id"], extra  # the live reattach path, not a rebuild
+            assert again["compactions"] == 3, extra
+    finally:
+        db.close()
+
+
+def test_live_reattach_of_an_unpersisted_session_is_unknown(monkeypatch, tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    _quiet(monkeypatch, db, tmp_path)
+    try:
+        created = server.handle_request({"id": "create", "method": "session.create", "params": {
+            "source": "iphone-voice", "cols": 96}})["result"]
+        key = created["stored_session_id"]
+        assert db.get_session(key) is None  # the row is lazy until the first prompt
+        again = _resume({"session_id": key, "source": "iphone-voice", "cols": 96})
+        assert again["session_id"] == created["session_id"]
+        assert again["compactions"] is None
+    finally:
+        db.close()

@@ -728,6 +728,7 @@ def _resume_live_unpersisted(ctx: _Resume, live_sid: str, live: dict) -> dict:
     return _ok(ctx.rid, _attach_todo_state({
         "session_id": live_sid, "stored_session_id": str(live.get("session_key") or ""),
         "message_count": len(messages), "messages": messages,
+        "compactions": None,  # RFC-001 V1: no stored transcript yet, so the count is unknown, not zero
         "info": {"model": model, "provider": provider, "lazy": True,
                  "desktop_contract": DESKTOP_BACKEND_CONTRACT,
                  "profile_name": profile_name_for_home(live.get("profile_home")) or _response_profile_name(ctx.profile)}}, live))
@@ -878,6 +879,11 @@ def _resume_reuse_live_locked(ctx: _Resume, sid: str, session: dict) -> dict:
                                     transport=current_transport() or _stdio_transport,
                                     inline_images=ctx.inline_images)
     payload["resumed"] = ctx.target
+    # RFC-001 V1: the reconnect path reports the stored count too (one indexed COUNT, also on the
+    # omit_messages fast path), read from the session's own profile-aware DB; unpersisted → None.
+    from .resume_compactions import persisted_compactions
+    with _session_db(session) as db:
+        payload["compactions"] = persisted_compactions(db, _session_lookup_key(session, fallback=ctx.target))
     if ctx.defer_history:
         payload.update(messages=[], hydrating=bool(session.get("resume_hydrating")),
                        message_count=int(session.get("resume_message_count") or payload["message_count"]))
