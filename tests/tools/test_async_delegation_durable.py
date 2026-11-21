@@ -376,6 +376,8 @@ def test_background_delegation_is_handed_off_not_dispatched(monkeypatch, tmp_pat
 
     assert payload["status"] == "handoff_required"
     assert payload["handoff"]["dispatcher"] == durable_admission.EXTERNAL_WORK_DISPATCHER
+    assert payload["handoff"]["reason"] == "no_durable_dispatcher"
+    assert payload["handoff"]["work_id"] is None, "a Work was opened for a handoff nobody consumes"
     assert payload.get("mode") != "background"
     assert _rows() == set()
     assert spawned == []
@@ -589,3 +591,38 @@ def test_the_registry_refuses_a_candidate_receipt_too(monkeypatch, tmp_path, spa
         assert result["reason"] == "session_bound_dispatch_refused"
     assert _rows() == set()
     assert spawned == []
+
+
+def test_background_delegation_opens_no_work_even_when_armed(monkeypatch):
+    """RFC-001 Wave 2.8: the background handoff must not call admit_execution.
+
+    Runs without the K7 worktree: the mode resolver is forced on and the
+    admitter entry point fails the test if it is reached.
+    """
+    from tools import delegate_tool
+
+    monkeypatch.setattr(durable_admission, "resolve_mode", lambda *a, **k: True)
+    monkeypatch.setattr(
+        durable_admission,
+        "admit_execution",
+        lambda **kw: (_ for _ in ()).throw(AssertionError("admit_execution was called")),
+    )
+    _no_children(monkeypatch)
+
+    first = json.loads(
+        delegate_tool.delegate_task(goal="audit the whole repo", background=True, parent_agent=_ParentAgent())
+    )
+    second = json.loads(
+        delegate_tool.delegate_task(goal="audit the whole repo", background=True, parent_agent=_ParentAgent())
+    )
+    other = json.loads(
+        delegate_tool.delegate_task(goal="audit the whole repo", context="other", background=True, parent_agent=_ParentAgent())
+    )
+
+    assert first["status"] == "handoff_required"
+    assert first["handoff"]["reason"] == "no_durable_dispatcher"
+    assert first["handoff"]["work_id"] is None
+    assert first["retryable"] is False
+    assert "delivery_ask_pm" in first["error"]
+    assert first["handoff"]["request_key"] == second["handoff"]["request_key"]
+    assert first["handoff"]["request_key"] != other["handoff"]["request_key"]
