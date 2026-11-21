@@ -60,3 +60,52 @@ def test_toolsets_parsing(raw, expected):
 def test_max_iterations_parsing(raw, expected):
     cfg = {"voice": {"turn_policy": {"sources": ["iphone-voice"], "max_iterations": raw}}}
     assert resolve_voice_turn_policy(cfg, "iphone-voice").max_iterations == expected
+
+
+# ---- review of #33: the selection survives a live refresh (/reload-mcp, a plugin going live) and the
+# read-back of an unbuilt session; an operator pin still wins.
+
+import types as _types
+
+
+def _refresh_setup(monkeypatch):
+    monkeypatch.setattr(server, "_load_cfg", lambda: _CFG)
+    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda platform=None: ["file", "terminal", "skills"])
+    monkeypatch.setattr(server, "_load_disabled_toolsets", lambda: None)
+    monkeypatch.setattr(server, "_gui_surface_toolsets", lambda platform: set())
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_session_info", lambda agent, sess=None: {})
+    monkeypatch.delenv("HERMES_TUI_TOOLSETS", raising=False)
+    captured: dict = {}
+
+    def fake_refresh(agent, enabled_override=None, **kwargs):
+        captured[agent.platform] = enabled_override
+
+    import tools.mcp_tool_agent as mcp_agent
+    monkeypatch.setattr(mcp_agent, "refresh_agent_mcp_tools", fake_refresh)
+    return captured
+
+
+def test_live_voice_agent_keeps_the_voice_list_after_refresh(monkeypatch):
+    captured = _refresh_setup(monkeypatch)
+    voice = _types.SimpleNamespace(platform="iphone-voice", enabled_toolsets=sorted(_VOICE))
+    desk = _types.SimpleNamespace(platform="desktop", enabled_toolsets=["file", "terminal", "skills"])
+    monkeypatch.setattr(server, "_sessions", {"v": {"agent": voice}, "d": {"agent": desk}})
+    server._refresh_live_sessions(None)
+    assert captured["iphone-voice"] == sorted(_VOICE)  # not the CLI list
+    assert "terminal" not in captured["iphone-voice"] and "skills" not in captured["iphone-voice"]
+    assert captured["desktop"] == ["file", "terminal", "skills"]  # other surfaces unchanged
+
+
+def test_unbuilt_voice_session_reads_back_the_voice_list(monkeypatch):
+    _refresh_setup(monkeypatch)
+    enabled, _disabled = server._session_toolsets({"source": "iphone-voice"})
+    assert enabled == sorted(_VOICE)
+    enabled, _disabled = server._session_toolsets({"source": "desktop"})
+    assert enabled == ["file", "terminal", "skills"]
+
+
+def test_operator_pin_wins_over_the_voice_list(monkeypatch):
+    _refresh_setup(monkeypatch)
+    monkeypatch.setenv("HERMES_TUI_TOOLSETS", "file")
+    assert server._agent_toolsets("iphone-voice") == ["file", "terminal", "skills"]  # i.e. _load_enabled_toolsets

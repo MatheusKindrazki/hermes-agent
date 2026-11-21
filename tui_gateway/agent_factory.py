@@ -344,13 +344,22 @@ def _with_session_toolsets(selection, platform: str) -> list[str]:
     return [*selection, *sorted(fold_in)]
 
 
-def _voice_or_cli_toolsets(voice_policy, platform: str) -> list[str] | None:
+def _voice_or_cli_toolsets(voice_policy, platform: str | None) -> list[str] | None:
     """``voice.turn_policy.toolsets`` for a voice source (with the same surface fold-in and
-    ``agent.disabled_toolsets`` subtraction as the CLI list), else the CLI toolsets unchanged."""
-    if voice_policy.toolsets is None:
+    ``agent.disabled_toolsets`` subtraction as the CLI list), else the CLI toolsets unchanged.
+    An operator pin (``HERMES_TUI_TOOLSETS``) still wins over the voice list, as it wins over the CLI one."""
+    if voice_policy is None or voice_policy.toolsets is None or os.environ.get("HERMES_TUI_TOOLSETS", "").strip():
         return _load_enabled_toolsets(platform)
     disabled = set(_load_disabled_toolsets() or [])
     return sorted(_with_session_toolsets([t for t in voice_policy.toolsets if t not in disabled], platform))
+
+
+def _agent_toolsets(platform: str | None) -> list[str] | None:
+    """THE toolset selection for an agent on ``platform`` (a session source). Every place that builds or
+    re-resolves an agent's tools goes through here (build, live refresh on /reload-mcp or a plugin going
+    live, the read-back of an unbuilt session), so a voice agent never falls back to the CLI list."""
+    from tui_gateway.voice_turn_policy import resolve_voice_turn_policy
+    return _voice_or_cli_toolsets(resolve_voice_turn_policy(_load_cfg(), platform), platform)
 
 
 def _tui_notice(text: str) -> None:
