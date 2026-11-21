@@ -217,7 +217,7 @@ def _joined_output(r) -> str:
 
 def _session_toolsets(session) -> tuple:
     """``(enabled, disabled)`` a session's read-back RPCs must reflect: the live agent's sets once built,
-    else what that session's profile would build with — ``_load_enabled_toolsets`` under the session's
+    else what that session's profile would build with — ``_agent_toolsets`` (voice-aware) under the session's
     profile scope, the same read ``_build_agent``/``_refresh_live_sessions`` make and the key
     ``profiles.configure`` pins. A session whose agent is not built yet (``session.create`` with no
     prompt) otherwise read back as "everything enabled" (#117977). ``None`` = all toolsets.
@@ -226,7 +226,7 @@ def _session_toolsets(session) -> tuple:
     if agent is not None:
         return getattr(agent, "enabled_toolsets", None), getattr(agent, "disabled_toolsets", None)
     with _session_profile_runtime_scope(session or {}):
-        return _load_enabled_toolsets(_resolve_agent_platform(_session_source(session))), _load_disabled_toolsets()
+        return _agent_toolsets(_resolve_agent_platform(_session_source(session))), _load_disabled_toolsets()
 
 
 def _toolset_rows(params: dict, *, with_tools: bool) -> list[dict]:
@@ -329,7 +329,7 @@ def _refresh_live_sessions(home=None, *, preserve_prefix: bool = False,
         agent = sess["agent"]
         try:
             with _session_profile_runtime_scope(sess):
-                enabled = carry_onboarding_toolset(_load_enabled_toolsets(getattr(agent, "platform", None)), agent)
+                enabled = carry_onboarding_toolset(_agent_toolsets(getattr(agent, "platform", None)), agent)
                 disabled = _load_disabled_toolsets()
                 refresh(agent, enabled_override=enabled, disabled_override=disabled,
                         quiet_mode=True, preserve_prefix=preserve_prefix)

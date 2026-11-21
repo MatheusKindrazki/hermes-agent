@@ -344,6 +344,24 @@ def _with_session_toolsets(selection, platform: str) -> list[str]:
     return [*selection, *sorted(fold_in)]
 
 
+def _voice_or_cli_toolsets(voice_policy, platform: str | None) -> list[str] | None:
+    """``voice.turn_policy.toolsets`` for a voice source (with the same surface fold-in and
+    ``agent.disabled_toolsets`` subtraction as the CLI list), else the CLI toolsets unchanged.
+    An operator pin (``HERMES_TUI_TOOLSETS``) still wins over the voice list, as it wins over the CLI one."""
+    if voice_policy is None or voice_policy.toolsets is None or os.environ.get("HERMES_TUI_TOOLSETS", "").strip():
+        return _load_enabled_toolsets(platform)
+    disabled = set(_load_disabled_toolsets() or [])
+    return sorted(_with_session_toolsets([t for t in voice_policy.toolsets if t not in disabled], platform))
+
+
+def _agent_toolsets(platform: str | None) -> list[str] | None:
+    """THE toolset selection for an agent on ``platform`` (a session source). Every place that builds or
+    re-resolves an agent's tools goes through here (build, live refresh on /reload-mcp or a plugin going
+    live, the read-back of an unbuilt session), so a voice agent never falls back to the CLI list."""
+    from tui_gateway.voice_turn_policy import resolve_voice_turn_policy
+    return _voice_or_cli_toolsets(resolve_voice_turn_policy(_load_cfg(), platform), platform)
+
+
 def _tui_notice(text: str) -> None:
     print(text, file=sys.stderr, flush=True)
 
@@ -659,7 +677,7 @@ def _make_agent(
     # A rebuild may omit platform_override; the session record still carries its source.
     voice_policy = resolve_voice_turn_policy(cfg, platform_override or (session or {}).get("source"))
     agent = AIAgent(
-        model=model, max_iterations=_cfg_max_turns(cfg, 500), provider=runtime.get("provider"),
+        model=model, max_iterations=voice_policy.max_iterations or _cfg_max_turns(cfg, 500), provider=runtime.get("provider"),
         requested_provider=runtime.get("requested_provider"),
         base_url=runtime.get("base_url"), api_key=runtime.get("api_key"), api_mode=runtime.get("api_mode"),
         acp_command=runtime.get("command"), acp_args=runtime.get("args"),
@@ -668,7 +686,7 @@ def _make_agent(
         reasoning_config=(
             reasoning_config_override if reasoning_config_override is not None else _load_reasoning_config(str(model or ""))),
         service_tier=service_tier_override if service_tier_override is not None else _load_service_tier(),
-        enabled_toolsets=onboarding_toolsets(_load_enabled_toolsets(platform),
+        enabled_toolsets=onboarding_toolsets(_voice_or_cli_toolsets(voice_policy, platform),
                                              session_db if session_db is not None else _get_db(), session_id or key),
         disabled_toolsets=_load_disabled_toolsets(),
         # OpenRouter provider_routing prefs (gateway + CLI parity).
