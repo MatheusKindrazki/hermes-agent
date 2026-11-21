@@ -195,7 +195,9 @@ class SessionResumeParams(SessionParams):
 
 
 class SessionResumeResult(LiveSessionSnapshot):
-    pass
+    # Stored context compactions (distinct carriers in state.db); None = could not be read, never "zero".
+    # The voice client rotates on it (RFC-001 V1): the wire projection hides every carrier.
+    compactions: int | None = None
 
 
 method("session.resume", params=SessionResumeParams, result=SessionResumeResult,
